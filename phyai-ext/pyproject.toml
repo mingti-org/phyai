@@ -22,6 +22,7 @@ cache-keys = [
     { file = "CMakeLists.txt" },
     { file = "csrc/**/*.{h,c,hpp,cpp,cc,cxx,cu,cuh}" },
     { file = "include/**/*.{h,hpp,cuh}" },
+    { file = "third_party/**/*.{h,c,hpp,cpp,cc,cxx}" },
 ]
 
 [tool.uv.sources]

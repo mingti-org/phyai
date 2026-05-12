@@ -22,6 +22,7 @@ add_library(phyai_ext_core SHARED ${PHYAI_EXT_SOURCES})
 target_include_directories(phyai_ext_core PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash"
 )
 
 tvm_ffi_configure_target(phyai_ext_core)
