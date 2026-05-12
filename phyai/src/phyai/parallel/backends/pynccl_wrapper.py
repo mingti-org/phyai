@@ -22,13 +22,15 @@ from typing import Any
 import torch
 from torch.distributed import ReduceOp
 
+from phyai.utils import all_ranks_log, this_rank_log
+
 logger = logging.getLogger(__name__)
 
 
 def find_nccl_library() -> str:
     so_file = os.environ.get("PHYAI_NCCL_SO_PATH")
     if so_file:
-        logger.info("Using PHYAI_NCCL_SO_PATH=%s", so_file)
+        this_rank_log(logger, logging.INFO, "Using PHYAI_NCCL_SO_PATH=%s", so_file)
         return so_file
     if torch.version.cuda is not None:
         return "libnccl.so.2"
@@ -228,7 +230,9 @@ class NCCLLibrary:
                 NCCLLibrary._path_lib_cache[so_file] = ctypes.CDLL(so_file)
             self.lib = NCCLLibrary._path_lib_cache[so_file]
         except Exception as e:
-            logger.error(
+            all_ranks_log(
+                logger,
+                logging.ERROR,
                 "Failed to load NCCL library from %s on platform %s. "
                 "Set PHYAI_NCCL_SO_PATH to point to a valid libnccl.",
                 so_file,

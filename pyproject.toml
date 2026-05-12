@@ -7,27 +7,44 @@ dependencies = [
     "phyai",
     "phyai-kernel",
     "phyai-ext",
+    "phyai-model-optimizer",
+    "phyai-utils-tools",
 ]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["phyai", "phyai-kernel", "phyai-ext"]
+members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools"]
 
 [tool.uv.sources]
 phyai = { workspace = true }
 phyai-kernel = { workspace = true }
 phyai-ext = { workspace = true }
+phyai-model-optimizer = { workspace = true }
+phyai-utils-tools = { workspace = true }
 
 [dependency-groups]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
     "ruff>=0.6",
+    "pre-commit>=3.7",
 ]
 
 [tool.pytest.ini_options]
 addopts = ["-ra", "--import-mode=importlib"]
-testpaths = ["phyai/tests", "phyai-kernel/tests", "phyai-ext/tests"]
-pythonpath = ["phyai/src", "phyai-kernel", "phyai-ext/src"]
+testpaths = [
+    "phyai/tests",
+    "phyai-kernel/tests",
+    "phyai-ext/tests",
+    "phyai-model-optimizer/tests",
+    "phyai-utils-tools/tests",
+]
+pythonpath = [
+    "phyai/src",
+    "phyai-kernel",
+    "phyai-ext/src",
+    "phyai-model-optimizer/src",
+    "phyai-utils-tools/src",
+]

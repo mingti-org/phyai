@@ -38,6 +38,7 @@ from phyai.parallel.backends.pynccl_wrapper import (
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
+from phyai.utils import all_ranks_log
 
 if TYPE_CHECKING:
     from phyai.parallel.mesh import Mesh
@@ -195,7 +196,7 @@ class _PyNcclComm:
             try:
                 self.nccl.ncclCommDestroy(self.comm)
             except Exception as e:
-                logger.warning("ncclCommDestroy failed: %s", e)
+                all_ranks_log(logger, logging.WARNING, "ncclCommDestroy failed: %s", e)
             self.comm = None
 
 
