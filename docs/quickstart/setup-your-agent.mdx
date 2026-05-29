@@ -1,0 +1,147 @@
+---
+title: "Set up your Coding Agent"
+description: "Configure a Coding Agent for PhyAI and understand the repository-local skills."
+icon: "bot"
+---
+
+<Note>
+Code is cheap, show me your CoT !!!
+</Note>
+
+<Warning>
+Coding Agents are currently encouraged for code tasks and performance tuning to reduce engineering workload. They are not recommended for generating documentation unless the author carefully reviews what the agent wrote.
+</Warning>
+
+# Set up your Coding Agent
+
+PhyAI keeps the skills that a Coding Agent may use, and that can make engineering work more convenient, under `.claude/skills`. Your Coding Agent should not work in isolation from this context. A better workflow is to read `CLAUDE.md` first, then load the relevant skill from `.claude/skills` when the task calls for it.
+
+## Prerequisites
+
+- A local clone of the PhyAI repository. You also need to update submodules, because some skills are introduced through submodules.
+- A Coding Agent that can access the current repository workspace.
+- The repository contains the `.claude/skills` directory.
+
+## Coding Agent instructions
+
+Each Claude session should start from the repository root:
+
+```bash
+cd phyai
+```
+
+<Tip>
+When editing files under a directory, use the most specific `CLAUDE.md`. For example, when editing documentation pages, there is a `CLAUDE.md` under the `docs` directory, so the agent should also consult `docs/CLAUDE.md`.
+</Tip>
+
+## Claude skills
+
+Coding Agent skills live under `.claude/skills`. They provide reviewable, continuous, and verifiable execution paths for complex tasks.
+
+| Skill | Location | Purpose | When to use |
+| --- | --- | --- | --- |
+| `ncu-report-skill` | `.claude/skills/ncu-report-skill/SKILL.md` | This skill comes from mit-han-lab's https://github.com/mit-han-lab/ncu-report-skill/. It uses Nsight Compute to analyze CUDA kernel performance, with special coverage for B200 / `sm_100`. It includes a profiling workflow, harness templates, report parsing scripts, a diagnosis playbook, and Blackwell reference materials. | Use it when you need to profile a CUDA kernel, interpret an `.ncu-rep` report, locate a performance bottleneck, or design a kernel optimization plan. |
+| `phyai-communicate-with-memory` | `.claude/skills/phyai-communicate-with-memory/SKILL.md` | Reads a PhyAI `.memory` file or directory, reconstructs the work recorded by a previous agent session, and checks memory claims against code, git history, and test results. | Use it when you provide a `.memory` artifact and want to understand what it did, what it validated, and what remains unresolved. |
+| `phyai-local-env-report` | `.claude/skills/phyai-local-env-report/SKILL.md` | Generates a reproducible local environment report covering the system, Python, CUDA/GPU, dependencies, workspace packages, git state, and `PHYAI_*` configuration. | Use it when you need to inspect or diagnose the current PhyAI development or runtime environment. |
+| `phyai-model-arch-research` | `.claude/skills/phyai-model-arch-research/SKILL.md` | Supports model architecture research across papers, model cards, checkpoints, code repositories, or local implementations, with emphasis on module decomposition, tensor shapes, and PhyAI integration risks. | Use it when you provide a paper, model name, checkpoint, repository, or local codebase and want an architecture study or implementation-oriented report. |
+| `phyai-solve-pr-comments` | `.claude/skills/phyai-solve-pr-comments/SKILL.md` | Fetches and triages GitHub PR review comments, verifies whether each comment is valid, presents a triage result and plan, then makes focused changes and runs tests. | Use it when a Coding Agent needs to inspect, handle, or fix GitHub PR comments. |
+
+<Note>
+Documentation tasks should still follow the Mintlify skill-set requirement in `CLAUDE.md`. This repository also provides `docs/CLAUDE.md` as documentation-writing guidance, but the Mintlify skills themselves are not located under the current `.claude/skills` directory. You can install them with `npx skills add https://mintlify.com/docs`.
+</Note>
+
+## `ncu-report-skill`
+
+`ncu-report-skill` is designed for CUDA kernel performance profiling and optimization diagnosis. It is especially suitable for PhyAI work involving kernels, Triton, CUDA extensions, and low-level operators, because these tasks should be grounded in profiling data rather than empirical guesswork.
+
+When a Coding Agent uses this skill, it should follow the sequence of "profile first, diagnose second, plan third":
+
+- Create a new `profile/<run_name>/` run directory under the repository root.
+- Identify the exact kernel, dispatch path, and representative input shape to analyze.
+- Build a standalone harness when the existing program is not a suitable profiling entry point.
+- Collect both full profiles and source-level profiles.
+- Parse reports with helper scripts instead of judging from CLI output alone.
+- Write metric-backed optimization recommendations in `REPORT.md`, ranked by expected benefit.
+
+The skill includes `.claude/skills/ncu-report-skill/helpers`, which provides a CUDA harness template, safetensors loader, report analysis scripts, stall hotspot extraction, and PM-sampling timeline plotting tools. Its `reference` directory further documents the run directory layout, collection commands, Python API, diagnosis playbook, B200 metric names, and common Nsight Compute issues.
+
+<Warning>
+A Coding Agent should not assume the bottleneck before profiling. This skill expects the final analysis to cite concrete metrics, not broad performance claims.
+</Warning>
+
+## `phyai-communicate-with-memory`
+
+`phyai-communicate-with-memory` is used to read and audit `.memory` artifacts. Its core position is that memory is evidence, not truth itself. A Coding Agent must extract the task goal, repository path, changed files, command records, test results, blockers, and conclusions from memory, then verify those claims against code and git history whenever possible.
+
+When the referenced repository still exists locally, the Coding Agent should inspect the relevant files, diffs, commits, tests, and symbol definitions to determine whether the memory narrative matches the real code state.
+
+The skill's output usually separates information into four categories:
+
+- **Confirmed facts**: verified through code, git history, or test files.
+- **Memory claims**: present only in the memory text and not independently verified.
+- **Reasonable inferences**: derived from context but not fully proven by direct evidence.
+- **Unknowns**: impossible to determine because repositories, commits, logs, or files are missing.
+
+It is useful for cross-session handoff, historical task audits, checking whether a change was actually applied, and identifying follow-up work that still needs attention.
+
+<Warning>
+When collaborating with other people on code, `.memory` can also be used as a form of offline communication with the other person's Coding Agent.
+</Warning>
+
+## `phyai-local-env-report`
+
+`phyai-local-env-report` generates a local PhyAI environment report. It covers host information, Python and `uv`, workspace packages, key dependency versions, CUDA/GPU state, Torch CUDA state, git state, and registered `PHYAI_*` configuration.
+
+The Coding Agent should prefer the script bundled with the skill:
+
+```bash
+uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
+```
+
+To save the report, provide an output path:
+
+```bash
+uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
+```
+
+This skill is useful for diagnosing installation failures, invisible CUDA devices, dependency mismatches, workspace package import errors, and runtime problems that reproduce only on a specific machine. Unless explicitly requested, the Coding Agent should not install dependencies, modify the repository, or run heavyweight builds just to generate the environment report.
+
+## `phyai-model-arch-research`
+
+`phyai-model-arch-research` is intended for model architecture research. For an inference framework such as PhyAI, understanding a model means more than restating a paper abstract. The more important task is to clarify input-output paths, module boundaries, tensor shapes, cache behavior, weight mapping, nonstandard operators, and how those mechanisms fit into PhyAI's runtime, kernels, weight loading, and test system.
+
+The Coding Agent should collect evidence in the following priority order:
+
+- Official implementation, release branch, or tagged commit.
+- Paper or technical report, especially architecture sections, equations, figures, configuration tables, and appendices.
+- Model card, config, tokenizer/processor files, and checkpoint metadata.
+- Credible secondary sources only when primary sources are missing or unclear.
+
+The skill's report should explain the model family, core data flow, module breakdown, key configuration, tensor shapes, nonstandard components, and the main risks for integrating the model into PhyAI. If the target includes code, the Coding Agent should map architecture claims to exact files, classes, functions, and `forward()` call chains instead of staying at an abstract description.
+
+It is especially useful for model support work involving VLAs, multimodal LLMs, MoE, diffusion, custom attention, cache layout, quantization, and deployment.
+
+## `phyai-solve-pr-comments`
+
+`phyai-solve-pr-comments` is used to handle GitHub PR review comments. Its focus is not to mechanically accept every suggestion, but to first determine whether the comment is valid. Bot-generated reviews in particular may identify real risks, but they may also project patterns from other projects onto the current codebase.
+
+The Coding Agent should fetch three comment surfaces for the PR:
+
+- Issue conversation comments.
+- Inline review comments.
+- Overall review summaries.
+
+Then the Coding Agent should classify each comment as a real bug, false claim, documentation issue, style nit, or already-fixed/stale item. For technical judgments involving library contracts, dtype, shape, kernel calls, or performance paths, Claude should verify against upstream source, local tests, available reference repositories under `.tmp`, and existing PhyAI conventions.
+
+The recommended flow is:
+
+1. Fetch and read all comments.
+2. Provide a verdict and handling plan for each comment.
+3. Present the triage result to the user before editing code.
+4. Make focused changes after the scope is clear.
+5. Run the relevant tests.
+6. Reply to PR comments on behalf of the user only when explicitly asked.
+
+<Tip>
+This skill is particularly useful for bot reviews because it explicitly requires the Coding Agent to verify suggestions rather than obey them directly.
+</Tip>

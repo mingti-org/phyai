@@ -99,8 +99,11 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
-# claude
+# claude & codex
 .claude/settings.local.json
+.agents/
+skills-lock.json
 
 # profile
 .profile/
+.memory/

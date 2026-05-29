@@ -18,6 +18,7 @@
             "group": "Getting started",
             "pages": [
               "index",
+              "quickstart/setup-your-agent",
               "quickstart/add-model"
             ]
           },
@@ -41,6 +42,7 @@
             "group": "快速开始",
             "pages": [
               "zh/index",
+              "zh/quickstart/setup-your-agent",
               "zh/quickstart/add-model"
             ]
           },

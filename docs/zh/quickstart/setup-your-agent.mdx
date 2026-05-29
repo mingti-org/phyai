@@ -1,0 +1,147 @@
+---
+title: "配置你的 Coding Agent"
+description: "在 PhyAI 中配置 Coding Agent，并理解仓库内置的 skills。"
+icon: "bot"
+---
+
+<Note>
+Code is cheap, show me your CoT !!!
+</Note>
+
+<Warning>
+目前鼓励大家在代码任务、性能调优中使用 Coding Agent 来减少工作量。但是不建议使用 agent 来生成文档（或者作者能仔细过一遍 Agent 写了什么）。
+</Warning>
+
+# 配置 Coding Agent
+
+PhyAI 将 Coding Agent 可能会用到的、能方便大家工作的 skills 都放在 `.claude/skills` 文件夹下面。你的 Coding Agent 不应脱离这些上下文孤立地工作；更合适的方式，是先阅读 `CLAUDE.md`，再在任务触发时加载 `.claude/skills` 中对应的 skills。
+
+## 前置条件
+
+- 已在本地克隆 PhyAI 仓库（且需要 update submodule，一些 skills 是通过 submodule 引入的）。
+- Coding Agent 能访问当前仓库的工作区。
+- 当前仓库包含 `.claude/skills` 目录。
+
+## Coding Agent 指令
+
+每次 Claude 会话建议从仓库根目录开始：
+
+```bash
+cd phyai
+```
+
+<Tip>
+编辑某一目录下的文件时，应采用最具体的 `CLAUDE.md`。例如，修改文档页面时，docs 文件夹下面有 CLAUDE,md，那么应同时参考 `docs/CLAUDE.md`。
+</Tip>
+
+## Claude skills
+
+Coding Agent 的 skills 位于 `.claude/skills`。它们为复杂任务提供可复查、可延续、可验证的执行路径。
+
+| Skill | 位置 | 作用 | 适用场景 |
+| --- | --- | --- | --- |
+| `ncu-report-skill` | `.claude/skills/ncu-report-skill/SKILL.md` | 这个 skill 是 mit-han-lab 的 https://github.com/mit-han-lab/ncu-report-skill/。使用 Nsight Compute 分析 CUDA kernel 性能，重点覆盖 B200 / `sm_100`。它包含 profiling 工作流、harness 模板、报告解析脚本、诊断 playbook 与 Blackwell 参考资料。 | 需要 profile CUDA kernel、解读 `.ncu-rep` 报告、定位性能瓶颈，或制定 kernel 优化方案时使用。 |
+| `phyai-communicate-with-memory` | `.claude/skills/phyai-communicate-with-memory/SKILL.md` | 读取 PhyAI `.memory` 文件或目录，重建历史 agent 会话的工作过程，并将记忆中的主张与代码、git 历史、测试结果相互校验。 | 你提供 `.memory` 产物，并希望理解它做了什么、验证了什么、还遗留了什么问题时使用。 |
+| `phyai-local-env-report` | `.claude/skills/phyai-local-env-report/SKILL.md` | 生成可复现的本地环境报告，覆盖系统、Python、CUDA/GPU、依赖、workspace package、git 状态和 `PHYAI_*` 配置。 | 需要检查或诊断当前 PhyAI 开发/运行环境时使用。 |
+| `phyai-model-arch-research` | `.claude/skills/phyai-model-arch-research/SKILL.md` | 面向模型架构研究，分析论文、模型卡、checkpoint、代码仓库或本地实现，重点关注模块划分、张量形状与 PhyAI 集成风险。 | 你提供论文、模型名、checkpoint、代码仓库或本地代码，并希望得到架构研究或实现导向报告时使用。 |
+| `phyai-solve-pr-comments` | `.claude/skills/phyai-solve-pr-comments/SKILL.md` | 获取并梳理 GitHub PR review comments，逐条验证评论是否成立，先给出 triage 与计划，再进行聚焦修改和测试。 | 需要 Coding Agent 检查、处理或修复 GitHub PR 评论时使用。 |
+
+<Note>
+文档类任务仍应遵循 `CLAUDE.md` 中关于 Mintlify skill set 的要求。本仓库还提供 `docs/CLAUDE.md` 作为文档写作约束，但 Mintlify skills 本身不位于当前 `.claude/skills` 目录中。可以通过 `npx skills add https://mintlify.com/docs` 来进行安装
+</Note>
+
+## `ncu-report-skill`
+
+`ncu-report-skill` 面向 CUDA kernel 的性能剖析与优化诊断。它特别适合 PhyAI 中与 kernel、Triton、CUDA 扩展和底层算子相关的工作，因为这类任务不能依赖经验性猜测，而应以 profile 数据为依据。
+
+Coding Agent 使用该 skill 时，应遵循“先 profile，再诊断，再规划”的顺序：
+
+- 在仓库根目录下创建新的 `profile/<run_name>/` 运行目录。
+- 明确要分析的 kernel、dispatch 路径和代表性输入形状。
+- 在现有程序不适合作为 profiling 入口时，构建独立 harness。
+- 分别采集 full profile 与 source-level profile。
+- 使用 helper scripts 解析报告，而不是仅凭 CLI 输出目测判断。
+- 在 `REPORT.md` 中给出有指标支撑、按收益排序的优化建议。
+
+该 skill 自带 `.claude/skills/ncu-report-skill/helpers` 目录，包括 CUDA harness 模板、safetensors loader、报告分析脚本、stall hotspot 提取脚本和 PM-sampling timeline 绘制工具。其 `reference` 目录进一步说明运行目录布局、采集命令、Python API、诊断 playbook、B200 指标名称和常见 Nsight Compute 问题。
+
+<Warning>
+Coding Agent 不应在没有 profiling 证据时预设瓶颈。该 skill 要求最终分析引用具体 metric，而不是给出泛泛的性能判断。
+</Warning>
+
+## `phyai-communicate-with-memory`
+
+`phyai-communicate-with-memory` 用于阅读和审计 `.memory` 产物。它的核心立场是：memory 是线索，而不是事实本身。Coding Agent 需要从记忆中抽取任务目标、仓库路径、修改文件、命令记录、测试结果、阻塞点与结论，再尽可能回到代码和 git 历史中验证这些说法。
+
+当被引用的仓库仍然存在于本地时，Coding Agent 应检查相关文件、diff、commit、测试和符号定义，判断 memory 中的叙述是否与真实代码状态一致。
+
+该 skill 的产出通常会区分四类信息：
+
+- **已确认事实**：已通过代码、git 历史或测试文件验证。
+- **memory 声称**：只出现在记忆文本中，尚未独立验证。
+- **合理推断**：由上下文推出，但没有直接证据完全证明。
+- **未知项**：由于仓库、commit、日志或文件缺失而无法判断。
+
+它适合用于跨会话交接、历史任务审计、判断某次修改是否真实落地，以及梳理后续仍需处理的问题。
+
+<Warning>
+特别是与大家进行代码协作的时候，可以使用 `.memory` 来与对方的 Coding Agent 进行某种 offline 的交互。
+</Warning>
+
+## `phyai-local-env-report`
+
+`phyai-local-env-report` 用于生成 PhyAI 本地环境报告。它覆盖 host 信息、Python 与 `uv`、workspace package、关键依赖版本、CUDA/GPU 状态、Torch CUDA 状态、git 状态，以及已注册的 `PHYAI_*` 配置。
+
+Coding Agent 应优先使用 skill 内置脚本：
+
+```bash
+uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
+```
+
+如需保存报告，可指定输出路径：
+
+```bash
+uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
+```
+
+该 skill 适合排查安装失败、CUDA 不可见、依赖版本不一致、workspace package 导入异常，以及只在特定机器上复现的运行时问题。除非你明确要求，Coding Agent 不应为了生成环境报告而安装依赖、修改仓库或执行重量级构建。
+
+## `phyai-model-arch-research`
+
+`phyai-model-arch-research` 面向模型架构研究。对于 PhyAI 这类推理框架而言，理解一个模型并不止于复述论文摘要；更重要的是弄清输入输出路径、模块边界、张量形状、cache 行为、权重映射、非标准算子，以及这些机制如何落入 PhyAI 的 runtime、kernel、权重加载和测试体系。
+
+Coding Agent 应按以下优先级采集证据：
+
+- 官方实现、release branch 或 tagged commit。
+- 论文或技术报告，尤其是架构章节、公式、图表、配置表和附录。
+- Model card、config、tokenizer/processor 文件和 checkpoint metadata。
+- 仅在主来源缺失或不清楚时，参考可信的二级资料。
+
+该 skill 的报告应说明模型家族、核心数据流、模块拆解、关键配置、张量形状、非标准组件，以及接入 PhyAI 时的主要风险。若分析对象包含代码，Coding Agent 应将架构判断映射到具体文件、类、函数和 `forward()` 调用链，而不是只给出抽象描述。
+
+它尤其适用于 VLA、多模态 LLM、MoE、diffusion、自定义 attention、cache layout、量化与部署相关的模型支持工作。
+
+## `phyai-solve-pr-comments`
+
+`phyai-solve-pr-comments` 用于处理 GitHub PR review comments。它的重点不是机械采纳每条建议，而是先判断评论是否成立。尤其是 bot 生成的 review，常常能指出真实风险，也可能将其他项目的模式误套到当前代码上。
+
+Coding Agent 应获取 PR 的三类评论面：
+
+- Issue conversation comments。
+- Inline review comments。
+- Overall review summaries。
+
+随后，Coding Agent 需要将每条评论分类为真实 bug、错误主张、文档说明问题、风格 nit，或已经修复/过期的问题。对于涉及库契约、dtype、shape、kernel 调用或性能路径的技术判断，Claude 应回到上游源码、本地测试、`.tmp` 下可用的参考仓库，以及 PhyAI 现有约定中验证。
+
+推荐流程如下：
+
+1. 获取并阅读全部评论。
+2. 对每条评论给出 verdict 与处理计划。
+3. 在编辑代码之前先向用户展示 triage 结果。
+4. 范围明确后进行聚焦修改。
+5. 运行相关测试。
+6. 只有在用户要求时，才代表用户回复 PR 评论。
+
+<Tip>
+该 skill 特别适合处理 bot review，因为它明确要求 Coding Agent 验证建议，而不是直接服从建议。
+</Tip>

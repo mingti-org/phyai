@@ -62,6 +62,20 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 - use .claude/skills/profile_model when user want to profile a model, or want to know the roofline of one model on one hardware setting.
 - use .claude/skills/solve_pr_comments when user want u to solve some PR comments.
 - use .claude/skills/phyai-model-arch-research when user provides a paper, article, link, model name, checkpoint, or code repo and wants research on the related model architecture.
+- use .claude/skills/phyai-local-env-report when user wants a local environment report or diagnostics for system info, CUDA/GPU state, Torch/dependency versions, phyai package versions, git state, or `PHYAI_*` env vars. Prefer its bundled `scripts/collect_env_report.py` over ad hoc env commands.
+- use .claude/skills/phyai-communicate-with-memory when user provides a phyai `.memory` file, directory, pasted memory content, or memory artifact path and wants to know what it did. Parse the memory, locate the referenced code repo if it exists, verify claims against code/git/tests, and clearly separate confirmed facts from memory claims and unknowns.
+
+## Agent memory log
+
+All coding agents working in this repo should keep a concise work log under `.memory/` so other agents can understand what happened without re-discovering context.
+
+- Record every meaningful action: files changed, commands run, decisions made, blockers found, validation results, and follow-up items.
+- Prefer one Markdown file per task/session, named like `.memory/YYYYMMDD-HHMMSS-brief-task-name.md`.
+- Keep entries concise and factual. Link to repo files when useful.
+- Do not paste secrets, credentials, huge command outputs, or generated build artifacts. Summarize long outputs and point to files if needed.
+- Update the memory file as work progresses, especially before handing off, pausing, or finishing.
+- Other agents should read relevant `.memory/` notes before continuing related work.
+- If user want to add documents, pls use mintlify skills set. It those skills are not installed. pls use `npx skills add https://mintlify.com/docs` to install it first.
 
 ---
 
