@@ -1,5 +1,5 @@
 ---
-name: solve-pr-comments
+name: phyai-solve-pr-comments
 description: Triage and resolve review comments on a GitHub PR — fetch all comment surfaces (issue / inline / review), validate each suggestion against upstream source rather than trusting blindly, present findings to the user before editing, then make focused changes and re-run tests. Use when the user asks to "check PR N's comments", "address review feedback", "resolve PR comments", or similar.
 ---
 

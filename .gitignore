@@ -101,3 +101,6 @@ Thumbs.db
 
 # claude
 .claude/settings.local.json
+
+# profile
+.profile/
