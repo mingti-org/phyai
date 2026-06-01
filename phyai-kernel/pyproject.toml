@@ -1,6 +1,6 @@
 [project]
 name = "phyai-kernel"
-version = "0.1.0"
+dynamic = ["version"]
 description = "JIT-compiled CPU/CUDA kernels for phyai via tvm-ffi."
 requires-python = ">=3.12"
 dependencies = [
@@ -14,8 +14,12 @@ dependencies = [
 phyai-kernel = "phyai_kernel.__main__:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "..", fallback_version = "0.1.0" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["phyai_kernel"]

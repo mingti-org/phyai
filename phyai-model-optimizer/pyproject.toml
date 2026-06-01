@@ -1,13 +1,17 @@
 [project]
 name = "phyai-model-optimizer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "phyai — Model optimization library."
 requires-python = ">=3.12"
 dependencies = []
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "..", fallback_version = "0.1.0" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/phyai_model_optimizer"]

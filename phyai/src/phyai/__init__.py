@@ -1,6 +1,11 @@
 """phyai — Physical Large Model main library."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("phyai")
+except PackageNotFoundError:  # raw source tree, not installed
+    __version__ = "0.0.0+unknown"
 
 
 def hello() -> str:

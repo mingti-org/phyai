@@ -18,7 +18,7 @@ Hard pins: `torch==2.11`, `flashinfer-python==v0.6.11.post3`, `transformers==5.8
 
 ## Common commands
 
-Everything goes through `uv`. The lockfile (`uv.lock`) is committed.
+Everything goes through `uv`.
 
 ```bash
 # Install / sync the workspace (creates .venv at repo root)

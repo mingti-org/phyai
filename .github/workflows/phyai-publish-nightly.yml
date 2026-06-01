@@ -1,0 +1,193 @@
+# phyai nightly publish — builds all five workspace packages and publishes them as
+# a PEP 503 "simple" wheel index on GitHub Pages, so users can:
+#
+#   uv pip install phyai \
+#     --extra-index-url https://membodied.github.io/phyai/simple/ \
+#     --prerelease=allow
+#
+# Job graph:
+#   setup        compute the one nightly version (git tag + date), shared by all
+#   build-ext    compile phyai-ext inside a manylinux_2_28 container so its .so
+#                links glibc 2.28 (wide compatibility), then auditwheel-repair it
+#   build-index  build the 4 pure-Python packages on a plain runner, merge in the
+#                manylinux phyai-ext wheel, and generate the PEP 503 index
+#   deploy       publish the index to GitHub Pages
+#
+# Why phyai-ext is split out: it is the only compiled package. The other four are
+# py3-none-any (glibc-irrelevant) and need no C/C++ toolchain, so they stay on the
+# fast plain runner. phyai-ext's libphyai_ext_core.so is a tvm-ffi plugin loaded at
+# runtime (dlopen), NOT a CPython extension and NOT link-time bound to libtvm_ffi.so
+# — hence wheel.py-api="py3" (in pyproject) for a version-agnostic tag, and
+# `auditwheel repair --exclude libtvm_ffi.so` (that lib is provided by the
+# apache-tvm-ffi runtime dependency and must not be vendored).
+#
+# One-time manual prerequisite: GitHub repo Settings -> Pages -> Source =
+# "GitHub Actions" (the workflow cannot toggle this itself).
+name: phyai nightly publish
+
+on:
+  schedule:
+    # 18:47 UTC daily. Off the :00 mark on purpose.
+    - cron: "47 18 * * *"
+  # Manual "Run workflow" button (use this for the first publish).
+  workflow_dispatch:
+
+# Serialize publishes: a Pages deployment must never race another. Do NOT cancel
+# an in-progress publish — a half-finished deploy is worse than a queued one.
+concurrency:
+  group: phyai-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # One source of truth for the version, so build-ext and build-index can't
+  # disagree if the run straddles UTC midnight.
+  setup:
+    name: compute nightly version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      # fetch-depth: 0 brings the full history + tags so the base version can be
+      # derived from the latest git tag.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Base version = latest git tag; UTC date makes each nightly unique; patch
+      # is bumped by one so the dev build sorts ABOVE the last release per PEP 440
+      # (X.Y.Z < X.Y.(Z+1).devN). No "+local" segment — PyPI-safe and valid in a
+      # simple index. setuptools-scm honors SETUPTOOLS_SCM_PRETEND_VERSION, so this
+      # one value stamps every package.
+      - name: Compute nightly version
+        id: ver
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)
+          BASE=$(echo "${TAG:-0.0.0}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')
+          VERSION="${BASE}.dev$(date -u +%Y%m%d)"
+          echo "Publishing version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  # Compile phyai-ext in a glibc-2.28 manylinux container. Building on ubuntu-latest
+  # (glibc 2.39) would bake GLIBC_2.34+ symbols into the .so and constrain the wheel
+  # to manylinux_2_39 — useless. The container's older glibc is the whole point.
+  build-ext:
+    name: build phyai-ext (manylinux_2_28)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and repair phyai-ext wheel in manylinux container
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" \
+            quay.io/pypa/manylinux_2_28_x86_64 bash -ceu '
+              export PATH=/opt/python/cp312-cp312/bin:$PATH
+              # SETUPTOOLS_SCM_PRETEND_VERSION short-circuits setuptools-scm before
+              # any git access, so the container needs neither git nor the .git dir.
+              python -m pip install -U uv auditwheel cmake ninja
+              rm -rf /io/ext-raw /io/dist-ext
+              # uv build isolation pulls scikit-build-core + apache-tvm-ffi (headers)
+              # from the index; cmake/ninja are preinstalled for a robust CMake build.
+              uv build --package phyai-ext -o /io/ext-raw
+              # Rewrite the .so wheel to a manylinux_2_28 platform tag. Exclude
+              # libtvm_ffi.so: it ships with the apache-tvm-ffi runtime dependency and
+              # must not be vendored (the .so loads it via dlopen at runtime, not via
+              # a link-time NEEDED entry).
+              auditwheel repair --exclude libtvm_ffi.so \
+                --plat manylinux_2_28_x86_64 \
+                /io/ext-raw/*.whl -w /io/dist-ext
+              # The sdist is platform-agnostic — copy it through untouched.
+              cp /io/ext-raw/*.tar.gz /io/dist-ext/
+            '
+          echo "Produced:"
+          ls -lh dist-ext
+
+      - name: Upload phyai-ext artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-ext
+          path: dist-ext/*
+          if-no-files-found: error
+
+  build-index:
+    name: build pure packages and wheel index
+    needs: [setup, build-ext]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # The four pure-Python packages: py3-none-any wheels, no compiler needed.
+      # `uv build --package` can't be repeated in one call, so loop. phyai-ext is
+      # NOT built here — it comes from the build-ext artifact below.
+      - name: Build pure-Python packages
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          for pkg in phyai phyai-kernel phyai-model-optimizer phyai-utils-tools; do
+            uv build --package "$pkg" --out-dir dist
+          done
+
+      - name: Download phyai-ext (manylinux) artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-ext
+          path: dist
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+
+      # Turn dist/ into a PEP 503 simple index under site/ (wheels copied into
+      # site/packages/, one index.html per project + a root index.html).
+      - name: Build wheel index
+        run: python scripts/build_wheel_index.py --dist-dir dist --out-dir site
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### phyai nightly publish — ${{ needs.setup.outputs.version }}"
+            echo ""
+            echo '```'
+            ls -lh dist 2>/dev/null || echo "no dist/ produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: deploy wheel index to Pages
+    needs: build-index
+    runs-on: ubuntu-latest
+    # deploy-pages requires these elevated scopes + the github-pages environment.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
