@@ -46,6 +46,13 @@ jobs:
   # disagree if the run straddles UTC midnight.
   setup:
     name: compute nightly version
+    # Publish only from the canonical repo — never a fork. github.repository is
+    # "owner/repo"; gating the root job blocks BOTH the nightly schedule and a
+    # manual dispatch on a fork such as chenghuaWang/phyai. The guard cascades:
+    # GitHub skips any job whose `needs` dependency was skipped, and build-ext /
+    # build-index / deploy all chain back to setup — so a fork never builds the
+    # wheel or deploys to the wrong github.io Pages site.
+    if: github.repository == 'MEmbodied/phyai'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -74,6 +81,8 @@ jobs:
   # Compile phyai-ext in a glibc-2.28 manylinux container. Building on ubuntu-latest
   # (glibc 2.39) would bake GLIBC_2.34+ symbols into the .so and constrain the wheel
   # to manylinux_2_39 — useless. The container's older glibc is the whole point.
+  #
+  # Image: pytorch/manylinux2_28-builder:cpu (Docker Hub).
   build-ext:
     name: build phyai-ext (manylinux_2_28)
     needs: setup
@@ -90,7 +99,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/io" -w /io \
             -e SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" \
-            quay.io/pypa/manylinux_2_28_x86_64 bash -ceu '
+            pytorch/manylinux2_28-builder:cpu bash -ceu '
               export PATH=/opt/python/cp312-cp312/bin:$PATH
               # SETUPTOOLS_SCM_PRETEND_VERSION short-circuits setuptools-scm before
               # any git access, so the container needs neither git nor the .git dir.
