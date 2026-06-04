@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from phyai.layers.layer_norm import LayerNorm
+import phyai.layers.linear as L
+from phyai.layers.layer_norm import AdaRMSNorm, LayerNorm
+from phyai.parallel.mesh import Mesh
+from phyai.parallel.state import _meshes, register_mesh
 
 
 cuda_only = pytest.mark.skipif(
@@ -177,3 +182,104 @@ def test_phyai_kernel_fp32_path():
     y = m(x)
     ref = _ref_layer_norm(x, src_w, src_b, m.variance_epsilon)
     torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# AdaRMSNorm — stateless cond vs precomputed modulation (CPU torch backend)   #
+# --------------------------------------------------------------------------- #
+#
+# The Triton-kernel equivalence tests live in the CUDA-gated
+# ``phyai-kernel/tests/test_adarmsnorm.py``. These run on the default CPU
+# suite via the ``"torch"`` backend, guarding the stateless refactor
+# (project_modulation + forward(modulation=...)) where CI actually runs.
+
+
+@pytest.fixture
+def _adarms_linear_env():
+    """Bootstrap the linear dispatcher + a degenerate ``"model"`` mesh.
+
+    ``AdaRMSNorm.dense`` is a :class:`ReplicatedLinear`, whose ``__init__``
+    consults the linear-dispatcher singleton and the ``"model"`` mesh — so
+    they must exist before construction (same setup as
+    ``phyai-kernel/tests/conftest.py``). ``LayerNorm`` has no such linear, so
+    this is scoped to the AdaRMSNorm tests rather than module-autouse.
+    """
+    saved = dict(_meshes)
+    tm = MagicMock()
+    tm.mesh_dim_names = ()
+    tm.size.side_effect = lambda axis=None: 1
+    tm.get_local_rank.side_effect = lambda axis=None: 0
+    tm.get_group.side_effect = lambda axis: MagicMock(name=f"pg-{axis}")
+    register_mesh(Mesh(tm, name="model"))
+    L.init(register_flashinfer=False, validate=False)
+    try:
+        yield
+    finally:
+        _meshes.clear()
+        _meshes.update(saved)
+        L._reset_for_test()
+
+
+def _make_cpu_adarms(hidden: int, cond_dim: int) -> AdaRMSNorm:
+    m = AdaRMSNorm(
+        hidden_size=hidden,
+        cond_dim=cond_dim,
+        eps=1e-6,
+        backend="torch",
+        dtype=torch.float32,
+        device="cpu",
+    )
+    with torch.no_grad():
+        m.dense.weight.normal_(0.0, 0.05)
+        m.dense.bias.normal_(0.0, 0.05)
+    return m
+
+
+def test_adarmsnorm_project_modulation_is_pure_and_shaped(_adarms_linear_env):
+    """``project_modulation`` returns a ``(K, 3*D)`` table and stores nothing."""
+    torch.manual_seed(0)
+    hidden, cond_dim, k = 64, 48, 5
+    m = _make_cpu_adarms(hidden, cond_dim)
+    conds = torch.randn(k, cond_dim)
+    mod = m.project_modulation(conds)
+    assert mod.shape == (k, 3 * hidden)
+    # Pure: no cache attribute left on the module.
+    assert not hasattr(m, "_mod_cache")
+    # Matches the dense projection directly.
+    ref, _ = m.dense(conds)
+    torch.testing.assert_close(mod, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_adarmsnorm_modulation_matches_cond_path_cpu(_adarms_linear_env):
+    """``forward(x, modulation=row)`` equals ``forward(x, cond_row)`` broadcast."""
+    torch.manual_seed(1)
+    hidden = cond_dim = 128
+    chunk, k = 20, 6
+    m = _make_cpu_adarms(hidden, cond_dim)
+
+    conds = torch.randn(k, cond_dim)
+    mod = m.project_modulation(conds)
+
+    for i in (0, 2, k - 1):
+        x = torch.randn(chunk, hidden)
+        out_mod, gate_mod = m(x, modulation=mod[i : i + 1])
+        out_ref, gate_ref = m(x, conds[i : i + 1].expand(chunk, -1))
+        torch.testing.assert_close(out_mod, out_ref, atol=1e-5, rtol=1e-5)
+        assert gate_mod.shape == (1, hidden)
+        torch.testing.assert_close(
+            gate_mod.expand(chunk, -1).contiguous(), gate_ref, atol=1e-5, rtol=1e-5
+        )
+
+
+def test_adarmsnorm_requires_exactly_one_of_cond_or_modulation_cpu(_adarms_linear_env):
+    torch.manual_seed(2)
+    hidden = cond_dim = 32
+    m = _make_cpu_adarms(hidden, cond_dim)
+    x = torch.randn(4, hidden)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        m(x)  # neither
+    cond = torch.randn(4, cond_dim)
+    mod = m.project_modulation(cond)
+    with pytest.raises(ValueError, match="exactly one"):
+        m(x, cond, modulation=mod[:1])  # both

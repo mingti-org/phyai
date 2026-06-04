@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 
 from phyai.engine_config import get_engine_config
-from phyai.layers.linear.layers import ReplicatedLinear
+from phyai.layers.linear import ReplicatedLinear
 from phyai.weights.shards import replicated
 
 _VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "phyai-kernel")
@@ -462,6 +462,16 @@ class AdaRMSNorm(nn.Module):
     The Triton kernel handles both shapes via a ``group_size`` derived
     from ``prod(x.shape[:-1]) / prod(modulation.shape[:-1])``; the torch
     backend just does the arithmetic broadcast.
+
+    The op is stateless: it either projects a ``cond`` it is handed, or
+    applies a ``modulation`` it is handed — exactly one per call. When the
+    conditioning is drawn from a small, fixed, input-independent set, a
+    caller can project them all once with :meth:`project_modulation` (a
+    pure helper that stores nothing) and later pass a single
+    ``(1, 3 * hidden_size)`` row back via ``forward(x, modulation=...)``;
+    the kernel broadcasts that row across all rows of ``x``. This keeps the
+    ``self.dense`` projection out of a captured graph that replays the same
+    schedule many times, without the op holding any per-call cache.
     """
 
     def __init__(
@@ -515,26 +525,69 @@ class AdaRMSNorm(nn.Module):
         # the Triton kernel so forward can dispatch through one indirection.
         return _torch_adarmsnorm
 
+    def project_modulation(self, conds: torch.Tensor) -> torch.Tensor:
+        """Project a fixed set of conditioning rows to their modulation.
+
+        Runs ``conds`` ``(K, cond_dim)`` through ``self.dense`` once and
+        returns the projected ``(K, 3 * hidden_size)`` table. This is a
+        **pure** helper — it stores nothing on the module. The caller owns
+        the returned table and feeds individual rows back through
+        ``forward(x, modulation=row)``; that is the path used when the
+        conditioning is a small, fixed, input-independent set (so the
+        projections are constants) and the forward runs many times — e.g.
+        inside a captured graph that would otherwise replay the projection
+        on every call.
+
+        Call after the real ``dense`` weights are loaded. Because the op
+        holds no cache, there is no stale-cache hazard: re-project whenever
+        the weights or the conditioning set change.
+        """
+        if conds.shape[-1] != self.cond_dim:
+            raise ValueError(
+                f"AdaRMSNorm.project_modulation: conds last dim "
+                f"{conds.shape[-1]} does not match cond_dim={self.cond_dim}."
+            )
+        with torch.no_grad():
+            return self.dense(conds)[0].contiguous()
+
     def forward(
         self,
         x: torch.Tensor,
-        cond: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        *,
+        modulation: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if cond.shape[-1] != self.cond_dim:
-            raise ValueError(
-                f"AdaRMSNorm: cond last dim {cond.shape[-1]} does not match "
-                f"cond_dim={self.cond_dim}."
-            )
         if x.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"AdaRMSNorm: x last dim {x.shape[-1]} does not match "
                 f"hidden_size={self.hidden_size}."
             )
+        if (cond is None) == (modulation is None):
+            raise ValueError(
+                "AdaRMSNorm.forward: provide exactly one of `cond` or `modulation`."
+            )
 
-        modulation, _ = self.dense(cond)
-        # When ``x`` is 3-D ``(B, S, D)`` and ``modulation`` came from a 2-D
-        # ``cond`` ``(B, cond_dim)``, broadcast the modulation across the
-        # sequence axis.
+        if modulation is None:
+            # Project the per-token condition through ``self.dense``.
+            if cond.shape[-1] != self.cond_dim:
+                raise ValueError(
+                    f"AdaRMSNorm: cond last dim {cond.shape[-1]} does not match "
+                    f"cond_dim={self.cond_dim}."
+                )
+            modulation, _ = self.dense(cond)
+        else:
+            # Use the caller's already-projected modulation (e.g. one row of
+            # a :meth:`project_modulation` table). A single ``(1, 3D)`` row
+            # broadcasts across all rows of ``x`` via the kernel's leading-dim
+            # ratio; a ``(B, 3D)`` modulation maps per batch.
+            if modulation.shape[-1] != 3 * self.hidden_size:
+                raise ValueError(
+                    f"AdaRMSNorm: modulation last dim {modulation.shape[-1]} "
+                    f"does not match 3 * hidden_size={3 * self.hidden_size}."
+                )
+
+        # When ``x`` is 3-D ``(B, S, D)`` and ``modulation`` is 2-D
+        # ``(B, 3D)``, broadcast the modulation across the sequence axis.
         if x.dim() == 3 and modulation.dim() == 2:
             modulation = modulation.unsqueeze(1)
 

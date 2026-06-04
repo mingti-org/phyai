@@ -29,6 +29,9 @@ from phyai.models.pi05.configuration_pi05 import (
 from phyai.models.pi05.modeling_pi05 import (
     SIGLIP_NORM_HF_NAMES,
     ActionTimeHeads,
+    ExpertLayerModulation,
+    ExpertModulationTables,
+    ExpertStepModulation,
     MultiModalProjector,
     PaliGemmaDecoderLayer,
     PaliGemmaEmbedTokens,
@@ -54,6 +57,9 @@ __all__ = [
     "SiglipVisionConfig",
     # Modeling
     "ActionTimeHeads",
+    "ExpertLayerModulation",
+    "ExpertModulationTables",
+    "ExpertStepModulation",
     "MultiModalProjector",
     "PaliGemmaDecoderLayer",
     "PaliGemmaEmbedTokens",

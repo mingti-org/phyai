@@ -74,6 +74,7 @@ from phyai.layers.attention import (
 from phyai.layers.rotary_embedding import RotaryEmbedding
 from phyai.models.pi05.modeling_pi05 import (
     ActionTimeHeads,
+    ExpertModulationTables,
     PaliGemmaLanguageModel,
     PI05ExpertStack,
     PI05VisionTower,
@@ -112,6 +113,43 @@ def _diffusion_attn_proto(stack_layers) -> DiffusionAttention:
     if len(stack_layers) == 0:
         raise ValueError("stack has no layers; cannot read attention metadata.")
     return stack_layers[0].attn
+
+
+def _modulation_tables_match(
+    a: ExpertModulationTables, b: ExpertModulationTables
+) -> bool:
+    """True if two modulation table sets share layout, dtype, and device.
+
+    Used to decide whether a re-bound schedule can be copied into the
+    existing tensors (preserving captured-graph storage) or needs a fresh
+    assignment.
+    """
+    if len(a.layers) != len(b.layers):
+        return False
+
+    def _same(x: torch.Tensor, y: torch.Tensor) -> bool:
+        return x.shape == y.shape and x.dtype == y.dtype and x.device == y.device
+
+    if not _same(a.final, b.final):
+        return False
+    return all(
+        _same(ai, bi) and _same(ap, bp)
+        for (ai, ap), (bi, bp) in zip(a.layers, b.layers)
+    )
+
+
+def _copy_modulation_tables_(
+    dst: ExpertModulationTables, src: ExpertModulationTables
+) -> None:
+    """Copy ``src`` into ``dst``'s tensors in place (shapes must match).
+
+    Keeps ``dst``'s storage stable so an already-captured graph that reads the
+    tables keeps seeing the same addresses after a same-shape schedule re-bind.
+    """
+    dst.final.copy_(src.final)
+    for (dst_in, dst_post), (src_in, src_post) in zip(dst.layers, src.layers):
+        dst_in.copy_(src_in)
+        dst_post.copy_(src_post)
 
 
 # ============================================================================ #
@@ -532,6 +570,13 @@ class PI05ExpertRunner(ModelRunner):
         self._dt: float = 0.0
         self._num_steps: int = 0
 
+        # Per-norm AdaRMS modulation tables for the whole expert stack across
+        # all Euler steps, built from ``_time_emb_table`` in
+        # ``bind_euler_schedule``. ``_one_step`` slices step ``i`` out and
+        # hands it to the (stateless) norms, so the ``dense`` projections stay
+        # out of the captured graph. ``None`` until the schedule is bound.
+        self._mod_tables: ExpertModulationTables | None = None
+
     def set_write_indices(self, write_indices_suffix: torch.Tensor) -> None:
         """Bind the suffix-slab slot indices once at scheduler setup."""
         if write_indices_suffix.shape != self.write_indices_suffix_buf.shape:
@@ -551,6 +596,12 @@ class PI05ExpertRunner(ModelRunner):
         is the AdaRMS conditioning for that Euler step. ``dt`` is the
         (constant) step size. The captured graph reads these in-graph, so
         they must be bound before the graph is captured.
+
+        The schedule is input-independent, so every AdaRMS modulation is a
+        constant of ``step``. We project them all once here (see
+        :meth:`_build_modulation_tables`); the captured loop then selects each
+        step's modulation by index instead of re-running the projection,
+        keeping those GEMMs out of the graph.
         """
         if time_emb_table.shape[0] != num_steps:
             raise ValueError(
@@ -560,6 +611,31 @@ class PI05ExpertRunner(ModelRunner):
         self._time_emb_table = time_emb_table
         self._dt = float(dt)
         self._num_steps = int(num_steps)
+        self._build_modulation_tables()
+
+    def _build_modulation_tables(self) -> None:
+        """Build (or refresh) the runner-held AdaRMS modulation tables.
+
+        Each step's conditioning is ``time_emb_table[step]`` (the per-token
+        ``cond`` is just that row broadcast over the action tokens), and the
+        schedule is input-independent, so one projection of the whole table
+        per norm yields a ``(num_steps, 3*D)`` table that ``_one_step`` slices
+        by index. The (stateless) norms read these via ``forward(modulation=...)``,
+        so the ``dense`` GEMMs stay out of the captured graph.
+
+        On a same-shape re-bind the new tables are copied *in place* into the
+        existing tensors so an already-captured graph keeps reading the same
+        storage (matches the CUDA-graph stability the rest of this runner
+        relies on); otherwise they are assigned fresh.
+        """
+        assert self._time_emb_table is not None
+        new_tables = self.expert_stack.build_modulation_tables(self._time_emb_table)
+        if self._mod_tables is not None and _modulation_tables_match(
+            self._mod_tables, new_tables
+        ):
+            _copy_modulation_tables_(self._mod_tables, new_tables)
+        else:
+            self._mod_tables = new_tables
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
@@ -657,12 +733,18 @@ class PI05ExpertRunner(ModelRunner):
     def _one_step(
         self,
         x_t: torch.Tensor,
-        time_emb: torch.Tensor,
+        step: int,
     ) -> torch.Tensor:
-        """One Euler denoise step: ``embed_action -> 18 layers -> project``."""
+        """One Euler denoise step: ``embed_action -> 18 layers -> project``.
+
+        ``step`` selects this step's AdaRMS modulation from the runner-held
+        tables (built in :meth:`bind_euler_schedule`) and hands it to the
+        stateless norms, so the per-token ``cond`` projection never runs
+        in-graph.
+        """
+        assert self._mod_tables is not None  # built in bind_euler_schedule()
         action_emb = self.heads.embed_action(x_t)
         suffix_h = action_emb.reshape(self.batch_size * self.chunk_size, -1)
-        cond_per_token = time_emb.repeat_interleave(self.chunk_size, dim=0)
         ctx = DiffusionAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
@@ -674,9 +756,10 @@ class PI05ExpertRunner(ModelRunner):
         suffix_out = self.expert_stack(
             suffix_h,
             self.pos_ids_suffix_buf,
-            cond_per_token,
+            None,
             self.rope,
             ctx,
+            modulation=self._mod_tables.step(step),
         )
         suffix_out_3d = suffix_out.view(self.batch_size, self.chunk_size, -1)
         return self.heads.project_action(suffix_out_3d)
@@ -685,17 +768,16 @@ class PI05ExpertRunner(ModelRunner):
         """Run the full ``num_steps``-step Euler loop, returning final ``x_t``.
 
         Unrolled at a constant ``num_steps`` so it captures into one CUDA
-        graph. Each step reads its conditioning from the constant
-        ``time_emb_table`` (a static in-graph lookup) and applies the
-        flow-matching update ``x_t <- x_t + dt * v_t`` — bit-identical to
-        the old scheduler-driven loop, just without the per-step graph
-        launch and the eager between-step update.
+        graph. Each step selects its AdaRMS modulation by index from the
+        runner-held tables (a static in-graph lookup) and applies the
+        flow-matching update ``x_t <- x_t + dt * v_t`` — equivalent to the
+        old scheduler-driven loop, just without the per-step graph launch, the
+        eager between-step update, and the in-graph modulation projections.
         """
         assert self._time_emb_table is not None  # bound in setup()
         x_t = noise
         for step in range(self._num_steps):
-            time_emb = self._time_emb_table[step : step + 1].expand(self.batch_size, -1)
-            v_t = self._one_step(x_t, time_emb)
+            v_t = self._one_step(x_t, step)
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
         return x_t
 

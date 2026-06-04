@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -82,7 +83,7 @@ from phyai.layers.attention.ar import ARAttention, ARAttnCtx
 from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
 from phyai.layers.conv import Conv2d
 from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm
-from phyai.layers.linear.layers import (
+from phyai.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -90,7 +91,7 @@ from phyai.layers.linear.layers import (
 from phyai.layers.mlp.dense_mlp import DenseMLP
 from phyai.layers.rotary_embedding import RotaryEmbedding
 from phyai.layers.transformer_block import TransformerBlock
-from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
+from phyai.layers.vocab_embedding import VocabParallelEmbedding
 from phyai.models.pi05.configuration_pi05 import (
     GemmaExpertConfig,
     PaliGemmaTextConfig,
@@ -799,6 +800,66 @@ class PaliGemmaLanguageModel(nn.Module):
 # ============================================================================ #
 
 
+@dataclass(frozen=True)
+class ExpertLayerModulation:
+    """Precomputed AdaRMS modulation for one expert layer at one step.
+
+    Each :class:`AdaRMSNorm` owns its own ``dense`` projection, so a layer's
+    two norms have two distinct modulation rows. Each tensor is
+    ``(1, 3 * hidden_size)`` — a single row that broadcasts across all action
+    tokens (the per-token ``cond`` for a step is one timestep embedding shared
+    by every token).
+    """
+
+    input_ln: torch.Tensor
+    post_attention_ln: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ExpertStepModulation:
+    """Precomputed AdaRMS modulation for the whole expert stack at one step.
+
+    ``layers[j]`` is layer ``j``'s pair; ``final`` is the trailing norm's
+    ``(1, 3 * hidden_size)`` row. Produced by
+    :meth:`ExpertModulationTables.step`.
+    """
+
+    layers: tuple[ExpertLayerModulation, ...]
+    final: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ExpertModulationTables:
+    """Precomputed AdaRMS modulation for the whole stack across all steps.
+
+    Built once per Euler schedule by :meth:`PI05ExpertStack.build_modulation_tables`
+    and held by the action-expert runner. ``layers[j]`` is the
+    ``(input_ln, post_attention_ln)`` pair for layer ``j``, each a
+    ``(num_steps, 3 * hidden_size)`` table; ``final`` is the trailing norm's
+    ``(num_steps, 3 * hidden_size)`` table. :meth:`step` slices one step out
+    for a single forward pass.
+    """
+
+    layers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    final: torch.Tensor
+
+    def step(self, i: int) -> ExpertStepModulation:
+        """Select step ``i``'s modulation for every norm in the stack.
+
+        Uses ``t[i : i + 1]`` row slices: each is a contiguous
+        ``(1, 3 * hidden_size)`` view into the table at a *constant* offset,
+        so this is safe to call inside a captured graph (the slice address is
+        baked in and the underlying storage stays the table's).
+        """
+        return ExpertStepModulation(
+            layers=tuple(
+                ExpertLayerModulation(inp[i : i + 1], post[i : i + 1])
+                for inp, post in self.layers
+            ),
+            final=self.final[i : i + 1],
+        )
+
+
 class PI05ExpertLayer(nn.Module):
     """One gemma_300m action-expert decoder layer with AdaRMS norms.
 
@@ -927,9 +988,11 @@ class PI05ExpertLayer(nn.Module):
         self,
         h: torch.Tensor,
         position_ids: torch.Tensor,
-        cond: torch.Tensor,
+        cond: torch.Tensor | None,
         rope: RotaryEmbedding,
         attn_ctx: DiffusionAttnCtx,
+        *,
+        modulation: ExpertLayerModulation | None = None,
     ) -> torch.Tensor:
         """Pre-AdaRMS self-attention + gated MLP, with KV cache scatter.
 
@@ -937,9 +1000,17 @@ class PI05ExpertLayer(nn.Module):
         output broadcast across ``chunk_size`` action tokens). Both
         norms produce ``(out, gate)`` and the matching residual is
         gated by that gate.
+
+        When the condition comes from a fixed, precomputed schedule, pass
+        ``modulation`` (an :class:`ExpertLayerModulation`) instead of
+        ``cond`` (``cond`` may then be ``None``); each norm applies its
+        precomputed row directly, skipping the ``dense`` projection.
         """
         residual = h
-        n, gate_attn = self.input_layernorm(h, cond)
+        if modulation is None:
+            n, gate_attn = self.input_layernorm(h, cond)
+        else:
+            n, gate_attn = self.input_layernorm(h, modulation=modulation.input_ln)
         fused, _ = self.qkv_proj(n)
         q, k, v = self._split_qkv(fused, h.shape[:-1])
         q, k = rope(position_ids, q, k)
@@ -951,7 +1022,12 @@ class PI05ExpertLayer(nn.Module):
         # twice, so it matches the old two-op form to bf16 ulp).
         h = torch.addcmul(residual, out, gate_attn)
         residual = h
-        m, gate_mlp = self.post_attention_layernorm(h, cond)
+        if modulation is None:
+            m, gate_mlp = self.post_attention_layernorm(h, cond)
+        else:
+            m, gate_mlp = self.post_attention_layernorm(
+                h, modulation=modulation.post_attention_ln
+            )
         m = self.mlp(m)
         return torch.addcmul(residual, m, gate_mlp)
 
@@ -1007,23 +1083,55 @@ class PI05ExpertStack(nn.Module):
             prefix=f"{prefix}.norm" if prefix else "",
         )
 
-    def final_norm(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def build_modulation_tables(self, conds: torch.Tensor) -> ExpertModulationTables:
+        """Project ``conds`` through every norm's ``dense`` once.
+
+        ``conds`` is the ``(num_steps, adarms_cond_dim)`` schedule of per-step
+        conditioning rows (one timestep embedding per Euler step). Each norm
+        owns its own ``dense``, so this returns one ``(num_steps, 3 * D)``
+        table per norm, bundled into an :class:`ExpertModulationTables` the
+        runner holds and slices per step. Call after the ``dense`` weights are
+        loaded (the projections bake in those weights).
+        """
+        layers = tuple(
+            (
+                layer.input_layernorm.project_modulation(conds),
+                layer.post_attention_layernorm.project_modulation(conds),
+            )
+            for layer in self.layers
+        )
+        return ExpertModulationTables(
+            layers=layers, final=self.norm.project_modulation(conds)
+        )
+
+    def final_norm(
+        self,
+        h: torch.Tensor,
+        cond: torch.Tensor | None,
+        *,
+        modulation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply the trailing AdaRMSNorm and discard the unused gate.
 
         The trailing norm produces ``(out, gate)`` like every other
         AdaRMSNorm call, but no sublayer follows it so the gate has
         nothing to multiply — drop it here so callers don't have to.
         """
-        out, _ = self.norm(h, cond)
+        if modulation is None:
+            out, _ = self.norm(h, cond)
+        else:
+            out, _ = self.norm(h, modulation=modulation)
         return out
 
     def forward(
         self,
         h: torch.Tensor,
         position_ids: torch.Tensor,
-        cond: torch.Tensor,
+        cond: torch.Tensor | None,
         rope: RotaryEmbedding,
         attn_ctx: DiffusionAttnCtx,
+        *,
+        modulation: ExpertStepModulation | None = None,
     ) -> torch.Tensor:
         """Run every expert layer + final AdaRMSNorm.
 
@@ -1031,13 +1139,21 @@ class PI05ExpertStack(nn.Module):
         to ``(B * chunk_size, adarms_cond_dim)``); the same ``cond`` is
         threaded through every layer's gated norms and the trailing
         :meth:`final_norm`.
+
+        When the condition is one step of a fixed, precomputed schedule,
+        pass ``modulation`` (an :class:`ExpertStepModulation`) instead
+        (``cond`` may be ``None``); each layer gets its precomputed row pair
+        and the final norm its row, so no ``dense`` projection runs here.
         """
-        for layer in self.layers:
-            h = layer(h, position_ids, cond, rope, attn_ctx)
-        return self.final_norm(h, cond)
+        for j, layer in enumerate(self.layers):
+            layer_mod = None if modulation is None else modulation.layers[j]
+            h = layer(h, position_ids, cond, rope, attn_ctx, modulation=layer_mod)
+        final_mod = None if modulation is None else modulation.final
+        return self.final_norm(h, cond, modulation=final_mod)
 
 
-# 5. Action / time heads — sinusoidal time embedding + action projections             #
+# ============================================================================ #
+# 5. Action / time heads — sinusoidal time embedding + action projections      #
 # ============================================================================ #
 
 
@@ -1177,7 +1293,7 @@ class ActionTimeHeads(nn.Module):
 
 
 # ============================================================================ #
-# 6. Top-level pi0.5 inference model — flat parameter container                                           #
+# 6. Top-level pi0.5 inference model — flat parameter container                #
 # ============================================================================ #
 
 
@@ -1347,6 +1463,9 @@ __all__ = [
     # Configuration re-exports come from ``configuration_pi05``; this
     # module owns every nn.Module the pi0.5 inference path needs.
     "ActionTimeHeads",
+    "ExpertLayerModulation",
+    "ExpertModulationTables",
+    "ExpertStepModulation",
     "MultiModalProjector",
     "PaliGemmaDecoderLayer",
     "PaliGemmaEmbedTokens",

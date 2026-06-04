@@ -415,3 +415,129 @@ def test_phyai_layers_adarmsnorm_rejects_flashinfer():
 
     with pytest.raises(ValueError, match="flashinfer"):
         AdaRMSNorm(hidden_size=64, cond_dim=64, backend="flashinfer", prefix="x")
+
+
+# --------------------------------------------------------------------------- #
+# Precomputed-modulation path (forward(x, modulation=...) == forward(x, cond))  #
+# --------------------------------------------------------------------------- #
+
+
+def _make_adarms(hidden: int, cond_dim: int) -> "object":
+    from phyai.layers import AdaRMSNorm
+
+    layer = (
+        AdaRMSNorm(
+            hidden_size=hidden,
+            cond_dim=cond_dim,
+            eps=1e-6,
+            backend="phyai-kernel",
+            prefix="model.layers.0.input_layernorm",
+        )
+        .cuda()
+        .to(torch.bfloat16)
+    )
+    with torch.no_grad():
+        layer.dense.weight.normal_(0.0, 0.05)
+        layer.dense.bias.normal_(0.0, 0.05)
+    return layer
+
+
+def test_phyai_layers_adarmsnorm_modulation_matches_dense_path():
+    """``forward(x, modulation=row)`` (precomputed, broadcast over all rows)
+    matches the standard ``forward(x, cond)`` projection path.
+
+    The conditioning is a fixed set of ``K`` rows; every token in one step
+    shares the same row, so a single precomputed modulation row broadcast
+    across the tokens must equal projecting that row per token. Near-, not
+    bit-exact (the projection runs at a different row count), so use the file
+    tolerance.
+    """
+    pytest.importorskip("phyai.layers")
+
+    hidden = cond_dim = 1024
+    chunk = 50
+    n_steps = 10
+    layer = _make_adarms(hidden, cond_dim)
+
+    conds = torch.randn(n_steps, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    mod = layer.project_modulation(conds)
+    assert tuple(mod.shape) == (n_steps, 3 * hidden)
+
+    for i in (0, 3, n_steps - 1):
+        x = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+
+        out_idx, gate_idx = layer(x, modulation=mod[i : i + 1])
+
+        # Reference: the dense path with this row broadcast across all tokens,
+        # exactly as the runtime did before the precompute (every row equal).
+        cond_rows = conds[i : i + 1].expand(chunk, -1)
+        out_ref, gate_ref = layer(x, cond_rows)
+
+        torch.testing.assert_close(out_idx, out_ref, rtol=2e-2, atol=2e-2)
+        # The lookup gate is a single broadcast row; compare against any
+        # reference row (they are all identical) and check the shape.
+        assert gate_idx.shape == (1, hidden)
+        torch.testing.assert_close(
+            gate_idx.expand(chunk, -1).contiguous(),
+            gate_ref,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+
+def test_phyai_layers_adarmsnorm_modulation_gate_broadcast_in_addcmul():
+    """A ``(1, D)`` lookup gate broadcasts through ``torch.addcmul`` to the
+    same result as a full ``(N, D)`` gate (the gated-residual use site)."""
+    pytest.importorskip("phyai.layers")
+
+    hidden = cond_dim = 256
+    chunk = 50
+    layer = _make_adarms(hidden, cond_dim)
+    conds = torch.randn(4, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    mod = layer.project_modulation(conds)
+
+    x = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+    residual = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+    out_idx, gate_idx = layer(x, modulation=mod[2:3])  # gate_idx: (1, hidden)
+
+    gated_broadcast = torch.addcmul(residual, out_idx, gate_idx)
+    gated_full = torch.addcmul(residual, out_idx, gate_idx.expand(chunk, -1))
+    torch.testing.assert_close(gated_broadcast, gated_full, rtol=0, atol=0)
+
+
+def test_phyai_layers_adarmsnorm_modulation_3d_input():
+    """The precomputed path also serves 3-D ``x`` ``(B, S, D)`` by broadcasting
+    the single modulation row over both leading axes."""
+    pytest.importorskip("phyai.layers")
+
+    hidden = cond_dim = 256
+    layer = _make_adarms(hidden, cond_dim)
+    conds = torch.randn(6, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    mod = layer.project_modulation(conds)
+
+    x = torch.randn(2, 7, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+    out_idx, gate_idx = layer(x, modulation=mod[1:2])
+
+    cond_rows = conds[1].reshape(1, 1, cond_dim).expand(2, 7, -1)
+    out_ref, _ = layer(x, cond_rows)
+    torch.testing.assert_close(out_idx, out_ref, rtol=2e-2, atol=2e-2)
+    assert out_idx.shape == (2, 7, hidden)
+    assert gate_idx.shape == (1, 1, hidden)
+
+
+def test_phyai_layers_adarmsnorm_requires_exactly_one_of_cond_or_modulation():
+    pytest.importorskip("phyai.layers")
+
+    hidden = cond_dim = 128
+    layer = _make_adarms(hidden, cond_dim)
+    x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
+
+    # Neither cond nor modulation.
+    with pytest.raises(ValueError, match="exactly one"):
+        layer(x)
+
+    # Both cond and modulation.
+    cond = torch.randn(4, cond_dim, device="cuda", dtype=torch.bfloat16)
+    mod = layer.project_modulation(cond)
+    with pytest.raises(ValueError, match="exactly one"):
+        layer(x, cond, modulation=mod[:1])
