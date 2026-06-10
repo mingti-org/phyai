@@ -14,7 +14,7 @@ measurement, not correctness.
 
 Run::
 
-    LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat/lib uv run python \\
+    uv run python \\
         benchmark/bench_n_batch_ws1_pi05.py \\
         --checkpoint /path/to/pi05_base \\
         --batch-sizes 1 2 4 --n-warmup 5 --n-timed 30 \\
