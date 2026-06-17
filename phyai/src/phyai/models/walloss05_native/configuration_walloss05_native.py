@@ -34,6 +34,11 @@ class WallOSS05NativeConfig(PretrainedConfig):
     num_hidden_layers: int = 36
     num_attention_heads: int = 16
     num_key_value_heads: int = 2
+    max_position_embeddings: int = 128000
+    rope_theta: float = 1000000.0
+    rope_scaling: Mapping[str, Any] | None = None
+    attention_dropout: float = 0.0
+    _attn_implementation: str = "flash_mask"
     rms_norm_eps: float = 1e-6
     hidden_act: str = "silu"
 
@@ -143,6 +148,10 @@ class WallOSS05NativeConfig(PretrainedConfig):
             )
         )
 
+        attn_impl = getattr(self, "_attn_implementation", "flash_mask")
+        if train_config.get("_attn_implementation", None) is not None:
+            attn_impl = str(train_config["_attn_implementation"])
+
         return replace(
             self,
             dof_config=dof_config,
@@ -153,6 +162,7 @@ class WallOSS05NativeConfig(PretrainedConfig):
             flow_loss_weight=float(model.get("flow_loss_weight", self.flow_loss_weight)),
             ar_loss_weight=float(model.get("ar_loss_weight", self.ar_loss_weight)),
             norm_key=str(norm_key),
+            _attn_implementation=attn_impl,
         )
 
 
