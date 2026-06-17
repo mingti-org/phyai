@@ -275,11 +275,133 @@ class WallOSS05SparseMoeBlockNative(nn.Module):
         return final_output
 
 
+
+
+class WallOSS05Qwen2RMSNormNative(nn.Module):
+    """Exact non-adaptive Qwen2 RMSNorm used by WALL-OSS-0.5.
+
+    PR26's phyai.layers.RMSNorm currently exposes flashinfer / phyai-kernel
+    backends only in this environment. This thin native layer mirrors the
+    official Wall-X Qwen2RMSNorm ordinary path exactly and can later be swapped
+    to phyai.layers.RMSNorm once a torch fallback backend is available.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.variance_epsilon = float(eps)
+        self.prefix = prefix
+        self.weight = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype, device=device))
+        if prefix:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        if cond is not None:
+            raise NotImplementedError("WALL-OSS-0.5 baseline uses use_adarms=False")
+
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        normed = x * torch.rsqrt(variance + self.variance_epsilon)
+        normed = self.weight.to(torch.float32) * normed
+        return normed.to(input_dtype), None
+
+
+class WallOSS05NormMoeNative(nn.Module):
+    """Expert-wise RMSNorm for WALL-OSS-0.5 norm_moe=True, mot_opt=True."""
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        kind: str,
+        dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        if kind not in {"input", "post_attention"}:
+            raise ValueError(f"unknown norm kind {kind!r}")
+
+        if not config.norm_moe:
+            raise NotImplementedError("Initial native NormMoe only supports norm_moe=True")
+        if not config.mot_opt:
+            raise NotImplementedError("Initial native NormMoe only supports mot_opt=True")
+        if config.use_adarms:
+            raise NotImplementedError("WALL-OSS-0.5 baseline uses use_adarms=False")
+
+        self.dim_inputs = tuple(int(v) for v in config.dim_inputs)
+        self.num_experts = config.num_experts
+
+        if kind == "input":
+            prefix_base = f"model.layers.{layer_idx}.input_layernorms"
+        else:
+            prefix_base = f"model.layers.{layer_idx}.post_attention_layernorms"
+
+        self.norms = nn.ModuleList(
+            [
+                WallOSS05Qwen2RMSNormNative(
+                    self.dim_inputs[i],
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                    device=device,
+                    prefix=f"{prefix_base}.{i}",
+                )
+                for i in range(self.num_experts)
+            ]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+        adarms_conds: list[torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        if adarms_conds is None:
+            adarms_conds = [None] * self.num_experts
+
+        new_hidden_states = torch.zeros_like(hidden_states)
+
+        for expert_idx, expert_norm in enumerate(self.norms):
+            start = int(start_indices[expert_idx].item())
+            end = int(end_indices[expert_idx].item())
+            if start == end:
+                continue
+
+            dim_input = self.dim_inputs[expert_idx]
+            selected = hidden_states[start:end]
+            input_slice = selected[:, :dim_input]
+            cond = adarms_conds[expert_idx]
+
+            processed, gate = expert_norm(input_slice, cond)
+            if gate is not None:
+                raise NotImplementedError("Unexpected adaptive RMSNorm gate in baseline path")
+
+            new_hidden_states[start:end, :dim_input] = processed.to(hidden_states.dtype)
+
+        return new_hidden_states, None, None
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
         return key
     if key.startswith("model.layers.") and ".moe.experts." in key:
+        return key
+    if key.startswith("model.layers.") and (".input_layernorms." in key or ".post_attention_layernorms." in key):
         return key
     return None
 
@@ -287,6 +409,8 @@ def walloss05_native_weight_remap(key: str) -> str | None:
 __all__ = [
     "WallOSS05ActionProcessorNative",
     "WallOSS05BlockSparseMLPNative",
+    "WallOSS05NormMoeNative",
+    "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",
     "WallOSS05SinusoidalPosEmb",
     "walloss05_native_weight_remap",

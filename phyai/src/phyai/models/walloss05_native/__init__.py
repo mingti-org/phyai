@@ -4,6 +4,8 @@ from .configuration_walloss05_native import WallOSS05NativeConfig
 from .modeling_walloss05_native import (
     WallOSS05ActionProcessorNative,
     WallOSS05BlockSparseMLPNative,
+    WallOSS05NormMoeNative,
+    WallOSS05Qwen2RMSNormNative,
     WallOSS05SparseMoeBlockNative,
     WallOSS05SinusoidalPosEmb,
     walloss05_native_weight_remap,
@@ -13,6 +15,8 @@ __all__ = [
     "WallOSS05NativeConfig",
     "WallOSS05ActionProcessorNative",
     "WallOSS05BlockSparseMLPNative",
+    "WallOSS05NormMoeNative",
+    "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",
     "WallOSS05SinusoidalPosEmb",
     "walloss05_native_weight_remap",
