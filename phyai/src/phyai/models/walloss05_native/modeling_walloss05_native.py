@@ -158,15 +158,136 @@ class WallOSS05ActionProcessorNative(nn.Module):
         return embed, None
 
 
+
+def _activation_fn(name: str) -> nn.Module:
+    if name == "silu":
+        return nn.SiLU()
+    if name == "gelu":
+        return nn.GELU()
+    raise ValueError(f"unsupported activation {name!r}")
+
+
+class WallOSS05BlockSparseMLPNative(nn.Module):
+    """Single expert MLP used by WALL-OSS-0.5 SparseMoeBlock."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        params_dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
+        prefix: str,
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.intermediate_size = int(intermediate_size)
+        self.hidden_act = hidden_act
+
+        self.gate_up_proj = ReplicatedLinear(
+            self.hidden_size,
+            2 * self.intermediate_size,
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = ReplicatedLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            prefix=f"{prefix}.down_proj",
+        )
+        self.act_fn = _activation_fn(hidden_act)
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        gate_up_out = _linear_forward(self.gate_up_proj, hidden_state)
+        gate_out, up_out = gate_up_out.split(
+            [self.intermediate_size, self.intermediate_size],
+            dim=-1,
+        )
+        act_out = self.act_fn(gate_out) * up_out
+        return _linear_forward(self.down_proj, act_out)
+
+
+class WallOSS05SparseMoeBlockNative(nn.Module):
+    """Expert-routed MLP block matching Wall-X SparseMoeBlock for mot_opt=True."""
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        params_dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.dim_inputs = tuple(int(v) for v in config.dim_inputs)
+        self.permuted = bool(config.mot_opt)
+
+        if not self.permuted:
+            raise NotImplementedError("Initial native SparseMoeBlock only supports mot_opt=True")
+
+        if not config.experts:
+            raise ValueError("config.experts must be present for SparseMoeBlock")
+
+        self.experts = nn.ModuleList()
+        for idx in range(self.num_experts):
+            expert_cfg = config.experts[idx]
+            self.experts.append(
+                WallOSS05BlockSparseMLPNative(
+                    hidden_size=int(expert_cfg["hidden_size"]),
+                    intermediate_size=int(expert_cfg["intermediate_size"]),
+                    hidden_act=str(expert_cfg["hidden_act"]),
+                    params_dtype=params_dtype,
+                    device=device,
+                    prefix=f"model.layers.{layer_idx}.moe.experts.{idx}",
+                )
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        experts_indices: torch.Tensor | None,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        del experts_indices
+
+        permuted_inputs = hidden_states
+        final_output = torch.zeros_like(permuted_inputs)
+
+        for expert_idx, expert in enumerate(self.experts):
+            start = int(start_indices[expert_idx].item())
+            end = int(end_indices[expert_idx].item())
+            if start == end:
+                continue
+
+            dim_input = self.dim_inputs[expert_idx]
+            expert_input = permuted_inputs[start:end, :dim_input]
+            partial_output = expert(expert_input)
+            final_output[start:end, :dim_input] = partial_output[:, :dim_input]
+
+        return final_output
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
+        return key
+    if key.startswith("model.layers.") and ".moe.experts." in key:
         return key
     return None
 
 
 __all__ = [
     "WallOSS05ActionProcessorNative",
+    "WallOSS05BlockSparseMLPNative",
+    "WallOSS05SparseMoeBlockNative",
     "WallOSS05SinusoidalPosEmb",
     "walloss05_native_weight_remap",
 ]
