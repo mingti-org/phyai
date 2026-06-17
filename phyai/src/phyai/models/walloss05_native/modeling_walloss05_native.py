@@ -585,6 +585,72 @@ class WallOSS05JointAttentionProjectionNative(nn.Module):
         return output_buffer
 
 
+
+
+def walloss05_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Official WALL-X/Qwen2.5-VL rotate-half: [x1, x2] -> [-x2, x1]."""
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class WallOSS05MRoPENative(nn.Module):
+    """Strict official-compatible M-RoPE used by WALL-OSS-0.5 JointQwen2VLAttention.
+
+    Mirrors wall_x.model.core.ops.rope.MRoPEOp._pytorch_fallback:
+      1. cos/sin half-dim -> full-dim by cat((cos, cos), -1)
+      2. split by mrope_section + mrope_section
+      3. select temporal/height/width pieces with i % 3
+      4. apply NeoX-style rotate_half
+    """
+
+    def __init__(self, mrope_section: list[int] | tuple[int, ...]):
+        super().__init__()
+        section = tuple(int(v) for v in mrope_section)
+        if len(section) != 3:
+            raise ValueError(f"mrope_section must have 3 entries, got {section}")
+        if any(v <= 0 for v in section):
+            raise ValueError(f"mrope_section entries must be positive, got {section}")
+        self.mrope_section = section
+
+    def forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_dtype = query_states.dtype
+        k_dtype = key_states.dtype
+
+        cos = cos.float()
+        sin = sin.float()
+
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
+
+        mrope_section_doubled = list(self.mrope_section) + list(self.mrope_section)
+
+        cos_split = torch.cat(
+            [m[i % 3] for i, m in enumerate(cos.split(mrope_section_doubled, dim=-1))],
+            dim=-1,
+        ).unsqueeze(2)
+        sin_split = torch.cat(
+            [m[i % 3] for i, m in enumerate(sin.split(mrope_section_doubled, dim=-1))],
+            dim=-1,
+        ).unsqueeze(2)
+
+        q_embed = (query_states.float() * cos_split) + (
+            walloss05_rotate_half(query_states.float()) * sin_split
+        )
+        k_embed = (key_states.float() * cos_split) + (
+            walloss05_rotate_half(key_states.float()) * sin_split
+        )
+
+        return q_embed.to(q_dtype), k_embed.to(k_dtype)
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -603,6 +669,7 @@ __all__ = [
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
     "WallOSS05JointAttentionProjectionNative",
+    "WallOSS05MRoPENative",
     "WallOSS05NormMoeNative",
     "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",
