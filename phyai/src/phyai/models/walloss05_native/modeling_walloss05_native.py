@@ -299,7 +299,7 @@ class WallOSS05Qwen2RMSNormNative(nn.Module):
         self.hidden_size = int(hidden_size)
         self.variance_epsilon = float(eps)
         self.prefix = prefix
-        self.weight = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype, device=device))
+        self.weight = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype, device=device), requires_grad=False)
         if prefix:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
 
@@ -1028,6 +1028,105 @@ class WallOSS05DecoderLayerNative(nn.Module):
         return hidden_states
 
 
+
+
+class WallOSS05DecoderModelNative(nn.Module):
+    """Decoder-only native skeleton for WALL-OSS-0.5.
+
+    This stacks all WALL-OSS-0.5 decoder layers and final expert-wise RMSNorms.
+    Embeddings, vision tower, action generation loop, and processor/runtime logic
+    are intentionally handled outside this skeleton.
+    """
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        params_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [
+                WallOSS05DecoderLayerNative(
+                    config,
+                    layer_idx=layer_idx,
+                    params_dtype=params_dtype,
+                    device=device,
+                )
+                for layer_idx in range(int(config.num_hidden_layers))
+            ]
+        )
+        self.norms = nn.ModuleList(
+            [
+                WallOSS05Qwen2RMSNormNative(
+                    int(config.dim_inputs[expert_idx]),
+                    eps=float(config.rms_norm_eps),
+                    dtype=torch.float32,
+                    device=device,
+                    prefix=f"model.norms.{expert_idx}",
+                )
+                for expert_idx in range(int(config.num_experts))
+            ]
+        )
+
+    def final_norm(
+        self,
+        hidden_states: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        new_hidden_states = torch.zeros_like(hidden_states)
+        for expert_idx, norm in enumerate(self.norms):
+            start = int(start_indices[expert_idx].item())
+            end = int(end_indices[expert_idx].item())
+            if start == end:
+                continue
+            dim_input = int(self.config.dim_inputs[expert_idx])
+            processed, gate = norm(hidden_states[start:end, :dim_input], None)
+            if gate is not None:
+                raise NotImplementedError("WALL-OSS-0.5 baseline expects no final adaptive norm gate")
+            new_hidden_states[start:end, :dim_input] = processed.to(hidden_states.dtype)
+        return new_hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_types: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+        row_id_map: torch.Tensor,
+        probs: torch.Tensor | None,
+        orig_shape: tuple[int, int, int],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        adarms_conds: list[torch.Tensor | None] | None = None,
+        projection_dtype: torch.dtype | None = None,
+        apply_final_norm: bool = True,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                token_types=token_types,
+                start_indices=start_indices,
+                end_indices=end_indices,
+                row_id_map=row_id_map,
+                probs=probs,
+                orig_shape=orig_shape,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                adarms_conds=adarms_conds,
+                projection_dtype=projection_dtype,
+            )
+
+        if apply_final_norm:
+            hidden_states = self.final_norm(hidden_states, start_indices, end_indices)
+
+        return hidden_states
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -1038,6 +1137,8 @@ def walloss05_native_weight_remap(key: str) -> str | None:
         return key
     if key.startswith("model.layers.") and (".self_attn.qkv_proj_experts." in key or ".self_attn.o_proj_experts." in key):
         return key
+    if key.startswith("model.norms."):
+        return key
     return None
 
 
@@ -1047,6 +1148,7 @@ __all__ = [
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
     "WallOSS05DecoderLayerNative",
+    "WallOSS05DecoderModelNative",
     "WallOSS05JointAttentionNative",
     "WallOSS05JointAttentionProjectionNative",
     "WallOSS05MRoPENative",
