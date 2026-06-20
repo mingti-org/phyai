@@ -122,10 +122,10 @@ The diagram below illustrates how phyai's three model runners cooperate with the
 
 # End-to-end example
 
-`examples/run_pi05.py` exercises the full path with deterministic dummy inputs at `max_batch_size ∈ {1, 4}` and includes a multi-batch equivalence check. To run it:
+`examples/pi05/run_pi05.py` exercises the full path with deterministic dummy inputs at `max_batch_size ∈ {1, 4}` and includes a multi-batch equivalence check. To run it:
 
 ```bash
-uv run python examples/run_pi05.py --checkpoint /path/to/pi0.5
+uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi0.5
 ```
 
 The script prints per-phase latency stats (mean / median / std / min / max over 3 warmups + 30 timed runs) and a `PASS` line for the equivalence check. Just change the path after `--checkpoint` to your local checkpoint path.

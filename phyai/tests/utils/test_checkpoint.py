@@ -14,6 +14,7 @@ from phyai.models.configuration import PretrainedConfig
 from phyai.utils.checkpoint import (
     find_safetensors,
     load_config,
+    resolve_checkpoint,
 )
 
 
@@ -177,5 +178,70 @@ def test_load_config_custom_filename(tmp_path: Path):
 
 
 def test_load_config_dir_validation(tmp_path: Path):
-    with pytest.raises(FileNotFoundError, match="does not exist"):
+    # Nonexistent path is resolved first: it is neither local nor a valid repo
+    # id, so resolve_checkpoint raises before _ensure_dir is reached.
+    with pytest.raises(FileNotFoundError, match="not a valid HuggingFace repo id"):
         load_config(tmp_path / "ghost", _TinyConfig)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_checkpoint                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_checkpoint_local_dir_returns_path(tmp_path: Path):
+    out = resolve_checkpoint(tmp_path)
+    assert out == tmp_path
+    assert out.is_dir()
+
+
+def test_resolve_checkpoint_local_file_returns_path(tmp_path: Path):
+    f = tmp_path / "model.safetensors"
+    f.write_bytes(b"")
+    out = resolve_checkpoint(f)
+    assert out == f
+    assert out.is_file()
+
+
+def test_resolve_checkpoint_local_str_path(tmp_path: Path):
+    out = resolve_checkpoint(str(tmp_path))
+    assert isinstance(out, Path)
+    assert out == tmp_path
+
+
+def test_resolve_checkpoint_typo_path_raises_filenotfound(tmp_path: Path):
+    """A nonexistent path containing '/' is rejected offline (no network)."""
+    with pytest.raises(FileNotFoundError, match="not a valid HuggingFace repo id"):
+        resolve_checkpoint(tmp_path / "ghost" / "sub")
+
+
+def test_resolve_checkpoint_repo_id_forwarded(tmp_path: Path, monkeypatch):
+    """A non-local source is treated as a repo id and downloaded."""
+    seen: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs):
+        seen.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    out = resolve_checkpoint("nvidia/Cosmos3-Nano", revision="abc123")
+    assert out == tmp_path
+    assert seen["repo_id"] == "nvidia/Cosmos3-Nano"
+    assert seen["repo_type"] == "model"
+    assert seen["revision"] == "abc123"
+
+
+def test_load_config_from_repo_id(tmp_path: Path, monkeypatch):
+    """load_config resolves a repo id, then parses config.json from the cache."""
+    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 64}))
+    seen: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs):
+        seen.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    cfg = load_config("org/model", _TinyConfig, revision="r1")
+    assert cfg.hidden_size == 64
+    assert seen["repo_id"] == "org/model"
+    assert seen["revision"] == "r1"

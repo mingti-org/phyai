@@ -199,8 +199,7 @@ class Engine:
         existing = cls._plugins.get(name)
         if existing is not None and existing is not entry_cls:
             raise ValueError(
-                f"plugin name {name!r} is already registered to "
-                f"{existing.__name__}."
+                f"plugin name {name!r} is already registered to {existing.__name__}."
             )
         cls._plugins[name] = entry_cls
         return entry_cls
@@ -280,8 +279,7 @@ class Engine:
         entry_cls = self._plugins.get(args.plugin)
         if entry_cls is None:
             raise ValueError(
-                f"unknown plugin {args.plugin!r}; registered: "
-                f"{list(self._plugins)!r}."
+                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
             )
         if not isinstance(args.plugin_args, entry_cls.args_cls):
             raise TypeError(
@@ -387,3 +385,7 @@ __all__ = [
 # ---------------------------------------------------------------------- #
 
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
+from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
+from phyai.models.cosmos3 import (  # noqa: E402, F401
+    main_cosmos3_policy as _main_cosmos3_policy,
+)

@@ -352,6 +352,7 @@ class PI05WS1Scheduler(Scheduler):
     # Setup                                                              #
     # ------------------------------------------------------------------ #
 
+    @torch.no_grad()
     def setup(self) -> None:
         """Warm up runners and capture every CUDA graph.
 

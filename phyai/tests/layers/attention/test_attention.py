@@ -324,3 +324,85 @@ def test_flashinfer_padded_b1_matches_eager():
     eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     out_e = eager(q.float(), k.float(), v.float())
     assert torch.allclose(out_fi.float(), out_e, atol=1e-2, rtol=1e-2)
+
+
+# --------------------------------------------------------------------- #
+# Rectangular cross-attention: 4-D padded with S_q != S_kv              #
+# --------------------------------------------------------------------- #
+
+
+def test_eager_sdpa_padded_match_rectangular():
+    """4-D padded with S_q != S_kv (cross-attention) — eager vs sdpa, B>1 + GQA."""
+    torch.manual_seed(10)
+    B, S_q, S_kv, H, H_kv, D = 2, 5, 9, 4, 2, 16
+    q = torch.randn(B, S_q, H, D)
+    k = torch.randn(B, S_kv, H_kv, D)
+    v = torch.randn(B, S_kv, H_kv, D)
+    eager = Attention(
+        num_heads=H, head_dim=D, num_kv_heads=H_kv, backend="eager", causal=False
+    )
+    sdpa = Attention(
+        num_heads=H,
+        head_dim=D,
+        num_kv_heads=H_kv,
+        backend="sdpa",
+        causal=False,
+        backend_kwargs={"compile": False},
+    )
+    out_e = eager(q, k, v)
+    out_s = sdpa(q, k, v)
+    assert out_e.shape == (B, S_q, H, D)
+    assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
+
+
+def test_padded_rectangular_matches_ragged():
+    """4-D padded rectangular == the same data packed into the 3-D ragged path.
+
+    Confirms the padded path's synthesized uniform cu_seqlens (built in
+    ``_build_default_ctx``) describe the same attention as explicit ragged
+    cu_seqlens — i.e. a 4-D ``attn(q, k, v)`` with S_q != S_kv needs no manual
+    packing.
+    """
+    torch.manual_seed(11)
+    B, S_q, S_kv, H, D = 2, 4, 7, 4, 16
+    q = torch.randn(B, S_q, H, D)
+    k = torch.randn(B, S_kv, H, D)
+    v = torch.randn(B, S_kv, H, D)
+    attn = Attention(num_heads=H, head_dim=D, backend="eager", causal=False)
+    out_padded = attn(q, k, v)
+    cu_q = torch.arange(0, (B + 1) * S_q, S_q, dtype=torch.int32)
+    cu_kv = torch.arange(0, (B + 1) * S_kv, S_kv, dtype=torch.int32)
+    out_ragged = attn(
+        q.reshape(B * S_q, H, D),
+        k.reshape(B * S_kv, H, D),
+        v.reshape(B * S_kv, H, D),
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+    ).reshape(B, S_q, H, D)
+    assert torch.allclose(out_padded, out_ragged, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.skipif(
+    not _can_use_flashinfer(),
+    reason="flashinfer requires CUDA + flashinfer-python.",
+)
+def test_flashinfer_padded_rectangular_matches_eager():
+    """flashinfer 4-D padded with S_q != S_kv matches eager, for B==1 and B>1.
+
+    B==1 routes through ``single_prefill`` (already rectangular); B>1 exercises
+    the synthesized padded cu_seqlens + ragged-KV plan (the gap the fix closes —
+    B>1 padded raised before). This is the regression guard for cosmos3's
+    cross-attention after dropping its hand-rolled ``_attend``.
+    """
+    torch.manual_seed(12)
+    H, D, S_q, S_kv = 4, 64, 5, 9
+    for B in (1, 2):
+        q = torch.randn(B, S_q, H, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, S_kv, H, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, S_kv, H, D, device="cuda", dtype=torch.float16)
+        fi = Attention(num_heads=H, head_dim=D, backend="flashinfer", causal=False)
+        out_fi = fi(q, k, v)
+        eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=False)
+        out_e = eager(q.float(), k.float(), v.float())
+        assert out_fi.shape == (B, S_q, H, D)
+        assert torch.allclose(out_fi.float(), out_e, atol=1e-2, rtol=1e-2)

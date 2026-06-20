@@ -11,11 +11,11 @@ numbers are meaningless (inputs are random); this verifies wiring + timing.
 
 Run::
 
-    uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base/
+    uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base/
 
-The argument is a HuggingFace-style checkpoint **folder**: it must
-contain ``config.json`` and either ``model.safetensors`` or
-``model.safetensors.index.json`` plus its shards.
+The argument is a HuggingFace-style checkpoint **folder** (or a HuggingFace
+repo id, downloaded on first use): it must contain ``config.json`` and either
+``model.safetensors`` or ``model.safetensors.index.json`` plus its shards.
 """
 
 from __future__ import annotations
@@ -140,9 +140,9 @@ def main() -> None:
         type=Path,
         required=True,
         help=(
-            "Path to the pi05_base checkpoint folder. Must contain "
-            "config.json and either model.safetensors or "
-            "model.safetensors.index.json with its shards."
+            "pi05_base checkpoint: a local folder, or a HuggingFace repo id "
+            "(downloaded on first use). Must contain config.json and either "
+            "model.safetensors or model.safetensors.index.json with its shards."
         ),
     )
     parser.add_argument(
@@ -212,11 +212,6 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-
-    if not args.checkpoint.is_dir():
-        raise NotADirectoryError(
-            f"--checkpoint must be a directory, got: {args.checkpoint}"
-        )
 
     plugin_cfg = load_config(args.checkpoint, PI05Config)
     device = torch.device("cuda")

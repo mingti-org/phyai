@@ -10,8 +10,10 @@ dependencies = [
     "torch==2.11",
     "safetensors",
     "torchvision",
-    "flashinfer-python==v0.6.11.post3",
+    "flashinfer-python==v0.6.12",
     "transformers==5.8.1",
+    "huggingface-hub",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

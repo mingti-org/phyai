@@ -1,18 +1,4 @@
-"""Conv{1,2,3}d wrappers tagged for the phyai loader system.
-
-Plain ``torch.nn.Conv{1,2,3}d`` would suffice for compute, but the rest
-of phyai expects every parameter-bearing layer to attach load metadata
-to its parameters so the top-level loader can dispatch generically.
-These classes are nothing more than ``F.conv{1,2,3}d`` with replicated
-:func:`phyai.weights.shards.replicated` loaders on each parameter — no
-tensor-parallel sharding, no kernel dispatch.
-
-Constructor signatures mirror ``torch.nn.Conv{1,2,3}d`` so existing
-configs drop in unchanged: ``int`` / tuple / ``"same"`` / ``"valid"``
-padding, grouped/depthwise convs via ``groups``, and the four
-``padding_mode`` variants (``"zeros"``, ``"reflect"``, ``"replicate"``,
-``"circular"``).
-"""
+"""Conv{1,2,3}d wrappers tagged for the phyai loader system."""
 
 from __future__ import annotations
 
@@ -23,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.engine_config import get_engine_config
-from phyai.weights.shards import replicated
+from phyai.weights.shards import replicated, weight_norm_fold
 
 _size_1_t = Union[int, Tuple[int]]
 _size_2_t = Union[int, Tuple[int, int]]
@@ -41,6 +27,33 @@ def _ntuple(n: int, x: int | Tuple[int, ...]) -> Tuple[int, ...]:
     if len(t) != n:
         raise ValueError(f"expected a length-{n} sequence, got {t!r}")
     return t
+
+
+def _attach_conv_loaders(
+    weight: nn.Parameter,
+    bias: nn.Parameter | None,
+    prefix: str,
+    weight_norm: bool,
+) -> None:
+    """Tag a conv's ``weight``/``bias`` with loader metadata (no-op if no prefix).
+
+    ``weight_norm=True`` expects a legacy ``weight_norm`` checkpoint — the weight
+    arrives split as ``<prefix>.weight_g`` / ``<prefix>.weight_v`` and is folded into
+    the single dense ``weight`` at load time via
+    :func:`phyai.weights.shards.weight_norm_fold`. Otherwise the weight loads whole
+    from ``<prefix>.weight``. Bias (if any) always loads whole from ``<prefix>.bias``.
+    """
+    if not prefix:
+        return
+    if weight_norm:
+        weight.hf_keys = [(f"{prefix}.weight_g", "g"), (f"{prefix}.weight_v", "v")]
+        weight.weight_loader = weight_norm_fold()
+    else:
+        weight.hf_keys = [(f"{prefix}.weight", None)]
+        weight.weight_loader = replicated()
+    if bias is not None:
+        bias.hf_keys = [(f"{prefix}.bias", None)]
+        bias.weight_loader = replicated()
 
 
 class _ConvNd(nn.Module):
@@ -70,6 +83,7 @@ class _ConvNd(nn.Module):
         dtype: torch.dtype | None,
         device: torch.device | str | None,
         prefix: str = "",
+        weight_norm: bool = False,
     ) -> None:
         super().__init__()
         if groups <= 0:
@@ -129,12 +143,7 @@ class _ConvNd(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        if prefix:
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = replicated()
-            if self.bias is not None:
-                self.bias.hf_keys = [(f"{prefix}.bias", None)]
-                self.bias.weight_loader = replicated()
+        _attach_conv_loaders(self.weight, self.bias, prefix, weight_norm)
 
     @staticmethod
     def _build_reversed_pad(
@@ -217,6 +226,7 @@ class Conv1d(_ConvNd):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
+        weight_norm: bool = False,
     ) -> None:
         super().__init__(
             in_channels,
@@ -231,6 +241,7 @@ class Conv1d(_ConvNd):
             dtype,
             device,
             prefix=prefix,
+            weight_norm=weight_norm,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -257,6 +268,7 @@ class Conv2d(_ConvNd):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
+        weight_norm: bool = False,
     ) -> None:
         super().__init__(
             in_channels,
@@ -271,6 +283,7 @@ class Conv2d(_ConvNd):
             dtype,
             device,
             prefix=prefix,
+            weight_norm=weight_norm,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -297,6 +310,7 @@ class Conv3d(_ConvNd):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
+        weight_norm: bool = False,
     ) -> None:
         super().__init__(
             in_channels,
@@ -311,10 +325,108 @@ class Conv3d(_ConvNd):
             dtype,
             device,
             prefix=prefix,
+            weight_norm=weight_norm,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._conv(F.conv3d, x)
 
 
-__all__ = ["Conv1d", "Conv2d", "Conv3d"]
+class ConvTranspose1d(nn.Module):
+    """1-D transposed convolution. Mirrors :class:`torch.nn.ConvTranspose1d` for inference.
+
+    Weight layout is ``(in_channels, out_channels // groups, kernel_size)`` — the
+    transposed-conv convention, which differs from :class:`_ConvNd` — so
+    ``nn.ConvTranspose1d`` / HuggingFace checkpoints copy straight in. Like
+    :class:`Conv1d` it tags each parameter with a :func:`replicated` loader (or a
+    :func:`weight_norm_fold` loader when ``weight_norm=True``); no TP sharding, no
+    kernel dispatch — just ``F.conv_transpose1d``.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: _size_1_t,
+        stride: _size_1_t = 1,
+        padding: _size_1_t = 0,
+        output_padding: _size_1_t = 0,
+        groups: int = 1,
+        bias: bool = True,
+        dilation: _size_1_t = 1,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        prefix: str = "",
+        weight_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        if groups <= 0:
+            raise ValueError(f"groups must be >= 1, got {groups}")
+        if in_channels % groups != 0:
+            raise ValueError(
+                f"in_channels={in_channels} not divisible by groups={groups}"
+            )
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"out_channels={out_channels} not divisible by groups={groups}"
+            )
+        if device is None:
+            device = get_engine_config().device.target
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _ntuple(1, kernel_size)
+        self.stride = _ntuple(1, stride)
+        self.padding = _ntuple(1, padding)
+        self.output_padding = _ntuple(1, output_padding)
+        self.dilation = _ntuple(1, dilation)
+        self.groups = groups
+        self.prefix = prefix
+
+        weight_shape = (in_channels, out_channels // groups) + self.kernel_size
+        self.weight = nn.Parameter(
+            torch.empty(weight_shape, dtype=dtype, device=device),
+            requires_grad=False,
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(out_channels, dtype=dtype, device=device),
+                requires_grad=False,
+            )
+        else:
+            self.register_parameter("bias", None)
+
+        _attach_conv_loaders(self.weight, self.bias, prefix, weight_norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv_transpose1d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
+            self.dilation,
+        )
+
+    def extra_repr(self) -> str:
+        s = (
+            f"{self.in_channels}, {self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}"
+        )
+        if self.padding != (0,):
+            s += f", padding={self.padding}"
+        if self.output_padding != (0,):
+            s += f", output_padding={self.output_padding}"
+        if self.dilation != (1,):
+            s += f", dilation={self.dilation}"
+        if self.groups != 1:
+            s += f", groups={self.groups}"
+        if self.bias is None:
+            s += ", bias=False"
+        return s
+
+
+__all__ = ["Conv1d", "Conv2d", "Conv3d", "ConvTranspose1d"]

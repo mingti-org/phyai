@@ -596,6 +596,33 @@ def init_engine_config(cfg: EngineConfig) -> EngineConfig:
     return cfg
 
 
+def resolve_engine_defaults(
+    params_dtype: torch.dtype | None,
+    attn_backend: str | None,
+    norm_backend: str | None,
+) -> tuple[torch.dtype, str, str]:
+    """Fill in ``None`` overrides from the process :class:`EngineConfig`.
+
+    Short-circuits when every argument is already a concrete override, so a
+    parent that has already resolved defaults can pass them through to a
+    child constructor without a second singleton read. Callers that
+    don't need ``attn_backend`` (norm-only sub-modules) just discard the
+    returned value.
+    """
+    if (
+        params_dtype is not None
+        and attn_backend is not None
+        and norm_backend is not None
+    ):
+        return params_dtype, attn_backend, norm_backend
+    ec = get_engine_config()
+    return (
+        ec.device.params_dtype if params_dtype is None else params_dtype,
+        ec.backends.attn if attn_backend is None else attn_backend,
+        ec.backends.norm if norm_backend is None else norm_backend,
+    )
+
+
 __all__ = [
     "BackendConfig",
     "DeviceConfig",
@@ -604,5 +631,6 @@ __all__ = [
     "RuntimeConfig",
     "get_engine_config",
     "init_engine_config",
+    "resolve_engine_defaults",
     "set_engine_config",
 ]

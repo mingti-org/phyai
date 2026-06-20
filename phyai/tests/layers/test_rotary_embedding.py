@@ -9,11 +9,14 @@ import torch
 
 from phyai.layers.rotary_embedding import (
     ROPE_INV_FREQ_FNS,
+    InterleavedMRotaryEmbedding,
     RotaryEmbedding,
     _default_inv_freq,
     _linear_inv_freq,
     _llama3_inv_freq,
     apply_rotary_pos_emb,
+    compute_cos_sin_from_inv_freq,
+    compute_qwen3vl_mrope_cos_sin_from_inv_freq,
     rotate_half,
 )
 
@@ -451,3 +454,71 @@ def test_flashinfer_rejects_cpu_input():
     pos = torch.arange(4)
     with pytest.raises(RuntimeError, match="rotary_emb.to"):
         m(pos, q, k)
+
+
+# ---------------------------------------------------------------------------
+# Static (stateless) compute fns — parity vs the instance get_cos_sin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+def test_compute_cos_sin_from_inv_freq_matches_instance(
+    interleave, partial_rotary_factor
+):
+    """The cache-free static fn equals the instance cache-gather path (1-D)."""
+    m = RotaryEmbedding(
+        16,
+        max_position_embeddings=64,
+        partial_rotary_factor=partial_rotary_factor,
+        interleave=interleave,
+        backend="eager",
+        device="cpu",
+    )
+    pos = torch.tensor([0, 1, 2, 3, 7, 15, 31])
+    cos_i, sin_i = m.get_cos_sin(pos)
+    cos_f, sin_f = compute_cos_sin_from_inv_freq(
+        pos,
+        m.inv_freq,
+        attention_scaling=m.attention_scaling,
+        interleave=interleave,
+    )
+    torch.testing.assert_close(cos_f, cos_i)
+    torch.testing.assert_close(sin_f, sin_i)
+
+
+def test_mrope_drops_cos_sin_cache_buffer():
+    """mRoPE recomputes from inv_freq; it must not carry the dead seq cache."""
+    mr = InterleavedMRotaryEmbedding(
+        16,
+        max_position_embeddings=64,
+        mrope_section=[2, 3, 3],
+        backend="eager",
+        device="cpu",
+    )
+    names = {n for n, _ in mr.named_buffers()}
+    assert "cos_sin_cache" not in names
+    assert not hasattr(mr, "cos_sin_cache")
+    assert "inv_freq" in names  # the seed it actually uses is kept
+
+
+def test_compute_qwen3vl_mrope_cos_sin_from_inv_freq_matches_instance():
+    """mRoPE instance get_cos_sin delegates to the free fn — byte-identical."""
+    mr = InterleavedMRotaryEmbedding(
+        16,
+        max_position_embeddings=64,
+        mrope_section=[2, 3, 3],
+        backend="eager",
+        device="cpu",
+    )
+    torch.manual_seed(0)
+    pos = torch.randint(0, 50, (3, 2, 7), dtype=torch.long)
+    cos_i, sin_i = mr.get_cos_sin(pos)
+    cos_f, sin_f = compute_qwen3vl_mrope_cos_sin_from_inv_freq(
+        pos,
+        mr.inv_freq,
+        mr.mrope_section,
+        attention_scaling=mr.attention_scaling,
+    )
+    assert torch.equal(cos_f, cos_i)
+    assert torch.equal(sin_f, sin_i)

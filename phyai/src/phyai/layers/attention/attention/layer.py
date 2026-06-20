@@ -193,8 +193,22 @@ class Attention(nn.Module):
     ) -> AttnCtx:
         backend = self._ensure_backend()
         if layout.is_padded():
-            B = q.shape[0]
-            num_query_tokens = q.shape[0] * q.shape[1]
+            B, S_q = q.shape[0], q.shape[1]
+            S_kv = k.shape[1]
+            num_query_tokens = B * S_q
+            # The flashinfer B>1 padded path plans a ragged-KV wrapper, which needs
+            # per-row q/kv offsets. Synthesize uniform cu_seqlens from the padded
+            # shapes so a 4-D batch works without the caller hand-packing — S_q may
+            # differ from S_kv (rectangular cross-attention). B==1 ignores these
+            # (single_prefill); sdpa/eager build their mask from shapes, not these.
+            if cu_seqlens_q is None:
+                cu_seqlens_q = torch.arange(
+                    0, (B + 1) * S_q, S_q, dtype=torch.int32, device=q.device
+                )
+            if cu_seqlens_kv is None:
+                cu_seqlens_kv = torch.arange(
+                    0, (B + 1) * S_kv, S_kv, dtype=torch.int32, device=q.device
+                )
         else:
             B = (cu_seqlens_q.numel() - 1) if cu_seqlens_q is not None else 1
             num_query_tokens = q.shape[0]

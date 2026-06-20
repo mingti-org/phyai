@@ -1,71 +1,6 @@
-"""pi0.5 inference model — vision + language + action expert (modules only).
+"""pi0.5
 
-Module layout for the pi0.5 inference path. Configs live in
-:mod:`configuration_pi05`; runners and scheduler live in
-:mod:`model_runner_pi05` and :mod:`scheduler_ws1_pi05` — the
-scheduler also owns the pi0.5-specific ragged-layout helpers
-(``cu_seqlens``, write-indices, padded packing). This file owns the
-``nn.Module`` classes only — every parameter declares its own
-``hf_keys`` so :func:`phyai.weights.load_pretrained` fills the model
-from ``pi05_base/model.safetensors`` without a remap.
-
-Sections (top -> bottom):
-
-1. **Engine defaults** — :func:`_resolve_engine_defaults`,
-   :func:`_adarms_backend`, :func:`_engine_to_paged_backend`.
-2. **Vision tower** — SigLIP-So400m + multi_modal_projector.
-3. **PaliGemma language model** — gemma_2b text side. Decoder layer
-   has its own :class:`ARAttention` bound to ``layer_idx`` and a real
-   ``forward(h, position_ids, rope, attn_ctx)`` that runs pre-norm
-   GQA attention + gated MLP end-to-end.
-4. **Action expert** — gemma_300m with AdaRMS conditioning + asymmetric
-   ``o_proj`` (joint attention output 2048 -> expert hidden 1024).
-   Each expert layer's ``forward`` mirrors the paligemma decoder plus
-   per-norm gates threaded from the AdaRMS condition.
-5. **Action / time heads** — sinusoidal time embedding, action_in /
-   action_out / time_mlp linears.
-5. **Top-level** — :class:`PI05Model` is a flat container holding
-   ``vision``, ``paligemma_lm``, ``expert_stack``, ``rope`` (shared
-   instance, passed by reference into stack forwards), and ``heads``.
-   No top-level forward; the runners in :mod:`model_runner_pi05` build
-   the right ctx (``ARAttnCtx`` for paligemma, ``DiffusionAttnCtx`` for
-   the expert) and call ``stack(h, position_ids, [cond,] rope, ctx)``.
-
-Default ``prefix`` strings throughout match the
-``paligemma_with_expert.*`` namespace of the pi0.5 base checkpoint;
-the action / time projection heads sit at the safetensors root.
-``embed_tokens.weight`` reuses the LM-head tensor at
-``paligemma_with_expert.paligemma.lm_head.weight`` (the checkpoint
-ships only one copy — a tied embedding).
-
-State-dict layout under
-``{root}=PI05VisionTower.DEFAULT_PREFIX``::
-
-    {root}.vision_tower.vision_model.embeddings.patch_embedding.{weight,bias}
-    {root}.vision_tower.vision_model.embeddings.position_embedding.weight
-    {root}.vision_tower.vision_model.encoder.layers.{i}.layer_norm{1,2}.{weight,bias}
-    {root}.vision_tower.vision_model.encoder.layers.{i}.self_attn.{q,k,v,out}_proj.{weight,bias}
-    {root}.vision_tower.vision_model.encoder.layers.{i}.mlp.{fc1,fc2}.{weight,bias}
-    {root}.vision_tower.vision_model.post_layernorm.{weight,bias}
-    {root}.multi_modal_projector.linear.{weight,bias}
-    {root}.language_model.layers.{i}.input_layernorm.weight
-    {root}.language_model.layers.{i}.post_attention_layernorm.weight
-    {root}.language_model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
-    {root}.language_model.layers.{i}.mlp.{gate,up,down}_proj.weight
-    {root}.language_model.norm.weight
-    paligemma_with_expert.paligemma.lm_head.weight             ← embed_tokens
-    paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.{weight,bias}
-    paligemma_with_expert.gemma_expert.model.layers.{i}.post_attention_layernorm.dense.{weight,bias}
-    paligemma_with_expert.gemma_expert.model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
-    paligemma_with_expert.gemma_expert.model.layers.{i}.mlp.{gate,up,down}_proj.weight
-    paligemma_with_expert.gemma_expert.model.norm.dense.{weight,bias}
-    action_in_proj.{weight,bias}
-    action_out_proj.{weight,bias}
-    time_mlp_in.{weight,bias}
-    time_mlp_out.{weight,bias}
-
-Inference-only — every parameter is allocated with
-``requires_grad=False``. Training will land in a separate file.
+https://www.pi.website/blog/pi05
 """
 
 from __future__ import annotations
@@ -78,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config
+from phyai.engine_config import get_engine_config, resolve_engine_defaults
 from phyai.layers.attention.ar import ARAttention, ARAttnCtx
 from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
 from phyai.layers.conv import Conv2d
@@ -99,38 +34,6 @@ from phyai.models.pi05.configuration_pi05 import (
     SiglipVisionConfig,
 )
 from phyai.weights.shards import replicated
-
-
-# ============================================================================ #
-# 1. Engine defaults                                                           #
-# ============================================================================ #
-
-
-def _resolve_engine_defaults(
-    params_dtype: torch.dtype | None,
-    attn_backend: str | None,
-    norm_backend: str | None,
-) -> tuple[torch.dtype, str, str]:
-    """Fill in ``None`` overrides from the process :class:`EngineConfig`.
-
-    Short-circuits when every argument is already a concrete override, so a
-    parent that has already resolved defaults can pass them through to a
-    child constructor without a second singleton read. Callers that
-    don't need ``attn_backend`` (norm-only sub-modules) just discard the
-    returned value.
-    """
-    if (
-        params_dtype is not None
-        and attn_backend is not None
-        and norm_backend is not None
-    ):
-        return params_dtype, attn_backend, norm_backend
-    ec = get_engine_config()
-    return (
-        ec.device.params_dtype if params_dtype is None else params_dtype,
-        ec.backends.attn if attn_backend is None else attn_backend,
-        ec.backends.norm if norm_backend is None else norm_backend,
-    )
 
 
 def _adarms_backend(norm_backend: str) -> str:
@@ -176,11 +79,6 @@ def _engine_to_paged_backend(attn_backend: str) -> str:
     if canonical == "sdpa":
         return "eager"
     return canonical
-
-
-# ============================================================================ #
-# 2. Vision tower — SigLIP-So400m + multi_modal_projector                      #
-# ============================================================================ #
 
 
 # SigLIP encoder layers name their pre-norms ``layer_norm1`` /
@@ -318,7 +216,7 @@ class SiglipVisionEncoder(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         layer_prefix = f"{prefix}.layers" if prefix else ""
@@ -380,7 +278,7 @@ class SiglipVisionModel(nn.Module):
         prefix: str = "vision_model",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         self.config = config
@@ -480,32 +378,7 @@ class VisionTowerWrapper(nn.Module):
 
 
 class PI05VisionTower(nn.Module):
-    """SigLIP-So400m + PaliGemma multi_modal_projector, glued for pi0.5.
-
-    The default ``prefix`` mirrors the pi0.5 checkpoint's namespace so
-    :func:`phyai.weights.load_pretrained` matches keys directly without
-    a ``remap=`` argument. ``forward`` returns the
-    ``(B, num_patches, projection_dim)`` token bank that pi0.5's
-    ``embed_image`` step consumes — including the
-    ``* sqrt(projection_dim)`` post-projection scale so callers can drop
-    the result straight into the language model's embedding space.
-
-    Precision
-    ---------
-    The tower runs all of its weights, norms, conv, and the projection
-    scale at ``params_dtype`` (the **compute** dtype). The openpi /
-    lerobot parity path keeps the whole vision stack in fp32 while the
-    rest of the model is bf16; pass ``params_dtype=torch.float32`` for
-    that, and ``io_dtype`` (the surrounding model's dtype) so the output
-    is cast back to bf16 before it enters the language-model embedding
-    space — exactly mirroring lerobot's ``embed_image`` (upcast pixels ->
-    run fp32 tower -> downcast features). When ``params_dtype == io_dtype``
-    (the bf16 default) both boundary casts are no-ops, so the captured
-    vision graph is byte-identical to the single-dtype path. fp32 also
-    forces the norm backend to ``phyai-kernel`` via
-    :func:`_vision_norm_backend` (flashinfer's norm kernels require bf16
-    input).
-    """
+    """SigLIP-So400m + PaliGemma multi_modal_projector, glued for pi0.5."""
 
     DEFAULT_PREFIX: str = "paligemma_with_expert.paligemma.model"
 
@@ -520,7 +393,7 @@ class PI05VisionTower(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         # ``params_dtype`` is the vision *compute* dtype (may be fp32 for the
@@ -563,37 +436,8 @@ class PI05VisionTower(nn.Module):
         return h.to(self.io_dtype)
 
 
-# ============================================================================ #
-# 3. PaliGemma language model — gemma_2b text side                             #
-# ============================================================================ #
-
-
 class PaliGemmaEmbedTokens(nn.Module):
-    """Gemma vocab embedding with the pi0.5-specific double scaling.
-
-    Wraps :class:`VocabParallelEmbedding` so the post-lookup scale
-    factor is fused into the embedding op (zero-cost when
-    ``embed_scale=1.0``). The HF source key is **not**
-    ``embed_tokens.weight`` — pi0.5's checkpoint stores it as the
-    LM-head weight at ``paligemma_with_expert.paligemma.lm_head.weight``.
-    This class points ``weight.hf_keys`` directly there so
-    :func:`~phyai.weights.load_pretrained` matches the right tensor
-    without needing a ``remap=`` argument.
-
-    Scale convention: pi0.5 lang tokens are scaled by ``hidden_size`` —
-    *not* the textbook ``sqrt(hidden_size)``. lerobot's port hits this
-    scale by composition: HF's ``GemmaTextScaledWordEmbedding`` applies
-    ``x sqrt(hidden_size)`` inside its forward, and pi0.5's
-    ``embed_prefix`` then multiplies by ``sqrt(hidden_size)`` again
-    (``lang_emb * math.sqrt(lang_emb_dim)``), total ``x hidden_size``.
-    The matching openpi reference does the same. Vision tokens, in
-    contrast, only get a single ``x sqrt(hidden_size)`` scale (applied
-    by :class:`PI05VisionTower.projection_scale`); lang and image
-    streams therefore live at *different* magnitudes by design — the
-    model was trained with that asymmetry.
-
-    Forward signature: ``forward(input_ids: (B, S) int) -> (B, S, hidden_size)``.
-    """
+    """Gemma vocab embedding with the pi0.5-specific double scaling."""
 
     def __init__(
         self,
@@ -620,22 +464,7 @@ class PaliGemmaEmbedTokens(nn.Module):
 
 
 class PaliGemmaDecoderLayer(nn.Module):
-    """One PaliGemma decoder layer — pre-norm GQA self-attention + gated MLP.
-
-    Holds ``input_layernorm`` (:class:`GemmaRMSNorm`),
-    ``self_attn.qkv_proj`` (fused MQA 8/1),
-    ``self_attn.o_proj`` (2048->2048),
-    ``self_attn.attn`` (:class:`ARAttention` bound to this
-    layer's ``layer_idx``), ``post_attention_layernorm``, and ``mlp``
-    (gated GeGLU, gelu_pytorch_tanh, 2048->16384->2048). All projection
-    children are bias=False.
-
-    The :class:`~phyai.layers.rotary_embedding.RotaryEmbedding`
-    instance is shared across layers (its 8 MiB cos/sin cache would
-    duplicate to ~144 MiB if owned per-layer) and is therefore passed
-    by reference into :meth:`forward` rather than registered as a
-    child module.
-    """
+    """One PaliGemma decoder layer — pre-norm GQA self-attention + gated MLP."""
 
     def __init__(
         self,
@@ -648,7 +477,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         self.config = config
@@ -734,13 +563,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         rope: RotaryEmbedding,
         attn_ctx: ARAttnCtx,
     ) -> torch.Tensor:
-        """Pre-norm self-attention + gated MLP, with KV cache scatter.
-
-        ``rope`` is shared across layers (passed by reference). The
-        attention call dispatches through ``self.attn`` which is bound
-        to this layer's ``layer_id`` and writes K/V into
-        ``attn_ctx.kv_pool`` at ``attn_ctx.write_indices``.
-        """
+        """Pre-norm self-attention + gated MLP, with KV cache scatter."""
         residual = h
         n = self.input_layernorm(h)
         fused, _ = self.qkv_proj(n)
@@ -757,25 +580,7 @@ class PaliGemmaDecoderLayer(nn.Module):
 
 
 class PaliGemmaLanguageModel(nn.Module):
-    """PaliGemma language model: embed_tokens + 18 decoder layers + final norm.
-
-    The :meth:`forward` runs every decoder layer over ``inputs_embeds``
-    (sample-major packed prefix, ragged across the batch via
-    ``attn_ctx``) and applies the trailing :class:`GemmaRMSNorm`. For
-    pi0.5's prefix phase the runner discards the output and consumes
-    only the cache pool side-effect; for ad-hoc decode this is a
-    proper end-to-end LLM forward.
-
-    The :class:`~phyai.layers.rotary_embedding.RotaryEmbedding`
-    instance is shared (8 MiB cos/sin cache per copy) and passed by
-    reference into :meth:`forward`, not registered here as a child
-    module.
-
-    State-dict prefix is ``paligemma_with_expert.paligemma.model.language_model``
-    by default to match the pi0.5 base checkpoint. The ``embed_tokens``
-    parameter source is the **LM head** of the same checkpoint — see
-    :class:`PaliGemmaEmbedTokens`.
-    """
+    """PaliGemma language model: embed_tokens + 18 decoder layers + final norm."""
 
     DEFAULT_PREFIX: str = "paligemma_with_expert.paligemma.model.language_model"
 
@@ -789,7 +594,7 @@ class PaliGemmaLanguageModel(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         self.config = config
@@ -845,21 +650,9 @@ class PaliGemmaLanguageModel(nn.Module):
         return self.norm(h)
 
 
-# ============================================================================ #
-# 4. Action expert — gemma_300m with AdaRMS conditioning                       #
-# ============================================================================ #
-
-
 @dataclass(frozen=True)
 class ExpertLayerModulation:
-    """Precomputed AdaRMS modulation for one expert layer at one step.
-
-    Each :class:`AdaRMSNorm` owns its own ``dense`` projection, so a layer's
-    two norms have two distinct modulation rows. Each tensor is
-    ``(1, 3 * hidden_size)`` — a single row that broadcasts across all action
-    tokens (the per-token ``cond`` for a step is one timestep embedding shared
-    by every token).
-    """
+    """Precomputed AdaRMS modulation for one expert layer at one step."""
 
     input_ln: torch.Tensor
     post_attention_ln: torch.Tensor
@@ -867,12 +660,7 @@ class ExpertLayerModulation:
 
 @dataclass(frozen=True)
 class ExpertStepModulation:
-    """Precomputed AdaRMS modulation for the whole expert stack at one step.
-
-    ``layers[j]`` is layer ``j``'s pair; ``final`` is the trailing norm's
-    ``(1, 3 * hidden_size)`` row. Produced by
-    :meth:`ExpertModulationTables.step`.
-    """
+    """Precomputed AdaRMS modulation for the whole expert stack at one step."""
 
     layers: tuple[ExpertLayerModulation, ...]
     final: torch.Tensor
@@ -880,15 +668,7 @@ class ExpertStepModulation:
 
 @dataclass(frozen=True)
 class ExpertModulationTables:
-    """Precomputed AdaRMS modulation for the whole stack across all steps.
-
-    Built once per Euler schedule by :meth:`PI05ExpertStack.build_modulation_tables`
-    and held by the action-expert runner. ``layers[j]`` is the
-    ``(input_ln, post_attention_ln)`` pair for layer ``j``, each a
-    ``(num_steps, 3 * hidden_size)`` table; ``final`` is the trailing norm's
-    ``(num_steps, 3 * hidden_size)`` table. :meth:`step` slices one step out
-    for a single forward pass.
-    """
+    """Precomputed AdaRMS modulation for the whole stack across all steps."""
 
     layers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     final: torch.Tensor
@@ -911,26 +691,7 @@ class ExpertModulationTables:
 
 
 class PI05ExpertLayer(nn.Module):
-    """One gemma_300m action-expert decoder layer with AdaRMS norms.
-
-    Differs from :class:`PaliGemmaDecoderLayer` in two ways:
-
-    1. Both norms are :class:`AdaRMSNorm` conditioned on the per-token
-       diffusion timestep embedding. The norm forward returns
-       ``(out, gate)`` and the residual is **gated**
-       ``residual + sublayer * gate``.
-    2. ``o_proj`` has an asymmetric shape — input dim is
-       ``num_heads * head_dim`` (the joint attention output, 2048-D)
-       but output is the expert's ``hidden_size`` (1024). This is what
-       lets the expert participate in the same attention space as the
-       paligemma stream while keeping its own narrower hidden.
-
-    The layer's :class:`DiffusionAttention` is bound to
-    ``layer_idx`` — paged into the same per-layer slab paligemma's
-    matching layer wrote during the prefix phase, so the joint
-    attention range covers ``[cached prefix K/V, fresh suffix K/V]``
-    automatically.
-    """
+    """One gemma_300m action-expert decoder layer with AdaRMS norms."""
 
     def __init__(
         self,
@@ -948,7 +709,7 @@ class PI05ExpertLayer(nn.Module):
                 "PI05ExpertLayer requires GemmaExpertConfig.use_adarms=True; "
                 "non-AdaRMS expert is not part of pi0.5."
             )
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         adarms_backend = _adarms_backend(norm_backend)
@@ -1044,18 +805,7 @@ class PI05ExpertLayer(nn.Module):
         *,
         modulation: ExpertLayerModulation | None = None,
     ) -> torch.Tensor:
-        """Pre-AdaRMS self-attention + gated MLP, with KV cache scatter.
-
-        ``cond`` is the per-token AdaRMS condition (the time-MLP
-        output broadcast across ``chunk_size`` action tokens). Both
-        norms produce ``(out, gate)`` and the matching residual is
-        gated by that gate.
-
-        When the condition comes from a fixed, precomputed schedule, pass
-        ``modulation`` (an :class:`ExpertLayerModulation`) instead of
-        ``cond`` (``cond`` may then be ``None``); each norm applies its
-        precomputed row directly, skipping the ``dense`` projection.
-        """
+        """Pre-AdaRMS self-attention + gated MLP, with KV cache scatter."""
         residual = h
         if modulation is None:
             n, gate_attn = self.input_layernorm(h, cond)
@@ -1083,14 +833,7 @@ class PI05ExpertLayer(nn.Module):
 
 
 class PI05ExpertStack(nn.Module):
-    """gemma_300m action-expert stack: 18 :class:`PI05ExpertLayer` + final AdaRMSNorm.
-
-    No ``embed_tokens`` — the expert ingests action tokens directly via
-    ``action_in_proj`` (handled at the model top level).
-
-    State-dict prefix is ``paligemma_with_expert.gemma_expert.model``
-    to match pi0.5 base.
-    """
+    """gemma_300m action-expert stack: 18 :class:`PI05ExpertLayer` + final AdaRMSNorm."""
 
     DEFAULT_PREFIX: str = "paligemma_with_expert.gemma_expert.model"
 
@@ -1104,7 +847,7 @@ class PI05ExpertStack(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         adarms_backend = _adarms_backend(norm_backend)
@@ -1134,15 +877,7 @@ class PI05ExpertStack(nn.Module):
         )
 
     def build_modulation_tables(self, conds: torch.Tensor) -> ExpertModulationTables:
-        """Project ``conds`` through every norm's ``dense`` once.
-
-        ``conds`` is the ``(num_steps, adarms_cond_dim)`` schedule of per-step
-        conditioning rows (one timestep embedding per Euler step). Each norm
-        owns its own ``dense``, so this returns one ``(num_steps, 3 * D)``
-        table per norm, bundled into an :class:`ExpertModulationTables` the
-        runner holds and slices per step. Call after the ``dense`` weights are
-        loaded (the projections bake in those weights).
-        """
+        """Project ``conds`` through every norm's ``dense`` once."""
         layers = tuple(
             (
                 layer.input_layernorm.project_modulation(conds),
@@ -1202,11 +937,6 @@ class PI05ExpertStack(nn.Module):
         return self.final_norm(h, cond, modulation=final_mod)
 
 
-# ============================================================================ #
-# 5. Action / time heads — sinusoidal time embedding + action projections      #
-# ============================================================================ #
-
-
 def create_sinusoidal_pos_embedding(
     time: torch.Tensor,
     dimension: int,
@@ -1214,18 +944,7 @@ def create_sinusoidal_pos_embedding(
     min_period: float,
     max_period: float,
 ) -> torch.Tensor:
-    """Sin/cos timestep embedding for the flow-matching scheduler.
-
-    Computes::
-
-        period[i]   = min_period * (max_period / min_period) ** (i / (dim/2 - 1))
-        scale[i]    = 2π / period[i]
-        embed[b, i] = sin(scale[i] * time[b])  for i in [0, dim/2)
-        embed[b, i] = cos(scale[j] * time[b])  for i = dim/2 + j
-
-    Reductions and the period sweep run in fp32, then cast back to
-    ``time.dtype``.
-    """
+    """Sin cos timestep embedding for the flow-matching scheduler."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
     if time.dim() != 1:
@@ -1241,29 +960,7 @@ def create_sinusoidal_pos_embedding(
 
 
 class ActionTimeHeads(nn.Module):
-    """Action and time embedding projections, all biased Linears.
-
-    Holds:
-
-    * ``action_in_proj`` — ``Linear(max_action_dim, expert_hidden)``;
-      checkpoint key ``action_in_proj.{weight,bias}`` (root-level).
-    * ``action_out_proj`` — ``Linear(expert_hidden, max_action_dim)``;
-      checkpoint key ``action_out_proj.{weight,bias}``.
-    * ``time_mlp_in`` — ``Linear(expert_hidden, expert_hidden)``.
-    * ``time_mlp_out`` — ``Linear(expert_hidden, expert_hidden)``.
-
-    All checkpoint keys live at the **root** of the safetensors file
-    (no ``paligemma_with_expert.`` parent), so the prefix passed to the
-    underlying :class:`ReplicatedLinear` is just the leg name.
-
-    Forward methods:
-
-    * :meth:`embed_action` — ``(B, T, max_action_dim) -> (B, T, expert_hidden)``
-    * :meth:`project_action` — inverse of ``embed_action``
-    * :meth:`embed_time` — full time-MLP (sinusoidal + Linear + SiLU +
-      Linear + SiLU), returns ``(B, expert_hidden)`` ready to feed
-      :class:`AdaRMSNorm` as the AdaRMS condition.
-    """
+    """Action and time embedding projections, all biased Linears."""
 
     def __init__(
         self,
@@ -1342,11 +1039,6 @@ class ActionTimeHeads(nn.Module):
         return F.silu(h)
 
 
-# ============================================================================ #
-# 6. Top-level pi0.5 inference model — flat parameter container                #
-# ============================================================================ #
-
-
 class PI05Model(nn.Module):
     """Full pi0.5 inference model — flat composition of forward-able sub-modules.
 
@@ -1362,44 +1054,6 @@ class PI05Model(nn.Module):
     Each decoder layer (paligemma + expert) owns its own paged
     attention instance bound to its layer index — paligemma uses
     :class:`ARAttention` and the expert uses :class:`DiffusionAttention`.
-
-    ``vision_params_dtype`` selects the vision tower's compute precision
-    independently of the rest of the model: pass ``torch.float32`` to run
-    SigLIP + projector + their norms in fp32 (the openpi / lerobot parity
-    path) while ``paligemma_lm`` / ``expert_stack`` stay at ``params_dtype``
-    (bf16). ``None`` keeps the tower at the model dtype — the byte-identical
-    single-dtype default. The tower casts its output back to ``params_dtype``
-    internally, so the rest of the pipeline is unaffected.
-
-    The runners build the right ctx type per stack
-    (:class:`ARAttnCtx` / :class:`DiffusionAttnCtx`) and pass it
-    through ``stack(h, position_ids, [cond,] rope, ctx)``. No
-    top-level forward lives here — the runners + scheduler in
-    :mod:`phyai.models.pi05.model_runner_pi05` and
-    :mod:`phyai.models.pi05.scheduler_ws1_pi05` orchestrate
-    the two-phase prefix / Euler-step execution.
-
-    The shared :attr:`rope` is *not* registered on the layers (its
-    8 MiB cos/sin cache would balloon to ~144 MiB at 18 duplicates);
-    each layer's forward takes it as an argument so the single
-    instance is reused.
-
-    The matching ``layer_id`` between paligemma layer ``i`` and expert
-    layer ``i`` is what makes joint attention coherent: both write
-    into the same per-layer K/V slab in the runner-supplied
-    :class:`KVCachePool`, so flashinfer's interleaved
-    ``paged_kv_indices`` reads ``[prefix slots, suffix slots]`` in one
-    attention call. pi0.5's text and expert configs are validated to
-    share ``head_dim`` / ``num_attention_heads`` /
-    ``num_key_value_heads`` for this reason.
-
-    All heavy weight sources are declared via ``hf_keys`` on the
-    constituent parameters; :func:`phyai.weights.load_pretrained` can
-    fill the model from the pi0.5 base checkpoint directly without a
-    ``remap=`` argument. ``embed_tokens.weight`` lives at
-    ``paligemma_with_expert.paligemma.lm_head.weight`` per
-    :class:`PaliGemmaEmbedTokens`; the action / time projections live
-    at the safetensors root.
     """
 
     def __init__(
@@ -1414,7 +1068,7 @@ class PI05Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
+        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         # The vision tower may run at a different (typically higher) precision

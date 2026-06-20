@@ -1,4 +1,4 @@
-from phyai.utils.checkpoint import find_safetensors, load_config
+from phyai.utils.checkpoint import find_safetensors, load_config, resolve_checkpoint
 from phyai.utils.logging import all_ranks_log, this_rank_log
 from phyai.utils.profile import (
     NoOpProfiler,
@@ -34,6 +34,7 @@ __all__ = [
     "make_profiler",
     "mark_instant",
     "profile_config_from_args",
+    "resolve_checkpoint",
     "set_profiler",
     "this_rank_log",
 ]

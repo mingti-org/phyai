@@ -5,24 +5,6 @@ Each function returns a :data:`WeightLoader` closure with signature
 their ``nn.Parameter`` so :func:`phyai.weights.load_pretrained` can
 dispatch generically. The math runs at load time only — there is no
 forward-time cost.
-
-Five primitives cover every parallelism shape phyai uses today:
-
-* :func:`replicated` — full copy. Default for norms, replicated linear,
-  conv, and replicated quant scales.
-* :func:`sharded` — single-axis TP / EP shard. ``replicate>1`` covers
-  GQA, where every ``replicate`` ranks on the named axis read the same
-  source slot.
-* :func:`fused` — multiple HF tensors fuse into one param along
-  ``fuse_dim``. Each leg has its own ``_Leg`` describing its
-  destination offset/size and shard. Covers fused QKV (with GQA
-  replication) and gate/up.
-* :func:`vocab` — vocab-parallel embedding with right-edge zero padding
-  on the trailing rank. Padding is written inline; no full-padded
-  source is materialised.
-* :func:`moe_expert` — MoE expert weights with EP-then-TP composition.
-  Adds a second ``narrow`` to the basic ``sharded`` flow plus optional
-  fuse-dim handling for gate/up-fused experts.
 """
 
 from __future__ import annotations
@@ -107,6 +89,39 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
     return load
 
 
+def weight_norm_fold(*, eps: float = 1e-12) -> WeightLoader:
+    """Fold a legacy ``weight_norm`` (``weight_g`` / ``weight_v``) pair into a dense weight.
+
+    ``torch.nn.utils.weight_norm`` (now deprecated) reparametrises a weight as a
+    magnitude ``g`` and direction ``v``; the forward weight is ``g * v / ‖v‖`` with
+    the norm taken over every dim except ``0`` (the ``dim=0`` default — correct for
+    both ``Conv`` ``(out, in, *k)`` and ``ConvTranspose`` ``(in, out, *k)`` layouts).
+    This loader caches the two source tensors (``shard_id`` ``"g"`` / ``"v"``, either
+    arrival order) and, once both are in, writes the dense forward weight. So a layer
+    can carry a single dense ``weight`` and never run ``weight_norm`` at inference.
+
+    A fresh closure (with its own per-parameter cache) is returned per call — attach
+    one to each parameter, not a shared instance.
+    """
+
+    cache: dict[str, torch.Tensor] = {}
+
+    def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
+        if shard_id not in ("g", "v"):
+            raise ValueError(
+                f"weight_norm_fold expects shard_id 'g' or 'v', got {shard_id!r}"
+            )
+        cache[shard_id] = loaded.to(torch.float32)
+        if "g" in cache and "v" in cache:
+            g = cache.pop("g")
+            v = cache.pop("v")
+            dims = tuple(range(1, v.dim()))  # all dims except 0 (weight_norm dim=0)
+            norm = v.norm(dim=dims, keepdim=True).clamp_min(eps)
+            param.data.copy_((g * v / norm).to(param.dtype))
+
+    return load
+
+
 def vocab(*, axis: str = "tp", mesh: Mesh) -> WeightLoader:
     """Vocab-parallel embedding load with right-edge zero padding.
 
@@ -139,4 +154,5 @@ __all__ = [
     "replicated",
     "sharded",
     "vocab",
+    "weight_norm_fold",
 ]

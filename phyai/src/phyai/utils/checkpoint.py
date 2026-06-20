@@ -9,6 +9,9 @@ A "checkpoint" in phyai follows the same on-disk layout as a
 
 This module covers the filesystem side of that layout:
 
+* :func:`resolve_checkpoint` — turn a ``source`` into a local folder/file
+  path, downloading from the HuggingFace Hub when ``source`` is a repo id
+  rather than a path that exists on disk.
 * :func:`find_safetensors` — list the safetensors shards in a folder,
   honouring ``model.safetensors.index.json`` when present.
 * :func:`load_config` — parse ``config.json`` into a
@@ -49,6 +52,49 @@ def _ensure_dir(folder: Path) -> Path:
             f"Pass the folder containing config.json + safetensors shard(s)."
         )
     return folder
+
+
+def resolve_checkpoint(source: str | Path, *, revision: str | None = None) -> Path:
+    """Resolve ``source`` to a local path, downloading from the Hub if needed.
+
+    Resolution:
+
+    1. If ``source`` already exists on disk (a folder *or* a file), it is
+       returned unchanged — the existing local-only behaviour.
+    2. Otherwise ``source`` is interpreted as a HuggingFace **repo id** and
+       the whole repo is fetched with :func:`huggingface_hub.snapshot_download`;
+       the local snapshot directory is returned.
+
+    To keep step 1 free of any network/SDK cost, ``huggingface_hub`` is imported
+    lazily inside the download branch — purely local loads never touch it.
+
+    Before any network call, the candidate is checked with
+    :func:`huggingface_hub.utils.validate_repo_id`. A string that is neither a
+    local path nor a syntactically valid repo id (a typo'd path such as
+    ``/data/typo`` or ``./ckpt``) raises :class:`FileNotFoundError` immediately,
+    offline — so a mistyped path fails fast instead of hanging on a doomed
+    download. Authentication, cache location, and offline mode are taken from the
+    usual ``HF_TOKEN`` / ``HF_HOME`` / ``HF_HUB_OFFLINE`` environment variables;
+    ``revision`` (branch / tag / commit) is the one per-call knob.
+    """
+    path = Path(source)
+    if path.exists():
+        return path
+
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HFValidationError
+    from huggingface_hub.utils import validate_repo_id
+
+    try:
+        validate_repo_id(str(source))
+    except HFValidationError as exc:
+        raise FileNotFoundError(
+            f"{source!r} is not a local path and is not a valid HuggingFace "
+            f"repo id. If you meant a local checkpoint, check the path."
+        ) from exc
+
+    local = snapshot_download(repo_id=str(source), repo_type="model", revision=revision)
+    return Path(local)
 
 
 def find_safetensors(folder: str | Path) -> list[Path]:
@@ -106,14 +152,19 @@ def load_config(
     config_cls: type[T],
     *,
     filename: str = _DEFAULT_CONFIG_FILENAME,
+    revision: str | None = None,
 ) -> T:
     """Read ``filename`` from ``folder`` and parse it via ``config_cls.from_json``.
+
+    ``folder`` may be a local checkpoint directory or a HuggingFace repo id —
+    it is passed through :func:`resolve_checkpoint` first (``revision`` selects
+    the branch / tag / commit when downloading).
 
     ``config_cls`` must be a :class:`~phyai.models.configuration.PretrainedConfig`
     subclass. Unknown JSON keys are silently dropped — see
     :meth:`PretrainedConfig.from_dict`.
     """
-    folder = _ensure_dir(folder)
+    folder = _ensure_dir(resolve_checkpoint(folder, revision=revision))
     config_path = folder / filename
     if not config_path.is_file():
         raise FileNotFoundError(
@@ -123,4 +174,4 @@ def load_config(
     return config_cls.from_json(config_path)
 
 
-__all__ = ["find_safetensors", "load_config"]
+__all__ = ["find_safetensors", "load_config", "resolve_checkpoint"]

@@ -243,6 +243,38 @@ def test_qk_norm_default_off(fake_mesh):
     assert isinstance(blk.k_norm, torch.nn.Identity)
 
 
+def test_attention_kind_accepts_layer_idx_metadata(fake_mesh):
+    """No-cache attention may carry layer_idx (stack-position metadata, ignored).
+
+    The paged kinds (ar / diffusion) still *require* it for KV-pool addressing,
+    but attention treats it as optional inert metadata (surfaced in repr).
+    """
+    fake_mesh()
+    _init_dispatcher()
+    blk = TransformerBlock(
+        hidden_size=64,
+        num_heads=4,
+        intermediate_size=128,
+        layer_idx=3,  # previously rejected for attn_kind="attention"
+        **_base_kwargs(),
+    )
+    assert blk.layer_idx == 3
+    assert "layer_idx=3" in repr(blk)
+    # None remains valid for attention.
+    assert (
+        TransformerBlock(hidden_size=64, num_heads=4, intermediate_size=128).layer_idx
+        is None
+    )
+    # ar still requires it (load-bearing — addresses the shared KV pool).
+    with pytest.raises(ValueError, match="requires layer_idx"):
+        TransformerBlock(
+            hidden_size=64,
+            num_heads=4,
+            intermediate_size=128,
+            attn_kind="ar",
+        )
+
+
 def test_qk_norm_present_when_enabled(fake_mesh):
     fake_mesh()
     _init_dispatcher()
@@ -349,6 +381,59 @@ def test_gemma1_style_forward(fake_mesh):
     y = blk(x, positions=pos)
     assert y.shape == (2, 16, H)
     assert y.dtype == torch.bfloat16
+
+
+@cuda_only
+def test_precompute_rope_pattern_b_matches_pattern_a(fake_mesh):
+    """Pattern B (threaded ``cos`` / ``sin``) == Pattern A (per-layer rope).
+
+    Covers the block-level ``cos`` / ``sin`` forward kwargs and the
+    ``precompute_rope=True`` branch against the default ``positions`` path,
+    using one shared rope instance and identical weights.
+    """
+    fake_mesh()
+    _init_dispatcher()
+    H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
+
+    rope = RotaryEmbedding(
+        head_dim, max_position_embeddings=128, backend="eager"
+    ).cuda()
+
+    def _build(precompute):
+        return TransformerBlock(
+            hidden_size=H,
+            num_heads=num_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            intermediate_size=I,
+            attn_causal=True,
+            rope=rope,
+            precompute_rope=precompute,
+            mlp_gated=True,
+            mlp_activation="silu",
+            norm_type="rmsnorm",
+            attn_backend="sdpa",
+            norm_backend="phyai-kernel",
+            params_dtype=torch.bfloat16,
+        ).cuda()
+
+    blk_a = _build(False)  # Pattern A: forward(positions=...)
+    blk_b = _build(True)  # Pattern B: forward(cos=..., sin=...)
+    # phyai layers init weights with uninitialized memory (filled by
+    # load_pretrained in production); give blk_a finite values, then copy
+    # them into blk_b so the two paths differ only in rope delivery.
+    torch.manual_seed(0)
+    for p in blk_a.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    blk_b.load_state_dict(blk_a.state_dict())
+
+    x = (torch.randn(2, 16, H) * 0.05).to(torch.bfloat16).cuda()
+    pos = torch.arange(16, device="cuda")
+    cos, sin = rope.get_cos_sin(pos)
+
+    y_a = blk_a(x, positions=pos)
+    y_b = blk_b(x, cos=cos, sin=sin)
+    torch.testing.assert_close(y_b, y_a)
 
 
 @cuda_only

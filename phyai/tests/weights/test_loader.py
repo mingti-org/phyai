@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 import phyai.layers.linear as L
 from phyai.layers.layer_norm import RMSNorm
 from phyai.weights import LoadReport, load_pretrained
+from phyai.weights import loader as loader_mod
 
 
 def _init_dispatcher():
@@ -439,3 +440,155 @@ def test_load_unexpected_keys_with_dropping_remap_via_folder(tmp_path: Path, fak
     )
     assert "drop.this.weight" not in report.unexpected
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+
+
+# --------------------------------------------------------------------------- #
+# Progress bar.                                                               #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBar:
+    """Records tqdm interactions so tests can assert bar behaviour."""
+
+    def __init__(self, *, total=None, disable=None, **_kwargs):
+        self.total = total
+        self.disable = disable
+        self.updates = 0
+        self.closed = False
+        self.postfixes: list[str] = []
+
+    def update(self, n=1):
+        self.updates += n
+
+    def set_postfix_str(self, s, refresh=True):
+        self.postfixes.append(s)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def spy_bar(monkeypatch):
+    """Swap the loader's tqdm for a recording fake; yield the captured bars."""
+    bars: list[_FakeBar] = []
+
+    def factory(*args, **kwargs):
+        bar = _FakeBar(*args, **kwargs)
+        bars.append(bar)
+        return bar
+
+    monkeypatch.setattr(loader_mod, "tqdm", factory)
+    return bars
+
+
+def test_count_keys_sums_across_shards(tmp_path: Path):
+    a = tmp_path / "a.safetensors"
+    b = tmp_path / "b.safetensors"
+    save_file({"x": torch.zeros(2), "y": torch.zeros(2)}, str(a))
+    save_file({"z": torch.zeros(2)}, str(b))
+    assert loader_mod._count_keys([a, b]) == 3
+
+
+def test_progress_disable_resolution(fake_mesh):
+    """Non-distributed rank-0: False->disabled, True->on, None->auto."""
+    fake_mesh(sizes={"tp": 1})
+    assert loader_mod._progress_disable(False) is True
+    assert loader_mod._progress_disable(True) is False
+    assert loader_mod._progress_disable(None) is None
+
+
+def test_progress_bar_advances_once_per_key(tmp_path: Path, fake_mesh, spy_bar):
+    """Bar total == key count and it ticks for every key, dropped ones included."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {
+            "mod.fc.weight": src_w,
+            "mod.fc.bias": src_b,
+            "drop.this.weight": torch.zeros(2),  # remapped to None
+            "totally.unexpected": torch.zeros(2),  # no owning param
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    load_pretrained(
+        layer,
+        tmp_path,
+        progress=True,
+        strict=False,  # the unexpected key would otherwise raise before the bar closes
+        remap=lambda k: None if k.startswith("drop.") else k,
+    )
+    assert len(spy_bar) == 1
+    bar = spy_bar[0]
+    assert bar.total == 4  # every key counted
+    assert bar.updates == 4  # advanced once per key
+    assert bar.disable is False  # progress=True forces it on
+    assert bar.closed is True
+    assert bar.postfixes == ["model.safetensors"]
+
+
+def test_progress_false_disables_bar(tmp_path: Path, fake_mesh, spy_bar):
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    save_file(
+        {"mod.fc.weight": torch.randn(8, 4), "mod.fc.bias": torch.randn(8)},
+        str(tmp_path / "model.safetensors"),
+    )
+    load_pretrained(layer, tmp_path, progress=False)
+    bar = spy_bar[0]
+    assert bar.disable is True
+    assert bar.total is None  # key pre-count skipped when disabled
+    assert bar.updates == 2  # still iterates; updates are no-ops on a disabled bar
+
+
+def test_progress_default_is_auto(tmp_path: Path, fake_mesh, spy_bar):
+    """Default (no progress kwarg) defers to tqdm's own TTY detection."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    save_file(
+        {"mod.fc.weight": torch.randn(8, 4), "mod.fc.bias": torch.randn(8)},
+        str(tmp_path / "model.safetensors"),
+    )
+    load_pretrained(layer, tmp_path)
+    assert spy_bar[0].disable is None
+
+
+# --------------------------------------------------------------------------- #
+# HuggingFace repo-id source (offline; snapshot_download monkeypatched).      #
+# --------------------------------------------------------------------------- #
+
+
+def test_load_pretrained_repo_id_forwarded(tmp_path: Path, fake_mesh, monkeypatch):
+    """A repo-id source downloads (faked) then loads from the cached dir.
+
+    Proves ``revision`` threads load_pretrained -> _resolve_source ->
+    resolve_checkpoint, and that the returned snapshot dir flows into
+    find_safetensors. No network: snapshot_download is monkeypatched.
+    """
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {"mod.fc.weight": src_w, "mod.fc.bias": src_b},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs):
+        seen.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    report = load_pretrained(layer, "org/model", revision="v1")
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+    assert seen["repo_id"] == "org/model"
+    assert seen["revision"] == "v1"
+    torch.testing.assert_close(layer.weight.data, src_w)

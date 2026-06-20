@@ -42,7 +42,7 @@ purely through environment variables — whichever fits your workflow.
 
     ```bash
     PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
-        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+        uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
     ```
 
     Restrict what is captured with a JSON array of regexes (matched against
@@ -51,7 +51,7 @@ purely through environment variables — whichever fits your workflow.
     ```bash
     PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
     PHYAI_DEBUG_TENSOR_DUMP_FILTER='["expert_stack\\.layers\\.0\\.", "\\.heads\\."]' \
-        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+        uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
     ```
 
     | Variable | Meaning |

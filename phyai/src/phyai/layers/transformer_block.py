@@ -48,8 +48,9 @@ Knob matrix
 group             knobs
 ================  ========================================================
 mode              ``attn_kind`` (``"attention"`` / ``"ar"`` /
-                  ``"diffusion"``); ``layer_idx`` (forbidden for
-                  ``"attention"``, required for the other two)
+                  ``"diffusion"``); ``layer_idx`` (optional stack-position
+                  metadata for ``"attention"`` — ignored; required for the
+                  other two)
 norm              ``norm_type`` (rmsnorm / gemma_rmsnorm / layernorm),
                   ``norm_eps``, ``norm_bias`` (LN only), ``norm_backend``,
                   ``sandwich_norm`` (off -> 2 norms; on -> 4 norms)
@@ -83,16 +84,16 @@ SigLIP, for the QKV side).
 
 Forward
 -------
-``forward(x, *, positions=None, attn_ctx=None, cu_seqlens_q=None, cu_seqlens_kv=None, rope_cos=None, rope_sin=None) -> y``
+``forward(x, *, positions=None, attn_ctx=None, cu_seqlens_q=None, cu_seqlens_kv=None, cos=None, sin=None) -> y``
 
 * ``x``: ``(B, S, hidden_size)`` for padded batches, ``(nnz, hidden_size)``
   for ragged. Output preserves the leading shape.
 * ``positions``: required in **Pattern A** (``precompute_rope=False``,
   the default) — ``(B, S)`` / ``(S,)`` for padded, ``(nnz,)`` for ragged.
   Ignored in Pattern B.
-* ``rope_cos`` / ``rope_sin``: required in **Pattern B**
+* ``cos`` / ``sin``: required in **Pattern B**
   (``precompute_rope=True``) — pre-gathered cos/sin tensors from
-  :meth:`RotaryEmbedding.compute_cos_sin`. Ignored in Pattern A.
+  :meth:`RotaryEmbedding.get_cos_sin`. Ignored in Pattern A.
 * ``attn_ctx``: required for ``attn_kind="ar"`` / ``"diffusion"``
   (the runner builds the right ctx type per stack); optional for
   ``attn_kind="attention"`` (:class:`Attention` builds a default ctx
@@ -109,10 +110,10 @@ RoPE patterns
   position-then-rotation contract. The flashinfer kernel does the
   position -> cos/sin lookup in-kernel.
 * **Pattern B** (``precompute_rope=True``): the caller (typically the
-  stack) calls :meth:`RotaryEmbedding.compute_cos_sin(positions)` once,
+  stack) calls :meth:`RotaryEmbedding.get_cos_sin(positions)` once,
   then threads the resulting ``(cos, sin)`` to every layer's forward as
-  ``rope_cos`` / ``rope_sin``. Each layer skips the cache gather and
-  runs only the rotation via :meth:`RotaryEmbedding.apply_with_cos_sin`.
+  ``cos`` / ``sin``. Each layer skips the cache gather and
+  runs only the rotation via :meth:`RotaryEmbedding.apply`.
   Helpful for cuda-graph capture (one less kernel inside the captured
   region per layer) and deep stacks where the gather appears in profiles.
 
@@ -303,10 +304,10 @@ class TransformerBlock(nn.Module):
       gather-and-rotate via :meth:`RotaryEmbedding.forward`. Forward
       caller passes ``positions`` only.
     * **Pattern B** (``precompute_rope=True``): caller pre-computes
-      ``(rope_cos, rope_sin)`` once at the top of the layer loop via
-      :meth:`RotaryEmbedding.compute_cos_sin` and threads the tensors
-      through every layer's forward as ``rope_cos`` / ``rope_sin``;
-      the layer applies them via :meth:`RotaryEmbedding.apply_with_cos_sin`,
+      ``(cos, sin)`` once at the top of the layer loop via
+      :meth:`RotaryEmbedding.get_cos_sin` and threads the tensors
+      through every layer's forward as ``cos`` / ``sin``;
+      the layer applies them via :meth:`RotaryEmbedding.apply`,
       skipping the per-layer cache gather. Useful for cuda-graph capture
       (one less kernel inside the captured region per layer) and deep
       stacks where the position lookup shows up in profiles.
@@ -418,7 +419,6 @@ class TransformerBlock(nn.Module):
         attn_prefix = f"{prefix}.self_attn" if prefix else "self_attn"
         mlp_prefix = f"{prefix}.mlp" if prefix else "mlp"
 
-        # ---- Norms (hidden_size) --------------------------------------- #
         norm_kwargs: dict[str, Any] = dict(
             hidden_size=hidden_size,
             eps=norm_eps,
@@ -452,7 +452,6 @@ class TransformerBlock(nn.Module):
             self.post_attn_norm = nn.Identity()
             self.post_ff_norm = nn.Identity()
 
-        # ---- Attention: QKV -> (Q/K norm) -> (RoPE) -> attn -> O ----------- #
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_dim=head_dim,
@@ -524,11 +523,10 @@ class TransformerBlock(nn.Module):
         # method-pointer write at __init__ replaces a runtime ``if`` in
         # the hot path with a single attribute lookup.
         if attn_kind == "attention":
-            if layer_idx is not None:
-                raise ValueError(
-                    f"attn_kind='attention' must have layer_idx=None, "
-                    f"got layer_idx={layer_idx}."
-                )
+            # layer_idx is optional here: the no-cache Attention has no KV-pool
+            # slot to address, so it is kept only as stack-position metadata
+            # (surfaced in extra_repr) and not passed on. The paged kinds below
+            # require it.
             self.attn = Attention(
                 num_heads=self.q_heads_local,
                 head_dim=head_dim,
@@ -601,7 +599,6 @@ class TransformerBlock(nn.Module):
             prefix=f"{attn_prefix}.{attn_out_hf_name}",
         )
 
-        # ---- MLP -------------------------------------------------------- #
         self.mlp = DenseMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -617,10 +614,6 @@ class TransformerBlock(nn.Module):
             mesh=mesh,
             prefix=mlp_prefix,
         )
-
-    # ------------------------------------------------------------------ #
-    # Attention dispatch — bound at __init__ so forward has no ``if``    #
-    # ------------------------------------------------------------------ #
 
     def _attn_forward_attention(
         self,
@@ -662,17 +655,13 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         return self.attn(q, k, v, attn_ctx)
 
-    # ------------------------------------------------------------------ #
-    # RoPE dispatch — bound at __init__ so forward has no ``if`` on rope #
-    # ------------------------------------------------------------------ #
-
     def _apply_rope_passthrough(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         positions: torch.Tensor | None,  # noqa: ARG002 — interface match
-        rope_cos: torch.Tensor | None,  # noqa: ARG002 — interface match
-        rope_sin: torch.Tensor | None,  # noqa: ARG002 — interface match
+        cos: torch.Tensor | None,  # noqa: ARG002 — interface match
+        sin: torch.Tensor | None,  # noqa: ARG002 — interface match
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return q, k
 
@@ -681,8 +670,8 @@ class TransformerBlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         positions: torch.Tensor | None,
-        rope_cos: torch.Tensor | None,  # noqa: ARG002 — interface match
-        rope_sin: torch.Tensor | None,  # noqa: ARG002 — interface match
+        cos: torch.Tensor | None,  # noqa: ARG002 — interface match
+        sin: torch.Tensor | None,  # noqa: ARG002 — interface match
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Pattern A: per-layer fused gather-and-rotate.
         return self.rope(positions, q, k)
@@ -692,16 +681,12 @@ class TransformerBlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         positions: torch.Tensor | None,  # noqa: ARG002 — interface match
-        rope_cos: torch.Tensor | None,
-        rope_sin: torch.Tensor | None,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Pattern B: caller passed pre-gathered cos/sin (one gather per
         # stack, amortised across N layers). Apply rotation only.
-        return self.rope.apply_with_cos_sin(q, k, rope_cos, rope_sin)
-
-    # ------------------------------------------------------------------ #
-    # Forward                                                            #
-    # ------------------------------------------------------------------ #
+        return self.rope.apply(q, k, cos, sin)
 
     def forward(
         self,
@@ -711,8 +696,8 @@ class TransformerBlock(nn.Module):
         attn_ctx: AttnCtx | ARAttnCtx | DiffusionAttnCtx | None = None,
         cu_seqlens_q: torch.Tensor | None = None,
         cu_seqlens_kv: torch.Tensor | None = None,
-        rope_cos: torch.Tensor | None = None,
-        rope_sin: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Input contract — cheap checks against `self`-stored constants.
         # NOT configuration branches (those are eliminated at __init__
@@ -730,15 +715,12 @@ class TransformerBlock(nn.Module):
             raise ValueError(
                 "rope is set (Pattern A) but no positions passed to forward."
             )
-        if self._rope_input_kind == "cos_sin" and (
-            rope_cos is None or rope_sin is None
-        ):
+        if self._rope_input_kind == "cos_sin" and (cos is None or sin is None):
             raise ValueError(
-                "precompute_rope=True (Pattern B) but rope_cos / rope_sin "
+                "precompute_rope=True (Pattern B) but cos / sin "
                 "missing from forward kwargs."
             )
 
-        # ---- Attention sub-block --------------------------------------- #
         residual = x
         h = self.input_norm(x)
         fused, _ = self.qkv_proj(h)
@@ -751,7 +733,7 @@ class TransformerBlock(nn.Module):
         )
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = self._apply_rope(q, k, positions, rope_cos, rope_sin)
+        q, k = self._apply_rope(q, k, positions, cos, sin)
         attn_out = self._attn_forward(q, k, v, attn_ctx, cu_seqlens_q, cu_seqlens_kv)
         attn_flat = attn_out.reshape(
             *attn_out.shape[:-2], self.q_heads_local * self.head_dim
@@ -760,7 +742,6 @@ class TransformerBlock(nn.Module):
         out = self.post_attn_norm(out)
         h = residual + out
 
-        # ---- MLP sub-block --------------------------------------------- #
         residual = h
         m = self.pre_ff_norm(h)
         m = self.mlp(m)

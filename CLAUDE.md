@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `phyai-model-optimizer/` | Placeholder, no source yet. |
 | `phyai-utils-tools/` | Placeholder, no source yet. |
 
-Hard pins: `torch==2.11`, `flashinfer-python==v0.6.11.post3`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions.
+Hard pins: `torch==2.11`, `flashinfer-python==v0.6.12`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions.
 
 ## Common commands
 
@@ -33,7 +33,7 @@ uv run pytest phyai/tests/layers/attention/test_static_cached_attention.py
 uv run pytest phyai/tests/parallel/test_collectives.py::test_all_reduce_basic
 
 # End-to-end pi0.5 demo (edit PI05_BASE_WEIGHTS in the script first)
-uv run python examples/run_pi05.py
+uv run python examples/pi05/run_pi05.py
 
 # Pre-commit: clang-format (C/C++, excludes third_party/), codespell, ruff-format
 scripts/setup_dev_env.sh            # one-time: install pre-commit hooks
@@ -52,13 +52,21 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 - C/C++: clang-format from `.clang-format` (column 128, 2-space indent, `PointerAlignment: Left`). clang-tidy from `.clang-tidy` (google + modernize + performance, `WarningsAsErrors: '*'`, identifier naming enforced: classes `CamelCase`, variables `lower_case`, globals `UPPER_CASE`). C++20 (`add_compile_options(-std=c++20)` in `phyai-ext/CMakeLists.txt`).
 - Python: `ruff-format` via pre-commit. Public-by-default — `_` prefix only for genuine implementation details. Singletons exposed via `get_*()` getters, not module-level instances.
 
-## More Conventions provide by human
+## More MUST FOLLOW Conventions provided by human
 
 - all log function in phyai package should use phyai.utils' logging api. U judge using `this_rank_log` or `all_rank_log`
 - Using ENGLISH for comment.
 - Be aware that phyai is a general inference engine for physical AI. Do not modify general components(such as phyai.layers, phyai.runtime) in phyai when supporting new models. Unless lack of layers, or lack of phyai's system components. Modify phyai's general components is a big deal, you should tell user first, let them agree.
 - When user want you to commit to github. You should run pre-commit first.
 - using `flashinfer` by default if CP is not set. When CP is set, pls using `MagiAttention` whose github repo is https://github.com/SandAI-org/MagiAttention.
+- Eager Attention is just for debug only, u should use flashinfer/flash attn/sdpa. and in most of the time, debug mode also need use flashinfer/flash attn/sdpa at first.
+- When a user asks you to run a model in FP32 precision, double-check first. Most common models are trained in BF16/FP16/FP8/NVFP4 rather than FP32. Ask the user why they need FP32 precision before proceeding. (Exception: ViT, time-embedding MLPs — some models do use FP32 for these two modules.)
+- Before running CUDA programs, use nvidia-smi to check whether the GPUs are already in use by other users. Running on busy GPUs will lead to inaccurate benchmark results (though regular tests should be fine — just watch out for OOM). If a user asks you to run a CUDA program and you find that the task (e.g., benchmarking) is significantly affected by other workloads on the same GPU, notify the user.
+- When implementing new models, you need to write plenty of tests. However, please do not put model-level tests in the main repository — CI/CD does not have enough resources to run model tests. Place model-level tests in the `.cache` directory instead. The only tests you are allowed to keep in the main repo are layer-level tests — for example, if you've added a new component under `phyai.layers`, that's when you can add a corresponding test.
+
+## How to implement a new model
+
+When you are asked to implement a new model — or to reproduce a model based on an existing repository — please first check the `phyai-model-implement` skills in .claude/skills.
 
 ## SKILLS! Use SKILLS if needed!
 

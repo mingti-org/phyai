@@ -29,10 +29,13 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from safetensors import safe_open
+from tqdm.auto import tqdm
 
-from phyai.utils.checkpoint import find_safetensors
+from phyai.utils.checkpoint import find_safetensors, resolve_checkpoint
+from phyai.utils.logging import this_rank_log
 from phyai.weights.shards import WeightLoader, replicated
 
 
@@ -111,23 +114,61 @@ def _resolve_remap(
 
 def _resolve_source(
     source: str | Path | Iterable[str | Path],
+    *,
+    revision: str | None = None,
 ) -> list[Path]:
     """Normalise ``source`` to a concrete list of safetensors file paths.
 
     Accepts three shapes:
 
-    * a checkpoint folder (``str``/``Path`` pointing at a directory) —
+    * a checkpoint folder or a HuggingFace repo id (``str``/``Path``) —
+      resolved to a local folder via
+      :func:`phyai.utils.checkpoint.resolve_checkpoint` (a repo id is
+      downloaded; ``revision`` selects the branch/tag/commit), then
       expanded via :func:`phyai.utils.checkpoint.find_safetensors`,
     * a single safetensors file path (``str``/``Path`` pointing at a
       file) — wrapped as ``[path]``,
-    * an iterable of file paths — materialised as a list.
+    * an iterable of file paths — materialised as a list (always treated
+      as already-local; no repo-id download for this form).
     """
     if isinstance(source, (str, Path)):
-        path = Path(source)
-        if path.is_dir():
-            return find_safetensors(path)
-        return [path]
+        resolved = resolve_checkpoint(source, revision=revision)
+        if resolved.is_dir():
+            return find_safetensors(resolved)
+        return [resolved]
     return [Path(p) for p in source]
+
+
+def _source_label(source: str | Path | Iterable[str | Path]) -> str:
+    """A short human label for the progress bar (folder / file name)."""
+    if isinstance(source, (str, Path)):
+        return Path(source).name or str(source)
+    return "weights"
+
+
+def _count_keys(paths: list[Path]) -> int:
+    """Sum the tensor-key count across shards (header-only, cheap)."""
+    total = 0
+    for path in paths:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            total += len(f.keys())
+    return total
+
+
+def _progress_disable(progress: bool | None) -> bool | None:
+    """Resolve the tqdm ``disable`` flag for a load.
+
+    Only rank 0 ever renders a bar. ``progress=None`` (auto) defers to
+    tqdm's own TTY detection, so piped / CI / captured (pytest) runs stay
+    silent while interactive terminals and notebooks show the bar.
+    ``True`` forces it on (rank 0, even off-TTY); ``False`` disables it.
+    """
+    rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+    if progress is False or not rank0:
+        return True
+    if progress is True:
+        return False
+    return None
 
 
 def load_pretrained(
@@ -136,6 +177,8 @@ def load_pretrained(
     *,
     remap: Callable[[str], str | None] | dict[str, str] | None = None,
     strict: bool = True,
+    progress: bool | None = None,
+    revision: str | None = None,
 ) -> LoadReport:
     """Load HF safetensors checkpoints into ``model``.
 
@@ -150,8 +193,13 @@ def load_pretrained(
         * a checkpoint **folder** (single ``str``/``Path``) —
           ``model.safetensors.index.json`` is consumed if present,
           otherwise ``model.safetensors`` / glob fallback;
+        * a HuggingFace **repo id** (single ``str``/``Path`` that is not a
+          local path) — the repo is downloaded via
+          :func:`huggingface_hub.snapshot_download` and loaded from the
+          local cache;
         * a single safetensors **file** path; or
-        * an iterable of safetensors file paths (advanced / test).
+        * an iterable of safetensors file paths (advanced / test) —
+          always treated as already-local (no repo-id download).
 
     remap : optional HF-key rewriter. If callable, called with each
         file key; return the lookup key, or ``None`` to drop the key.
@@ -160,13 +208,19 @@ def load_pretrained(
         written in the post-remap namespace.
     strict : raise if any *required* key is missing or any HF key was
         unexpected. Optional missing keys never raise.
+    progress : control the per-tensor progress bar (rank 0 only).
+        ``None`` (default) auto-detects — shown on an interactive TTY /
+        notebook, silent when output is piped or captured (CI, pytest).
+        ``True`` forces it on even off-TTY; ``False`` disables it.
+    revision : branch / tag / commit selected when ``source`` is a repo id
+        downloaded from the Hub. Ignored for local sources.
 
     Returns
     -------
     LoadReport with diagnostics.
     """
     remap_fn = _resolve_remap(remap)
-    paths = _resolve_source(source)
+    paths = _resolve_source(source, revision=revision)
 
     # 1. Build dispatch index from data on params.
     index: dict[str, tuple[nn.Parameter, "int | str | None", WeightLoader]] = {}
@@ -190,10 +244,23 @@ def load_pretrained(
     report = LoadReport()
     seen: set[str] = set()
 
-    # 2. Stream safetensors; dispatch.
+    # 2. Stream safetensors; dispatch. A rank-0 progress bar advances once
+    #    per tensor key (total = key count across all shards), so it always
+    #    fills to 100% regardless of remap drops / unexpected keys.
+    disable = _progress_disable(progress)
+    total = None if disable is True else _count_keys(paths)
+    bar = tqdm(
+        total=total,
+        disable=disable,
+        unit="tensor",
+        desc=f"Loading {_source_label(source)}",
+        leave=False,
+    )
     for path in paths:
+        bar.set_postfix_str(path.name, refresh=False)
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for raw in f.keys():
+                bar.update(1)
                 hf = remap_fn(raw)
                 if hf is None:
                     continue
@@ -208,6 +275,7 @@ def load_pretrained(
                 loader(param, tensor, shard_id)
                 seen.add(hf)
                 report.loaded.append(hf)
+    bar.close()
 
     # 3. Diagnose missing.
     for hf_key in index:
@@ -235,6 +303,14 @@ def load_pretrained(
                 src_dtype,
                 dst_dtype,
             )
+
+    this_rank_log(
+        _logger,
+        logging.INFO,
+        "load_pretrained(%s): %s",
+        _source_label(source),
+        report.summary(),
+    )
 
     return report
 

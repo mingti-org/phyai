@@ -12,29 +12,82 @@ A :class:`PretrainedConfig` is a frozen dataclass with three jobs:
   ``functools.lru_cache`` and graph-capture machinery.
 
 Concrete subclasses just declare their fields with
-``@dataclass(frozen=True)`` — no extra plumbing required.
+``@dataclass(frozen=True)``. Two hooks let a subclass load an upstream
+``config.json`` whose schema *nests* or *renames* values the phyai config keeps
+flat, with no bespoke ``from_*`` method:
+
+* a **nested sub-config field** (one whose default is itself a
+  :class:`PretrainedConfig`) is built recursively from its dict form by
+  :meth:`PretrainedConfig.from_dict` — automatically, nothing to declare;
+* :attr:`PretrainedConfig.nested_sources` declares, per flat field, where to
+  find its value when the upstream schema buries it under a different key or
+  inside a nested dict (e.g. ``mrope_section`` living in ``rope_scaling``, or a
+  ``vision`` sub-config arriving as ``vision_config``).
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Iterator, TypeVar
+from typing import Any, ClassVar, Iterator, Mapping, TypeVar
 
 
 T = TypeVar("T", bound="PretrainedConfig")
+
+
+def _dig(data: dict[str, Any], dotted: str) -> tuple[bool, Any]:
+    """Descend a dotted path through nested dicts; return ``(found, value)``.
+
+    ``found`` is ``False`` (and ``value`` ``None``) if any segment is missing or
+    a non-dict is hit partway, so a declared source the checkpoint omits simply
+    leaves the field at its default.
+    """
+    cur: Any = data
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return False, None
+        cur = cur[key]
+    return True, cur
+
+
+def _subconfig_type(default_factory: Any) -> type[PretrainedConfig] | None:
+    """The config subclass a field's ``default_factory`` produces, else ``None``.
+
+    Lets :meth:`PretrainedConfig.from_dict` recognise a nested sub-config field
+    (so a dict value is built into that config rather than stored raw) without
+    evaluating string type annotations. The common case — ``default_factory`` is
+    the config class itself — needs no throwaway instance.
+    """
+    if default_factory is MISSING:
+        return None
+    if isinstance(default_factory, type) and issubclass(
+        default_factory, PretrainedConfig
+    ):
+        return default_factory
+    try:
+        produced = default_factory()
+    except Exception:
+        return None
+    return type(produced) if isinstance(produced, PretrainedConfig) else None
 
 
 @dataclass(frozen=True)
 class PretrainedConfig:
     """Base for every model config in phyai.models.
 
-    Subclass with ``@dataclass(frozen=True)``. Every field must declare
-    a default (or rely on the subclass' own ``__init__``); the JSON
-    loader filters the input dict to declared field names so unknown
-    keys are dropped instead of raising.
+    Subclass with ``@dataclass(frozen=True)``. Every field must declare a
+    default. :meth:`from_dict` filters the input dict to declared field names
+    (so unknown upstream keys are dropped instead of raising), recursively
+    builds nested sub-config fields, and honours :attr:`nested_sources`.
     """
+
+    #: Optional per-subclass map ``flat_field -> source(s)`` for values the
+    #: upstream schema nests or renames. A source is a dotted path into the raw
+    #: dict (``"rope_scaling.mrope_section"``); a tuple of paths is tried in
+    #: order, first hit wins. A top-level key matching the field name always
+    #: takes precedence over any nested source. Empty for flat configs.
+    nested_sources: ClassVar[Mapping[str, str | tuple[str, ...]]] = {}
 
     @classmethod
     def field_names(cls) -> set[str]:
@@ -44,14 +97,41 @@ class PretrainedConfig:
     def from_dict(cls: type[T], data: dict[str, Any]) -> T:
         """Build an instance from a dict; unknown keys are silently dropped.
 
-        This makes it safe to feed a full upstream ``config.json``
-        (with optimizer / scheduler / device / dataset knobs) directly
-        into a narrow phyai config: only the fields the subclass
-        declares survive.
+        Beyond filtering to declared fields, this:
+
+        * lifts each :attr:`nested_sources` entry from its (possibly nested or
+          renamed) location to the flat field — unless that field is already
+          present at the top level, which wins;
+        * recursively builds any nested sub-config field (a field whose default
+          is a :class:`PretrainedConfig`) from its dict form.
+
+        So a full upstream ``config.json`` — nested sub-configs, buried RoPE
+        knobs, and unrelated optimizer/device keys alike — loads directly, with
+        no bespoke per-model conversion method.
         """
-        known = cls.field_names()
-        filtered = {k: v for k, v in data.items() if k in known}
-        return cls(**filtered)
+        data = dict(data)  # shallow copy: lifted keys must not touch the caller's dict
+        # Lift declared nested / renamed sources to flat fields (top-level wins).
+        for name, sources in cls.nested_sources.items():
+            if name in data:
+                continue
+            for path in (sources,) if isinstance(sources, str) else sources:
+                found, value = _dig(data, path)
+                if found:
+                    data[name] = value
+                    break
+        # Filter to declared fields, recursively building sub-config fields.
+        factories = {f.name: f.default_factory for f in fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for name in cls.field_names():
+            if name not in data:
+                continue
+            value = data[name]
+            if isinstance(value, dict):
+                sub = _subconfig_type(factories[name])
+                if sub is not None:
+                    value = sub.from_dict(value)
+            kwargs[name] = value
+        return cls(**kwargs)
 
     @classmethod
     def from_json(cls: type[T], path: str | Path) -> T:

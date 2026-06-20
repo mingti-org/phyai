@@ -34,9 +34,9 @@ in one fused launch per layer; signature passes
 Alternatively the cos/sin gather can be hoisted out of the layer loop
 and the rotation applied per layer with the cached tensors:
 
-    cos, sin = rope.compute_cos_sin(positions)   # once at top of stack
+    cos, sin = rope.get_cos_sin(positions)   # once at top of stack
     for layer in layers:
-        q, k = rope.apply_with_cos_sin(q, k, cos, sin)   # rotation only
+        q, k = rope.apply(q, k, cos, sin)   # rotation only
 
 Trades one extra method on the rope object for amortising the cache
 gather across N layers. Mostly useful when the same ``positions`` apply
@@ -243,6 +243,99 @@ def _apply_interleaved(
     q_out = (q * cos) + (_rotate_interleave(q) * sin)
     k_out = (k * cos) + (_rotate_interleave(k) * sin)
     return q_out, k_out
+
+
+def compute_cos_sin_from_inv_freq(
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+    *,
+    attention_scaling: float = 1.0,
+    interleave: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """1-D RoPE cos/sin from ``inv_freq``, fp32"""
+    freqs = positions.unsqueeze(-1).float() * inv_freq.to(
+        device=positions.device, dtype=torch.float32
+    )
+    cos_h = freqs.cos() * attention_scaling
+    sin_h = freqs.sin() * attention_scaling
+    if interleave:
+        cos = cos_h.repeat_interleave(2, dim=-1)
+        sin = sin_h.repeat_interleave(2, dim=-1)
+    else:
+        cos = torch.cat([cos_h, cos_h], dim=-1)
+        sin = torch.cat([sin_h, sin_h], dim=-1)
+    return cos, sin
+
+
+def _weave_qwen3vl_mrope(
+    freqs: torch.Tensor, mrope_section: tuple[int, ...] | list[int]
+) -> torch.Tensor:
+    """Weave the 3 axes into ``rotary_dim/2`` slots at stride 3.
+
+    ``freqs`` is ``(3, B, S, rotary_dim/2)``; returns ``(B, S, rotary_dim/2)``.
+    Temporal fills every slot first, then height (offset 1) and width
+    (offset 2) overwrite their stride-3 positions up to their section span.
+    """
+    freqs_t = freqs[0]  # temporal occupies all slots initially
+    for dim, offset in enumerate((1, 2), start=1):  # height, width
+        length = mrope_section[dim] * 3
+        idx = slice(offset, length, 3)
+        freqs_t[..., idx] = freqs[dim, ..., idx]
+    return freqs_t
+
+
+def compute_qwen3vl_mrope_cos_sin_from_inv_freq(
+    position_ids: torch.Tensor,
+    inv_freq: torch.Tensor,
+    mrope_section: tuple[int, ...] | list[int],
+    *,
+    attention_scaling: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Interleaved 3-D mRoPE cos/sin from ``inv_freq`` (Qwen2/3-VL "M-RoPE").
+
+    Recomputes freqs directly from ``inv_freq`` so arbitrary position values
+    are supported with no cache-size limit, then weaves the temporal / height
+    / width axes into the ``rotary_dim/2`` slots at stride 3
+    (see :func:`_weave_qwen3vl_mrope`). Backs
+    :meth:`InterleavedMRotaryEmbedding.get_cos_sin`.
+
+    Parameters
+    ----------
+    position_ids:
+        ``(3, B, S)`` temporal/height/width indices, or ``(B, S)`` which is
+        broadcast across the three axes (degenerates to plain 1-D RoPE).
+    inv_freq:
+        ``(rotary_dim / 2,)`` inverse frequencies.
+    mrope_section:
+        Per-axis ``(t, h, w)`` frequency-slot budget, summing to
+        ``rotary_dim / 2``.
+    attention_scaling:
+        Scalar multiplied into cos/sin.
+
+    Returns
+    -------
+    cos, sin : torch.Tensor
+        Shape ``(B, S, rotary_dim)``, fp32, half-duplicated (rotate-half layout).
+    """
+    if position_ids.ndim == 2:
+        position_ids = position_ids[None].expand(3, *position_ids.shape)
+    if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+        raise ValueError(
+            f"mRoPE position_ids must be (3, B, S) or (B, S), got "
+            f"{tuple(position_ids.shape)}."
+        )
+    inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
+    # (3, B, rotary_dim/2, 1) @ (3, B, 1, S) -> (3, B, rotary_dim/2, S)
+    inv_freq_expanded = inv_freq[None, None, :, None].expand(
+        3, position_ids.shape[1], -1, 1
+    )
+    position_ids_expanded = position_ids[:, :, None, :].float()
+    freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+    freqs = _weave_qwen3vl_mrope(freqs, mrope_section)  # (B, S, rotary_dim/2)
+    emb = torch.cat([freqs, freqs], dim=-1)  # (B, S, rotary_dim)
+    cos = emb.cos() * attention_scaling
+    sin = emb.sin() * attention_scaling
+    return cos, sin
 
 
 # ---------------------------------------------------------------------------
@@ -488,25 +581,22 @@ class RotaryEmbedding(nn.Module):
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Eager path: gather cos/sin from the cache and apply via
-        # :meth:`apply_with_cos_sin`. Sharing the apply path with the
+        # :meth:`apply`. Sharing the apply path with the
         # precomputed-cos/sin route keeps the two numerically identical.
-        cos, sin = self.compute_cos_sin(positions)
-        return self.apply_with_cos_sin(q, k, cos, sin)
+        cos, sin = self.get_cos_sin(positions)
+        return self.apply(q, k, cos, sin)
 
     # ------------------------------------------------------------------ #
     # Precomputed cos/sin                                                #
     # ------------------------------------------------------------------ #
 
-    def compute_cos_sin(
-        self, positions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_cos_sin(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Gather cos/sin from the cache for the given positions.
 
         Hoist this call to the top of the layer loop when the same
         ``positions`` apply to every layer, then thread the resulting
-        ``(cos, sin)`` through every layer's
-        :meth:`apply_with_cos_sin` (or the equivalent
-        ``rope_cos`` / ``rope_sin`` forward kwargs on
+        ``(cos, sin)`` through every layer's :meth:`apply` (or the
+        equivalent ``cos`` / ``sin`` forward kwargs on
         :class:`~phyai.layers.transformer_block.TransformerBlock`).
 
         Returns
@@ -522,8 +612,8 @@ class RotaryEmbedding(nn.Module):
               repeated twice in place (``[c0, c0, c1, c1, ...]``).
 
             The caller broadcasts to the head axis by passing through
-            :meth:`apply_with_cos_sin` (which uses ``unsqueeze_dim=-2``)
-            or with their own unsqueeze.
+            :meth:`apply` (which uses ``unsqueeze_dim=-2``) or with their
+            own unsqueeze.
         """
         pos = positions.to(self.cos_sin_cache.device).long()
         cs = self.cos_sin_cache[pos]  # (*pos.shape, rotary_dim)
@@ -536,7 +626,7 @@ class RotaryEmbedding(nn.Module):
             sin = torch.cat([sin_h, sin_h], dim=-1)
         return cos, sin
 
-    def apply_with_cos_sin(
+    def apply(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -581,9 +671,129 @@ class RotaryEmbedding(nn.Module):
         return s
 
 
+class InterleavedMRotaryEmbedding(RotaryEmbedding):
+    """Related Papers:
+    https://arxiv.org/pdf/2409.12191 Qwen2-VL Technical Report
+    https://arxiv.org/abs/2511.21631 Qwen3-VL Technical Report
+
+    Interleaved multimodal 3-D RoPE (Qwen2-VL / Qwen3-VL "M-RoPE").
+
+    Extends :class:`RotaryEmbedding` for the multimodal case where every token
+    carries *three* position indices — temporal ``t``, height ``h``, width
+    ``w`` — instead of one. The three axes are woven into the
+    ``rotary_dim // 2`` frequency slots at stride 3: slot ``i`` takes the
+    temporal axis when ``i % 3 == 0``, height when ``i % 3 == 1``, width when
+    ``i % 3 == 2``, with each non-temporal axis bounded to its
+    ``mrope_section`` span and the tail falling back to temporal. This is the
+    *interleaved* layout (Qwen3-VL); it preserves frequency continuity, in
+    contrast to the original chunked ``[T..T H..H W..W]`` mRoPE.
+
+    Only cos/sin *computation* differs from the 1-D parent. The rotation itself
+    (rotate-half, via the inherited :meth:`apply`) and ``inv_freq``
+    are reused unchanged, so the parent's 1-D fused / eager paths stay
+    byte-identical.
+
+    Usage — Pattern B (precompute), since a token's three axes cannot be
+    expressed as the single ``positions`` index the fused flashinfer kernel
+    expects. Compute ``(cos, sin)`` once at the top of the decoder loop and
+    thread them through every layer::
+
+        rope = InterleavedMRotaryEmbedding(head_dim=128, mrope_section=[24, 20, 20],
+                                           rope_theta=5e5)
+        cos, sin = rope.get_cos_sin(position_ids)   # position_ids: (3, B, S)
+        for layer in layers:                        # TransformerBlock(precompute_rope=True)
+            h = layer(h, cos=cos, sin=sin, attn_ctx=ctx)
+
+    The fused :meth:`forward` is only valid for 1-D / ``(B, S)`` positions and
+    is therefore not used for mRoPE.
+
+    Parameters
+    ----------
+    mrope_section:
+        Per-axis ``(t, h, w)`` frequency-slot budget. Must sum to
+        ``rotary_dim // 2`` (e.g. ``[24, 20, 20]`` for ``head_dim=128``).
+    backend:
+        Defaults to ``"eager"`` — the flashinfer fused kernel has no mRoPE
+        path, and :meth:`get_cos_sin` is backend-independent regardless.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_position_embeddings: int = 8192,
+        *,
+        mrope_section: list[int] | tuple[int, ...],
+        rope_theta: float = 10000.0,
+        rope_type: str = "default",
+        rope_scaling: dict | None = None,
+        backend: str = "eager",
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__(
+            head_dim,
+            max_position_embeddings,
+            rope_theta=rope_theta,
+            rope_type=rope_type,
+            rope_scaling=rope_scaling,
+            interleave=False,
+            backend=backend,
+            device=device,
+        )
+        section = tuple(int(s) for s in mrope_section)
+        if any(s <= 0 for s in section):
+            raise ValueError(
+                f"mrope_section entries must be positive ints, got {section}."
+            )
+        if sum(section) != self.rotary_dim // 2:
+            raise ValueError(
+                f"sum(mrope_section)={sum(section)} must equal rotary_dim//2="
+                f"{self.rotary_dim // 2} (rotary_dim={self.rotary_dim}); the three "
+                f"axes partition the half-rotary frequency slots."
+            )
+        self.mrope_section = section
+        # The parent built a seq-indexed ``cos_sin_cache`` for its fused /
+        # gather paths, but mRoPE recomputes from ``inv_freq`` (see
+        # :meth:`get_cos_sin`) and never reads the cache — drop it so each
+        # instance doesn't carry a dead ``(max_pos, rotary_dim)`` fp32 buffer.
+        del self.cos_sin_cache
+
+    def get_cos_sin(
+        self, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build interleaved-mRoPE cos/sin from 3-D ``position_ids``.
+
+        Unlike the parent (which gathers from the seq-indexed ``cos_sin_cache``),
+        this recomputes freqs directly from ``inv_freq`` so arbitrary position
+        values are supported with no cache-size limit — matching the HF
+        reference. Delegates to
+        :func:`compute_qwen3vl_mrope_cos_sin_from_inv_freq`.
+
+        Parameters
+        ----------
+        position_ids:
+            ``(3, B, S)`` temporal/height/width indices, or ``(B, S)`` which is
+            broadcast across the three axes (degenerates to plain 1-D RoPE).
+
+        Returns
+        -------
+        cos, sin : torch.Tensor
+            Shape ``(B, S, rotary_dim)``, fp32, half-duplicated (rotate-half
+            layout) — ready for the inherited :meth:`apply`.
+        """
+        return compute_qwen3vl_mrope_cos_sin_from_inv_freq(
+            position_ids,
+            self.inv_freq,
+            self.mrope_section,
+            attention_scaling=self.attention_scaling,
+        )
+
+
 __all__ = [
     "RotaryEmbedding",
+    "InterleavedMRotaryEmbedding",
     "apply_rotary_pos_emb",
+    "compute_cos_sin_from_inv_freq",
+    "compute_qwen3vl_mrope_cos_sin_from_inv_freq",
     "rotate_half",
     "ROPE_INV_FREQ_FNS",
 ]
