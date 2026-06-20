@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from phyai_utils_tools.models.cosmos3.processor_cosmos3 import (
     COSMOS3_VISION_START_TOKEN,
+    Cosmos3GenerationOutput,
+    Cosmos3GenerationPostProcessor,
     Cosmos3PolicyProcessedInputs,
     Cosmos3PolicyProcessor,
     Cosmos3Processor,
@@ -19,6 +21,8 @@ from phyai_utils_tools.models.cosmos3.processor_cosmos3 import (
 
 __all__ = [
     "COSMOS3_VISION_START_TOKEN",
+    "Cosmos3GenerationOutput",
+    "Cosmos3GenerationPostProcessor",
     "Cosmos3PolicyProcessedInputs",
     "Cosmos3PolicyProcessor",
     "Cosmos3Processor",

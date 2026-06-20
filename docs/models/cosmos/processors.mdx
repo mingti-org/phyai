@@ -1,0 +1,371 @@
+---
+title: "Cosmos3 Processors"
+description: "Input preprocessing and output postprocessing for Cosmos3 text-to-video and action-policy paths"
+icon: "workflow"
+---
+
+# Overview
+
+Cosmos3 has three processor utilities in PhyAI, covering two engine plugins:
+
+| Processor | Plugin | Purpose |
+| --- | --- | --- |
+| `Cosmos3Processor` | `cosmos3` | Builds conditional and unconditional prompt tokens for the T2V/T2AV generation path |
+| `Cosmos3GenerationPostProcessor` | `cosmos3` | Moves generated pixels / waveform to CPU, converts video to uint8 frames, and saves mp4 files |
+| `Cosmos3PolicyProcessor` | `cosmos3_policy` | Processes images, text, actions, and domain id for policy, forward dynamics, and inverse dynamics; slices and optionally denormalizes output actions |
+
+Schedulers expect canonical requests whose tensors are already tokenized, resized/normalized, and shape-resolved. Tokenization, prompt metadata, observation image preprocessing, action padding, and domain name resolution all live in the processors.
+
+<Note>
+  The `cosmos3` generation plugin already decodes video latents into pixels in `engine.step`; with audio enabled, it also decodes waveform. `Cosmos3GenerationPostProcessor` handles media export glue, not VAE decode. The `cosmos3_policy` path's `postprocess` slices actions to their real dimension and can denormalize them from a stats JSON.
+</Note>
+
+# Generation path: Cosmos3Processor
+
+`Cosmos3Processor` is a Qwen chat-template tokenizer wrapper for `Cosmos3T2VRequest` in T2V/T2AV generation. It:
+
+- Applies the chat template to the positive prompt, then appends `eos` and `<|vision_start|>` tokens.
+- Produces `text_ids` and an all-ones `text_mask`.
+- Tokenizes the negative prompt the same way, producing `neg_text_ids` and `neg_text_mask`.
+- Appends duration, FPS, and resolution metadata to the positive prompt when `append_metadata=True` and `fps`, `num_frames`, `height`, and `width` are known.
+- Uses the built-in Cosmos3 structured bad-quality negative prompt when `negative_prompt=None`; pass `""` for an empty negative prompt.
+
+Common construction:
+
+```python
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+processor = Cosmos3Processor(
+    "/path/to/Cosmos3-Nano/text_tokenizer",
+    fps=24.0,
+    num_frames=189,
+    height=720,
+    width=1280,
+    append_metadata=True,
+)
+
+cond, uncond = processor.tokenize_pair(
+    "A red sports car driving along a coastal road at sunset.",
+    negative_prompt=None,
+    device="cuda",
+)
+```
+
+The output of `tokenize_pair` maps directly to `Cosmos3T2VRequest`:
+
+| Field | Shape | Notes |
+| --- | --- | --- |
+| `cond.text_ids` | `(1, S)` int64 | Positive prompt token ids |
+| `cond.text_mask` | `(1, S)` int64 | No padding today, so all values are 1 |
+| `uncond.text_ids` | `(1, S_neg)` int64 | Negative / unconditional prompt token ids |
+| `uncond.text_mask` | `(1, S_neg)` int64 | No padding today, so all values are 1 |
+
+## Connect to T2V/T2AV Engine
+
+The example below shows how tokenizer output is assembled into `Cosmos3T2VRequest`. `video_shape` is a latent grid, not pixel dimensions; use `pixel_to_latent_shape(num_frames, height, width)` to convert from pixel dimensions.
+
+```python
+import math
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+checkpoint_dir = "/path/to/Cosmos3-Nano"
+device = "cuda"
+dtype = torch.bfloat16
+num_frames = 189
+height = 720
+width = 1280
+fps = 24.0
+with_sound = False
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3",
+        plugin_args=Cosmos3Args(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+            load_sound=(True if with_sound else None),
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=fps,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=device,
+    )
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+
+    output = engine.step(request)
+    media = Cosmos3GenerationPostProcessor(fps=fps).postprocess(output)
+finally:
+    engine.close()
+```
+
+When `with_sound=True`, `engine.step` returns `{"video": pixels, "sound": waveform, "sample_rate": int}`. Otherwise it returns video pixels shaped `(B, 3, T, H, W)` with values in `[0, 1]`.
+
+`Cosmos3GenerationPostProcessor.postprocess(...)` returns `Cosmos3GenerationOutput`:
+
+| Field | Shape / Type | Notes |
+| --- | --- | --- |
+| `frames` | `(T, H, W, 3)` uint8 CPU | RGB frames, ready for video encoding |
+| `video` | CPU tensor | Original decoded pixels in `[0, 1]` |
+| `waveform` | CPU tensor or `None` | Present for T2AV, values in `[-1, 1]` |
+| `sample_rate` | `int` or `None` | Audio sample rate for T2AV |
+
+Save an mp4:
+
+```python
+postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+media = postprocessor.postprocess(output)
+postprocessor.save_mp4(media, "/tmp/cosmos3_t2v.mp4")
+```
+
+# Action-policy path: Cosmos3PolicyProcessor
+
+`Cosmos3PolicyProcessor` is used with the `cosmos3_policy` plugin. It converts an observation image/video, task prompt, optional conditioning action, and domain name into fields required by `Cosmos3ActionRequest`.
+
+It supports three modes:
+
+| Mode | Condition inputs | Generated target |
+| --- | --- | --- |
+| `policy` | Observation frame/video + prompt | Action chunk, optionally rollout video |
+| `forward_dynamics` | Observation + prompt + known action | Rollout video |
+| `inverse_dynamics` | Observation video + prompt | Action chunk explaining the transition |
+
+## Input contract
+
+`preprocess` accepts a dict. The common fields are:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `images` | path, PIL image, numpy array, torch tensor, or a list of those objects | A single image becomes 1 frame; a list is treated as a multi-frame observation |
+| `task` / `prompt` | `str` or `list[str]` | Task text; when a list is provided, the first item is used |
+| `cond_action` / `action` | array-like or `torch.Tensor` | Required only for `forward_dynamics`; usually shaped `(chunk, raw_action_dim)` or `(1, chunk, raw_action_dim)` |
+| `domain_name` / `domain_id` | `str` or `int` | Overrides the constructor's `domain_name` |
+| `mode` | `str` | Overrides the constructor's `mode` |
+
+The output `Cosmos3PolicyProcessedInputs` fields are:
+
+| Field | Shape / Type | Notes |
+| --- | --- | --- |
+| `pixel_values` | `(1, 3, T, H, W)` float | Pixel range `[-1, 1]`, used to VAE-encode condition frames |
+| `text_ids` / `text_mask` | `(1, S)` int64 | Positive branch text condition |
+| `neg_text_ids` / `neg_text_mask` | `(1, S_neg)` int64 | Unconditional / negative branch text condition |
+| `cond_action` | `(1, action_chunk, action_dim)` or `None` | Padded to `action_dim` in `forward_dynamics`; default `action_dim=64` |
+| `domain_id` | `int` | Domain id resolved from the embodiment name |
+| `mode` | `str` | `policy`, `forward_dynamics`, or `inverse_dynamics` |
+| `action_chunk` | `int` | Default `16` |
+| `raw_action_dim` | `int` | Real action width for the embodiment |
+| `video_shape` | `(T, H, W)` | Pixel frame count and spatial dimensions after preprocessing |
+| `cond_frame_indexes` | `tuple[int, ...]` or `None` | Latent frame indexes kept clean by the downstream scheduler |
+
+## Image preprocessing
+
+`Cosmos3ImagePreprocessStep` converts input images to RGB, then resizes/pads them to one target size:
+
+- Input can be a path, PIL image, numpy array, torch tensor, or list.
+- Tensor / numpy inputs may be channel-first or channel-last.
+- Floating-point images that look like `[-1, 1]` are first mapped to `[0, 1]`.
+- Resize uses scale-down BICUBIC and never upscales small images; remaining area is padded with reflect or edge padding.
+- Output layout is `(1, 3, T, H, W)` with values in `[-1, 1]`.
+
+When `image_size` is not `None`, the processor does not use constructor `height/width` directly. Instead, it scales the first frame's height to `image_size`, then snaps to one of the predefined Cosmos3 training resolution/aspect-ratio grids. `examples/cosmos3/run_cosmos3_policy.py` defaults to `image_size=480`.
+
+## Text prompt
+
+`Cosmos3TextTokenizeStep` supports two prompt formats:
+
+| `prompt_format` | Behavior |
+| --- | --- |
+| `"json"` | Builds a structured JSON action caption with viewpoint, duration, fps, resolution, and aspect ratio |
+| `"plain"` | Appends duration/FPS and resolution sentences to the task text |
+
+`negative_prompt` is not metadata-augmented. The policy example defaults to an empty negative prompt.
+
+## Action and domain
+
+`raw_action_dim` can be passed explicitly or resolved from `domain_name`. Common mappings:
+
+| `domain_name` | `domain_id` | `raw_action_dim` |
+| --- | ---: | ---: |
+| `bridge_orig_lerobot` | 7 | 10 |
+| `droid_lerobot` | 8 | 10 |
+| `agibotworld` | 15 | 29 |
+| `fractal` | 20 | 10 |
+
+If `domain_name` is an integer `domain_id`, the processor cannot infer the real action width, so you must pass `raw_action_dim`.
+
+In `forward_dynamics`, `cond_action` is trimmed to `action_chunk_size` or padded by repeating its last frame, then zero-padded to `action_dim`. In other modes, `cond_action` is set to `None`.
+
+# Connect to Policy Engine
+
+The example below runs policy inference from a single observation image and asks the plugin to return both action and decoded rollout pixels. For action output, use a policy checkpoint such as <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>; the general `Cosmos3-Nano` checkpoint remains the T2V/T2AV generation checkpoint.
+
+```python
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+device = "cuda"
+dtype = torch.bfloat16
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3_policy",
+        plugin_args=Cosmos3PolicyArgs(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=None,
+            decode_video=True,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device=device,
+        params_dtype=dtype,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to(device),
+        text_mask=processed.text_mask.to(device),
+        neg_text_ids=processed.neg_text_ids.to(device),
+        neg_text_mask=processed.neg_text_mask.to(device),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
+        cond_action=processed.cond_action,
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    action = output["action"]
+    pixels = output.get("pixels")
+finally:
+    engine.close()
+```
+
+`postprocess` returns a dict:
+
+| Field | Notes |
+| --- | --- |
+| `action` | CPU tensor shaped `(1, action_chunk, raw_action_dim)` |
+| `pixels` | Present when the plugin uses `decode_video=True`; CPU tensor in `[0, 1]` |
+| `video` | Preserved when the engine returns a latent video dict; CPU tensor |
+
+# Action denormalization
+
+If `action_stats_path` is passed to `Cosmos3PolicyProcessor`, `postprocess` denormalizes action values back to physical units before moving them to CPU:
+
+```python
+processor = Cosmos3PolicyProcessor(
+    tokenizer_name_or_path="/path/to/Cosmos3-Nano-Policy-DROID/text_tokenizer",
+    domain_name="droid_lerobot",
+    action_stats_path="/path/to/action_stats.json",
+    action_normalization="minmax",
+)
+```
+
+Supported `action_normalization` modes:
+
+| Method | JSON fields |
+| --- | --- |
+| `meanstd` | `mean`, `std` |
+| `minmax` | `min`, `max` |
+| `quantile` | `q01`, `q99` |
+| `quantile_rot` | Reads `q01`, `q99` from `global_raw` |
+
+Without `action_stats_path`, `postprocess` only slices the action and calls `.cpu()`; it does not change the numeric scale.
+
+# FAQ
+
+## Why call `pixel_to_latent_shape` on `video_shape`
+
+`Cosmos3PolicyProcessedInputs.video_shape` is the post-preprocess pixel size `(T, H, W)`. `Cosmos3ActionRequest.video_shape` expects the latent grid `(t_lat, h_lat, w_lat)`, so call `pixel_to_latent_shape(*processed.video_shape)`.
+
+## How are single-image and video observations different
+
+A single image produces `T=1`. A video or list input keeps all provided frames, and VAE encode also encodes the full observation. Which latent frames stay clean downstream is controlled by `cond_frame_indexes`; the example script defaults to `(0,)` for images and `(0, 1)` for videos.
+
+## What are `raw_action_dim` and `action_dim`
+
+`raw_action_dim` is the real action width for the robot embodiment, for example `droid_lerobot=10` or `agibotworld=29`. `action_dim` is the model's internal action token width, default `64`. The processor pads conditioning actions to `action_dim`, and postprocess slices model outputs back to `raw_action_dim`.
+
+## Does the tokenizer require network access
+
+The examples use the checkpoint-local `text_tokenizer` directory, for example `/path/to/Cosmos3-Nano-Policy-DROID/text_tokenizer`. If you pass a remote tokenizer name and it is not in the local cache, first construction may trigger a download. In offline environments, pass a local tokenizer path.

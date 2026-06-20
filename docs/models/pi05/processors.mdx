@@ -1,0 +1,240 @@
+---
+title: "PI0.5 Processors"
+description: "Use pi0.5 preprocessors and postprocessors compatible with the lerobot format"
+icon: "workflow"
+---
+
+# Overview
+
+`PI05Processor` lives in `phyai_utils_tools.models.pi05`. It converts robot-side data into the canonical tensors required by `PI05Request`, and converts the model's action chunk back to the dataset's real action dimension.
+
+The PhyAI pi0.5 scheduler does not resize images, tokenize text, discretize state, or unnormalize actions. Those steps are handled by the processor:
+
+| Stage | Input | Output |
+| --- | --- | --- |
+| `preprocess` | `images`, `task`, `state` | `PI05ProcessedInputs(pixel_values, input_ids, lang_lens)` |
+| `engine.step` | `PI05Request` | `(B, chunk_size, max_action_dim)` |
+| `postprocess` | Raw action chunk | `(B, chunk_size, action_dim)` |
+
+<Note>
+  The public `pi05_base` checkpoint has empty normalizer `features`, so state/action normalization is a no-op by default. If your lerobot checkpoint includes dataset stats, `from_pretrained` loads those stats sidecars and uses them in pre/postprocess.
+</Note>
+
+# Input contract
+
+`preprocess` accepts a transition dict. The common fields are:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `images` | `list[torch.Tensor]` or `torch.Tensor` | Each camera is `(B, C, H, W)`; stacked `(B, num_images, C, H, W)` is also accepted |
+| `task` | `list[str]` or `str` | One task string per batch sample |
+| `state` | `torch.Tensor` | `(B, state_dim)`, with state values in the `[-1, 1]` range for the pi0.5 prompt |
+
+The output `PI05ProcessedInputs` fields map directly into `PI05Request`:
+
+| Field | Shape | Notes |
+| --- | --- | --- |
+| `pixel_values` | `(B, num_images, C, image_size, image_size)` | Defaults: `num_images=3`, `C=3`, `image_size=224` |
+| `input_ids` | `(B, tokenizer_max_length)` int64 | Default tokenizer is `google/paligemma-3b-pt-224`, right-padded |
+| `lang_lens` | `(B,)` int64 | Real token length for each prompt |
+
+Images are resized proportionally to a square, padded, then stacked into the `(B, num_images, C, H, W)` layout expected by the scheduler. When `normalize_pixels=True`, the processor maps `[0, 1]` pixels to `[-1, 1]`.
+
+# Construct from a checkpoint
+
+If your checkpoint directory contains lerobot-format `policy_preprocessor.json` and `policy_postprocessor.json`, prefer `from_pretrained`. This path preserves the processor steps, normalizer configuration, and stats sidecars recorded in the checkpoint, then adds the vision resize and action slice needed by PhyAI inference.
+
+```python
+from pathlib import Path
+
+import torch
+
+from phyai_utils_tools.models.pi05 import PI05Processor
+
+processor = PI05Processor.from_pretrained(
+    Path("/path/to/pi05_base"),
+    image_size=224,
+    num_channels=3,
+    num_images=3,
+    action_dim=7,
+    device="cuda",
+    params_dtype=torch.bfloat16,
+)
+```
+
+This construction path:
+
+- Loads `policy_preprocessor.json` and `policy_postprocessor.json`.
+- Injects a HuggingFace tokenizer object into the tokenizer step.
+- Points the preprocess `device_processor` at `device`, so model inputs land on the inference device.
+- Leaves postprocess device behavior as configured by the checkpoint; the `pi05_base` postprocessor returns CPU tensors.
+- Prepends resize / optional pixel normalization to the loaded preprocessor.
+- Appends `SliceActionStep(action_dim=action_dim)` to the loaded postprocessor.
+
+# Manual construction
+
+If you do not have processor JSON files, or you only need the default `pi05_base` behavior, construct `PI05Processor` directly:
+
+```python
+import torch
+
+from phyai_utils_tools.models.pi05 import PI05Processor
+
+processor = PI05Processor(
+    image_size=224,
+    num_channels=3,
+    num_images=3,
+    tokenizer_max_length=200,
+    action_dim=7,
+    device="cuda",
+    params_dtype=torch.bfloat16,
+)
+```
+
+The manually constructed preprocess pipeline runs in this order:
+
+<Steps>
+  <Step title="Resize cameras">
+    `ResizeWithPadStep` reads `images`, validates the camera count and channel count, then resizes/pads each camera to `image_size × image_size`.
+  </Step>
+
+  <Step title="Normalize state">
+    `NormalizerStep` processes `state` using `dataset_stats` and `PI05_NORM_MAP`. Without stats, this is a no-op.
+  </Step>
+
+  <Step title="Build prompt">
+    `StateTokenizerPrepareStep` discretizes `state` into 256 bins and builds `Task: <task>, State: <bins>;\nAction: `.
+  </Step>
+
+  <Step title="Tokenize">
+    `TokenizerStep` uses the PaliGemma tokenizer to encode the prompt into `input_ids` and `lang_lens`.
+  </Step>
+
+  <Step title="Move tensors">
+    `DeviceStep` moves tensors to `device` and casts floating-point tensors to `params_dtype`.
+  </Step>
+</Steps>
+
+The postprocess pipeline first unnormalizes actions, slices the model's padded internal action dimension down to `action_dim`, then moves the result back to CPU.
+
+# Connect to Engine
+
+The example below shows how raw cameras, task text, and state flow through `PI05Processor` into `PI05Request`, then into `Engine` inference.
+
+```python
+from pathlib import Path
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.configuration_pi05 import PI05Config
+from phyai.models.pi05.main_pi05 import PI05Args
+from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
+from phyai.utils import load_config
+from phyai_utils_tools.models.pi05 import PI05Processor
+
+checkpoint_dir = Path("/path/to/pi05_base")
+cfg = load_config(checkpoint_dir, PI05Config)
+device = torch.device("cuda")
+dtype = torch.bfloat16
+batch_size = 1
+action_dim = 7
+
+processor = PI05Processor.from_pretrained(
+    checkpoint_dir,
+    image_size=cfg.vision.image_size,
+    num_channels=cfg.vision.num_channels,
+    num_images=3,
+    action_dim=action_dim,
+    device=device,
+    params_dtype=dtype,
+)
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir=checkpoint_dir,
+            max_batch_size=batch_size,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+
+try:
+    raw = {
+        "images": [
+            torch.rand(batch_size, 3, 480, 640, device=device),
+            torch.rand(batch_size, 3, 480, 640, device=device),
+            torch.rand(batch_size, 3, 480, 640, device=device),
+        ],
+        "task": ["pick up the cup"],
+        "state": torch.rand(batch_size, 7, device=device) * 2 - 1,
+    }
+
+    processed = processor.preprocess(raw)
+    request = PI05Request(
+        pixel_values=processed.pixel_values,
+        input_ids=processed.input_ids,
+        lang_lens=processed.lang_lens,
+    )
+
+    raw_actions = engine.step(request)
+    actions = processor.postprocess(raw_actions)
+    print(actions.shape)
+finally:
+    engine.close()
+```
+
+<Tip>
+  If you only want to measure engine latency, skip the processor and build an already resized/tokenized `PI05Request` directly. `examples/pi05/run_pi05.py --raw` uses that path.
+</Tip>
+
+# Save and load
+
+A manually constructed processor can be saved as lerobot-compatible JSON:
+
+```python
+processor.save_pretrained("/tmp/pi05_processor")
+```
+
+The saved directory contains:
+
+| File | Contents |
+| --- | --- |
+| `policy_preprocessor.json` | Normalizer, pi0.5 prompt step, tokenizer, device step |
+| `policy_postprocessor.json` | Unnormalizer and device step |
+| `*.safetensors` | Generated only when the normalizer / unnormalizer has stats |
+
+PhyAI-side vision resize, optional pixel normalization, and action slicing are not written into JSON. `PI05Processor.from_pretrained(...)` adds them back from constructor arguments. This matches the lerobot boundary: image resize and action slicing are inference-side model glue, not part of the checkpoint JSON's generic processor core.
+
+# FAQ
+
+## `images` shape mismatch
+
+`num_images` and `num_channels` must match the processor constructor arguments. The default `pi05_base` setup uses 3 RGB cameras, so list input needs 3 tensors shaped `(B, 3, H, W)`, and stacked input needs `(B, 3, 3, H, W)`.
+
+## Is `state` required
+
+`StateTokenizerPrepareStep` supports the path where `state` is absent. In that case, the prompt only contains task text and no state bins. The normal pi0.5 robot inference path should pass proprioceptive state.
+
+## Why action output returns to CPU
+
+`PI05Processor.from_pretrained` does not override the checkpoint postprocessor's `device_processor`. The `pi05_base` postprocessor configuration returns actions to CPU so they are ready for robot control or evaluation code.
+
+## Does the tokenizer require network access
+
+The default tokenizer name is `google/paligemma-3b-pt-224`. If this tokenizer is not already in the local HuggingFace cache, the first processor construction may trigger a download. In offline environments, pass a prepared tokenizer object:
+
+```python
+processor = PI05Processor(
+    tokenizer=my_tokenizer,
+    image_size=224,
+    num_images=3,
+    tokenizer_max_length=200,
+)
+```

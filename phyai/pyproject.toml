@@ -14,7 +14,6 @@ dependencies = [
     "transformers==5.8.1",
     "huggingface-hub",
     "tqdm",
-    "av>=14.0.0",
 ]
 
 [project.optional-dependencies]

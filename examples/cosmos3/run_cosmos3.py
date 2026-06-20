@@ -53,7 +53,6 @@ import argparse
 import contextlib
 import math
 import time
-from pathlib import Path
 
 import torch
 
@@ -70,70 +69,6 @@ def _timed(label: str, store: dict):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         store[label] = time.perf_counter() - t0
-
-
-def _to_uint8_frames(video: torch.Tensor) -> torch.Tensor:
-    """``[1,3,T,H,W]`` or ``[3,T,H,W]`` in [0,1] -> CPU uint8 frames ``[T,H,W,3]``.
-
-    This is the GPU->CPU + dtype-convert step (timed separately from encoding).
-    """
-    if video.ndim == 5:
-        video = video[0]
-    return (video.clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 3, 0).cpu()
-
-
-def _encode_mp4(
-    frames: torch.Tensor,
-    path: str,
-    fps: float,
-    *,
-    waveform: torch.Tensor | None = None,
-    sample_rate: int | None = None,
-) -> None:
-    """Encode CPU uint8 frames ``[T,H,W,3]`` (+ optional audio) to one mp4 via PyAV.
-
-    In-process libav encoding (PyAV) — no external ffmpeg subprocess or stdin pipe,
-    and video + audio are muxed into a single container in one pass. ``waveform`` is
-    ``[1,ch,N]`` / ``[ch,N]`` / ``[N]`` in [-1, 1]; pass it with ``sample_rate`` for an
-    AAC audio track.
-    """
-    from fractions import Fraction
-
-    import av
-
-    arr = frames.numpy()  # [T, H, W, 3] uint8 RGB
-    samples = None
-    layout = "stereo"
-    with av.open(path, mode="w") as container:
-        v = container.add_stream("h264", rate=Fraction(fps).limit_denominator(10000))
-        v.width = int(arr.shape[2])
-        v.height = int(arr.shape[1])
-        v.pix_fmt = "yuv420p"
-        v.options = {"crf": "18"}
-
-        a = None
-        if waveform is not None and sample_rate is not None:
-            wav = waveform[0] if waveform.ndim == 3 else waveform  # [ch, N]
-            samples = wav.clamp(-1.0, 1.0).float().cpu().numpy()
-            if samples.ndim == 1:
-                samples = samples.reshape(1, -1)
-            layout = "stereo" if samples.shape[0] >= 2 else "mono"
-            a = container.add_stream("aac", rate=int(sample_rate))
-            a.layout = layout
-
-        for frame_data in arr:
-            for pkt in v.encode(av.VideoFrame.from_ndarray(frame_data, format="rgb24")):
-                container.mux(pkt)
-        for pkt in v.encode():
-            container.mux(pkt)
-
-        if a is not None:
-            af = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
-            af.sample_rate = int(sample_rate)
-            for pkt in a.encode(af):
-                container.mux(pkt)
-            for pkt in a.encode():
-                container.mux(pkt)
 
 
 def main() -> None:
@@ -181,11 +116,13 @@ def main() -> None:
     from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
     from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
     from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
-    from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+    from phyai_utils_tools.models.cosmos3 import (
+        Cosmos3GenerationPostProcessor,
+        Cosmos3Processor,
+    )
 
     device = "cuda"
     dtype = torch.bfloat16
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     use_karras = {"auto": None, "true": True, "false": False}[args.use_karras_sigmas]
 
     timings: dict[str, float] = {}
@@ -250,19 +187,19 @@ def main() -> None:
         with _timed("inference", timings):
             result = engine.step(request)
 
-        if isinstance(result, dict):
-            video, sound, sr = result["video"], result["sound"], result["sample_rate"]
-        else:
-            video, sound, sr = result, None, None
-
+        postprocessor = Cosmos3GenerationPostProcessor(fps=args.fps)
         out_mp4 = f"{args.out}.mp4"
         with _timed("to_cpu", timings):
-            frames = _to_uint8_frames(video)
+            media = postprocessor.postprocess(result)
         with _timed("encode", timings):
-            _encode_mp4(frames, out_mp4, args.fps, waveform=sound, sample_rate=sr)
+            postprocessor.save_mp4(media, out_mp4)
         print(
             f"[saved] -> {out_mp4}"
-            + (f" (+{sr} Hz audio)" if sound is not None else "")
+            + (
+                f" (+{media.sample_rate} Hz audio)"
+                if media.waveform is not None and media.sample_rate is not None
+                else ""
+            )
         )
 
         # --- timing breakdown (model_load = JuiceFS weight read; inference = denoise

@@ -1,0 +1,368 @@
+---
+title: "Cosmos3 Processors"
+description: "Cosmos3 文生视频与动作策略路径的输入预处理和输出后处理"
+icon: "workflow"
+---
+
+# 概述
+
+Cosmos3 在 PhyAI 里有两条 processor 路径，分别对应两个 engine plugin：
+
+| Processor | Plugin | 作用 |
+| --- | --- | --- |
+| `Cosmos3Processor` | `cosmos3` | 给 T2V/T2AV 生成路径构造正向/负向 prompt token |
+| `Cosmos3GenerationPostProcessor` | `cosmos3` | 把生成路径的 pixels / waveform 搬到 CPU，转换成 uint8 frames，并保存 mp4 |
+| `Cosmos3PolicyProcessor` | `cosmos3_policy` | 给 policy、forward dynamics、inverse dynamics 路径处理图像、文本、动作和 domain id，并对输出 action 做 slice / 可选反归一化 |
+
+Scheduler 接收的是已经 tokenized、已经 resize/normalize、形状明确的 canonical request。tokenizer、prompt metadata、observation 图像预处理、动作 padding、domain name 解析都在 processor 里完成。
+
+<Note>
+  `cosmos3` 生成 plugin 的 `engine.step` 已经把 video latent 解码成像素；带音频时还会解码 waveform。`Cosmos3GenerationPostProcessor` 处理的是媒体导出胶水，不负责 VAE decode。`cosmos3_policy` 路径的 `postprocess` 负责把 action 裁到真实维度，并可按 stats JSON 反归一化。
+</Note>
+
+# 生成路径：Cosmos3Processor
+
+`Cosmos3Processor` 是 Qwen chat-template tokenizer wrapper，主要用于 T2V/T2AV 的 `Cosmos3T2VRequest`。它会：
+
+- 对 positive prompt 使用 chat template，并追加 `eos` 和 `<|vision_start|>` token。
+- 生成 `text_ids` 和全 1 的 `text_mask`。
+- 对 negative prompt 走同样的 tokenization，生成 `neg_text_ids` 和 `neg_text_mask`。
+- 在 `append_metadata=True` 且已知 `fps`、`num_frames`、`height`、`width` 时，给 positive prompt 追加时长、FPS 和分辨率信息。
+- 当 `negative_prompt=None` 时，使用内置的 Cosmos3 structured bad-quality negative prompt；传 `""` 表示空 negative。
+
+常用构造方式：
+
+```python
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+processor = Cosmos3Processor(
+    "/path/to/Cosmos3-Nano/text_tokenizer",
+    fps=24.0,
+    num_frames=189,
+    height=720,
+    width=1280,
+    append_metadata=True,
+)
+
+cond, uncond = processor.tokenize_pair(
+    "A red sports car driving along a coastal road at sunset.",
+    negative_prompt=None,
+    device="cuda",
+)
+```
+
+`tokenize_pair` 的输出可以直接映射到 `Cosmos3T2VRequest`：
+
+| 字段 | Shape | 备注 |
+| --- | --- | --- |
+| `cond.text_ids` | `(1, S)` int64 | positive prompt token ids |
+| `cond.text_mask` | `(1, S)` int64 | 当前没有 padding，全部为 1 |
+| `uncond.text_ids` | `(1, S_neg)` int64 | negative / unconditional prompt token ids |
+| `uncond.text_mask` | `(1, S_neg)` int64 | 当前没有 padding，全部为 1 |
+
+## 和 T2V/T2AV Engine 串起来
+
+下面的例子展示 tokenizer 输出如何组装成 `Cosmos3T2VRequest`。`video_shape` 是 latent grid，不是像素尺寸；使用 `pixel_to_latent_shape(num_frames, height, width)` 从像素尺寸换算。
+
+```python
+import math
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano"
+device = "cuda"
+dtype = torch.bfloat16
+num_frames = 189
+height = 720
+width = 1280
+fps = 24.0
+with_sound = False
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3",
+        plugin_args=Cosmos3Args(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+            load_sound=(True if with_sound else None),
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=fps,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=device,
+    )
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+
+    output = engine.step(request)
+    media = Cosmos3GenerationPostProcessor(fps=fps).postprocess(output)
+finally:
+    engine.close()
+```
+
+`with_sound=True` 时，`engine.step` 返回 `{"video": pixels, "sound": waveform, "sample_rate": int}`；否则返回 video pixels，shape 为 `(B, 3, T, H, W)`，数值范围为 `[0, 1]`。
+
+`Cosmos3GenerationPostProcessor.postprocess(...)` 的输出是 `Cosmos3GenerationOutput`：
+
+| 字段 | Shape / 类型 | 备注 |
+| --- | --- | --- |
+| `frames` | `(T, H, W, 3)` uint8 CPU | RGB frames，可直接编码成视频 |
+| `video` | CPU tensor | 原始 decoded pixels，范围 `[0, 1]` |
+| `waveform` | CPU tensor 或 `None` | T2AV 时存在，范围 `[-1, 1]` |
+| `sample_rate` | `int` 或 `None` | T2AV 音频采样率 |
+
+保存 mp4：
+
+```python
+postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+media = postprocessor.postprocess(output)
+postprocessor.save_mp4(media, "/tmp/cosmos3_t2v.mp4")
+```
+
+# 动作策略路径：Cosmos3PolicyProcessor
+
+`Cosmos3PolicyProcessor` 用于 `cosmos3_policy` plugin。它把 observation image/video、task prompt、可选 conditioning action 和 domain name 转成 `Cosmos3ActionRequest` 所需字段。
+
+支持三种 mode：
+
+| Mode | 条件输入 | 生成目标 |
+| --- | --- | --- |
+| `policy` | observation frame/video + prompt | action chunk，可选 rollout video |
+| `forward_dynamics` | observation + prompt + 已知 action | rollout video |
+| `inverse_dynamics` | observation video + prompt | 解释这段 transition 的 action chunk |
+
+## 输入规范
+
+`preprocess` 接收一个 dict。常用字段如下：
+
+| 字段 | 类型 | 备注 |
+| --- | --- | --- |
+| `images` | path、PIL image、numpy array、torch tensor，或这些对象的 list | 单图会变成 1 帧；list 会作为多帧 observation |
+| `task` / `prompt` | `str` 或 `list[str]` | 任务文本；list 时使用第一条 |
+| `cond_action` / `action` | array-like 或 `torch.Tensor` | 仅 `forward_dynamics` 需要，shape 通常为 `(chunk, raw_action_dim)` 或 `(1, chunk, raw_action_dim)` |
+| `domain_name` / `domain_id` | `str` 或 `int` | 覆盖构造参数中的 `domain_name` |
+| `mode` | `str` | 覆盖构造参数中的 `mode` |
+
+输出的 `Cosmos3PolicyProcessedInputs` 字段：
+
+| 字段 | Shape / 类型 | 备注 |
+| --- | --- | --- |
+| `pixel_values` | `(1, 3, T, H, W)` float | 像素范围 `[-1, 1]`，用于 VAE encode 条件帧 |
+| `text_ids` / `text_mask` | `(1, S)` int64 | positive branch 文本条件 |
+| `neg_text_ids` / `neg_text_mask` | `(1, S_neg)` int64 | unconditional / negative branch 文本条件 |
+| `cond_action` | `(1, action_chunk, action_dim)` 或 `None` | `forward_dynamics` 中 padding 到 `action_dim`，默认 `64` |
+| `domain_id` | `int` | 从 embodiment name 解析出的 domain id |
+| `mode` | `str` | `policy`、`forward_dynamics` 或 `inverse_dynamics` |
+| `action_chunk` | `int` | 默认 `16` |
+| `raw_action_dim` | `int` | embodiment 真实 action 宽度 |
+| `video_shape` | `(T, H, W)` | 预处理后的像素帧数和空间尺寸 |
+| `cond_frame_indexes` | `tuple[int, ...]` 或 `None` | 下游 scheduler 中保持 clean 的 latent frame index |
+
+## 图像预处理
+
+`Cosmos3ImagePreprocessStep` 会把输入图像转为 RGB，再 resize/pad 成统一尺寸：
+
+- 输入可以是路径、PIL image、numpy array、torch tensor，或 list。
+- tensor / numpy 支持 channel-first 或 channel-last。
+- 浮点图像如果看起来是 `[-1, 1]`，会先映射到 `[0, 1]`。
+- resize 使用 scale-down BICUBIC，不会把小图放大；剩余区域用 reflect 或 edge padding。
+- 输出 layout 是 `(1, 3, T, H, W)`，数值范围是 `[-1, 1]`。
+
+当 `image_size` 不为 `None` 时，processor 不直接使用构造参数里的 `height/width`，而是根据第一帧的原始比例把高度缩放到 `image_size`，再 snap 到 Cosmos3 训练时使用的预定义分辨率/宽高比网格。`examples/cosmos3/run_cosmos3_policy.py` 默认 `image_size=480`。
+
+## 文本 prompt
+
+`Cosmos3TextTokenizeStep` 支持两种 prompt 格式：
+
+| `prompt_format` | 行为 |
+| --- | --- |
+| `"json"` | 构造 structured JSON action caption，包含 viewpoint、duration、fps、resolution、aspect ratio |
+| `"plain"` | 在 task 文本后追加 duration/FPS 和 resolution 句子 |
+
+`negative_prompt` 不会追加 metadata。policy 示例默认 negative prompt 是空字符串。
+
+## 动作和 domain
+
+`raw_action_dim` 可以显式传入，也可以从 `domain_name` 自动解析。常见映射包括：
+
+| `domain_name` | `domain_id` | `raw_action_dim` |
+| --- | ---: | ---: |
+| `bridge_orig_lerobot` | 7 | 10 |
+| `droid_lerobot` | 8 | 10 |
+| `agibotworld` | 15 | 29 |
+| `fractal` | 20 | 10 |
+
+如果 `domain_name` 是整数 `domain_id`，processor 无法推断真实 action 宽度，需要显式传 `raw_action_dim`。
+
+`forward_dynamics` 的 `cond_action` 会按 `action_chunk_size` 裁剪或用最后一帧 repeat padding，然后补零到 `action_dim`。其他 mode 下 `cond_action` 会被置为 `None`。
+
+# 和 Policy Engine 串起来
+
+下面的例子使用单张 observation image 做 policy 推理，并让 plugin 返回 action 和 decoded rollout pixels。出 action 时请使用 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a> 这类 policy checkpoint；通用 `Cosmos3-Nano` 仍用于 T2V/T2AV 生成路径。
+
+```python
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+device = "cuda"
+dtype = torch.bfloat16
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3_policy",
+        plugin_args=Cosmos3PolicyArgs(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=None,
+            decode_video=True,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device=device,
+        params_dtype=dtype,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to(device),
+        text_mask=processed.text_mask.to(device),
+        neg_text_ids=processed.neg_text_ids.to(device),
+        neg_text_mask=processed.neg_text_mask.to(device),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
+        cond_action=processed.cond_action,
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    action = output["action"]
+    pixels = output.get("pixels")
+finally:
+    engine.close()
+```
+
+`postprocess` 的输出是 dict：
+
+| 字段 | 备注 |
+| --- | --- |
+| `action` | CPU tensor，shape 为 `(1, action_chunk, raw_action_dim)` |
+| `pixels` | 当 plugin 使用 `decode_video=True` 时存在，CPU tensor，范围 `[0, 1]` |
+| `video` | 当 engine 返回 latent video dict 时保留，CPU tensor |
+
+# 动作反归一化
+
+如果构造 `Cosmos3PolicyProcessor` 时传入 `action_stats_path`，`postprocess` 会在 CPU 迁移前把 action 反归一化到物理单位：
+
+```python
+processor = Cosmos3PolicyProcessor(
+    tokenizer_name_or_path="/path/to/Cosmos3-Nano-Policy-DROID/text_tokenizer",
+    domain_name="droid_lerobot",
+    action_stats_path="/path/to/action_stats.json",
+    action_normalization="minmax",
+)
+```
+
+支持的 `action_normalization`：
+
+| 方法 | JSON 字段 |
+| --- | --- |
+| `meanstd` | `mean`、`std` |
+| `minmax` | `min`、`max` |
+| `quantile` | `q01`、`q99` |
+| `quantile_rot` | 从 `global_raw` 读取 `q01`、`q99` |
+
+没有 `action_stats_path` 时，`postprocess` 只做 action slice 和 `.cpu()`，不会改变数值尺度。
+
+# 常见问题
+
+## `video_shape` 为什么要再调用 `pixel_to_latent_shape`
+
+`Cosmos3PolicyProcessedInputs.video_shape` 是预处理后的像素尺寸 `(T, H, W)`；`Cosmos3ActionRequest.video_shape` 需要 latent grid `(t_lat, h_lat, w_lat)`。因此要调用 `pixel_to_latent_shape(*processed.video_shape)`。
+
+## 单图和视频 observation 有什么区别
+
+单图输入会得到 `T=1`。视频或 list 输入会保留全部提供的帧，VAE encode 时也会编码整段 observation。下游哪些 latent frame 保持 clean 由 `cond_frame_indexes` 决定；示例脚本默认单图用 `(0,)`，视频用 `(0, 1)`。
+
+## `raw_action_dim` 和 `action_dim` 分别是什么
+
+`raw_action_dim` 是机器人 embodiment 的真实动作宽度，例如 `droid_lerobot=10`、`agibotworld=29`。`action_dim` 是模型内部动作 token 宽度，默认 `64`。processor 会把 conditioning action padding 到 `action_dim`，postprocess 会把模型输出裁回 `raw_action_dim`。
+
+## tokenizer 是否会联网
+
+示例使用 checkpoint 内的 `text_tokenizer` 目录，例如 `/path/to/Cosmos3-Nano-Policy-DROID/text_tokenizer`。如果传的是远程 tokenizer 名且本地没有缓存，首次构造 tokenizer 可能会触发下载；离线环境建议传本地 tokenizer 路径。

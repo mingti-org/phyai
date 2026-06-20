@@ -1,0 +1,327 @@
+---
+title: "Single-GPU Cosmos3 Generation"
+description: "How PhyAI runs the Cosmos3 T2V and T2AV generation paths on one GPU"
+icon: "sparkles"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano"
+  subtitle="Text-to-Video / Text-to-Audio-Video · Single-GPU Generation"
+  icon="C"
+  rows={{
+    "Model Type": "World Foundation Model",
+    "Weights": <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano</a>,
+    "Paths": ["T2V", "T2AV"],
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3T2VScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3</code>,
+    "Sampler": "UniPC",
+    "Default Size": "720x1280 · 189 frames · 35 steps",
+    "Param Precision": "bf16",
+  }}
+/>
+
+# Overview
+
+Cosmos3's generation path turns text into video. When the sound stream is enabled, the same denoising run also produces audio aligned with the frames. T2V produces video only; T2AV advances video latent and sound latent on the same timeline, so the image comes into view while the waveform takes shape beside it.
+
+This page is about `ws1`, meaning `world_size=1`. There is no tensor parallelism, no continuous batching, and no server-side scheduling in this path. It is the plain single-GPU route: build an engine, tokenize the prompt, assemble a `Cosmos3T2VRequest`, run the denoising loop, and let VAE / AVAE decode the result into media you can save.
+
+<Warning>
+  PhyAI has not added special optimization for the Cosmos3 T2V/T2AV path yet. The current implementation favors correctness, reference alignment, and readable control flow: the denoising loop is a Python-driven UniPC loop, and the examples use `RuntimeConfig(use_cuda_graph=False)`. Treat any timing numbers as baseline measurements, not final optimized throughput.
+</Warning>
+
+# Architecture
+
+The Cosmos3 generation path uses PhyAI's <Tooltip headline="Engine + plugin" tip="Engine resolves an Entry by plugin name. Entry.setup() builds models, loads weights, and prepares the scheduler. Entry.step() accepts a canonical request and returns model output.">engine + plugin contract</Tooltip>. The `cosmos3` plugin splits the work into a few layers:
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/cosmos3" defaultOpen>
+    <Tree.File name="main_cosmos3.py" />
+    <Tree.File name="scheduler_ws1_cosmos3.py" />
+    <Tree.File name="model_runner_cosmos3.py" />
+    <Tree.File name="model_runner_vae_cosmos3.py" />
+    <Tree.File name="modeling_cosmos3.py" />
+    <Tree.File name="vae_wan.py" />
+    <Tree.File name="avae_sound.py" />
+    <Tree.File name="sampler_unipc.py" />
+    <Tree.File name="configuration_cosmos3.py" />
+  </Tree.Folder>
+</Tree>
+
+Main components:
+
+| Component | Responsibility |
+| --- | --- |
+| `Cosmos3Entry` | Parses `Cosmos3Args`; loads the transformer, VAE, and optional AVAE |
+| `Cosmos3T2VScheduler` | Runs the T2V/T2AV denoising loop, owns the UniPC sampler, and decodes video / sound when needed |
+| `Cosmos3T2VRunner` | Calls the transformer and caches timestep-independent UND condition |
+| `Cosmos3VAERunner` | Decodes video latent into pixels in `[0, 1]` |
+| `Cosmos3SoundVAERunner` | Decodes sound latent into waveform in `[-1, 1]` |
+| `Cosmos3Processor` | Handles prompt tokenization and prompt metadata outside the engine |
+| `Cosmos3GenerationPostProcessor` | Moves pixels / waveform to CPU and saves mp4 output outside the engine |
+
+# Run path
+
+<Steps>
+  <Step title="Prepare weights">
+    Prepare a <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer">Cosmos3-Nano</a> checkpoint. The examples assume this layout:
+
+    ```text
+    /path/to/Cosmos3-Nano/
+      transformer/
+      vae/
+      text_tokenizer/
+      sound_tokenizer/   # required for T2AV
+      scheduler/
+    ```
+  </Step>
+
+  <Step title="Construct the engine">
+    The plugin name is `"cosmos3"`. T2V needs the transformer and VAE. T2AV also needs AVAE, exposed through `sound_tokenizer`.
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano"
+    with_sound = False
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3",
+            plugin_args=Cosmos3Args(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=False,
+                load_sound=(True if with_sound else None),
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    `flow_shift=10.0` and `use_karras_sigmas=False` match the native linear-flow UniPC setup used by the current example script.
+  </Step>
+
+  <Step title="Tokenize the prompt">
+    `Cosmos3T2VScheduler` does not run the tokenizer. Chat template handling, `eos` / `<|vision_start|>` suffixes, and positive / negative prompt token ids are produced by `Cosmos3Processor`.
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=24.0,
+        num_frames=189,
+        height=720,
+        width=1280,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device="cuda",
+    )
+    ```
+
+    `negative_prompt=None` uses the built-in Cosmos3 structured negative prompt. Pass `negative_prompt=""` if you want an empty negative prompt.
+  </Step>
+
+  <Step title="Build the request">
+    `Cosmos3T2VRequest` carries tokenized text conditions, the latent grid, sampler settings, CFG scale, and seed.
+
+    | Field | Shape / Type | Notes |
+    | --- | --- | --- |
+    | `text_ids` / `text_mask` | `(1, S)` int64 | Positive prompt condition |
+    | `neg_text_ids` / `neg_text_mask` | `(1, S_neg)` int64 | Negative / unconditional prompt condition |
+    | `video_shape` | `(t_lat, h_lat, w_lat)` | Latent grid, not pixel dimensions |
+    | `fps` | `float` | Video FPS; also used in prompt metadata |
+    | `num_inference_steps` | `int` | UniPC steps; the example default is `35` |
+    | `guidance_scale` | `float` | CFG scale; the example default is `6.0` |
+    | `seed` | `int` | Initial video / sound noise seed |
+    | `sound_frames` | `int` or `None` | Non-`None` enables T2AV |
+
+    ```python
+    import math
+
+    from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+
+    num_frames = 189
+    height = 720
+    width = 1280
+    fps = 24.0
+    with_sound = False
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+    ```
+
+    `pixel_to_latent_shape` converts pixel dimensions into the VAE latent grid. The default compression is `4` along time and `16` along each spatial axis.
+  </Step>
+
+  <Step title="Run generation">
+    ```python
+    output = engine.step(request)
+    ```
+
+    T2V returns a pixels tensor shaped `(B, 3, T, H, W)` with values in `[0, 1]`. T2AV returns a dict:
+
+    ```python
+    {
+        "video": pixels,
+        "sound": waveform,
+        "sample_rate": sample_rate,
+    }
+    ```
+  </Step>
+
+  <Step title="Save media">
+    `Cosmos3GenerationPostProcessor` moves GPU tensors to CPU, converts video to uint8 RGB frames, and muxes waveform into the same mp4 when audio is present.
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3GenerationPostProcessor
+
+    postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+    media = postprocessor.postprocess(output)
+    postprocessor.save_mp4(media, ".cache/cosmos3_t2v.mp4")
+    ```
+  </Step>
+</Steps>
+
+# End-to-end examples
+
+`examples/cosmos3/run_cosmos3.py` wires the full path together. T2V:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --out .cache/cosmos3_t2v
+```
+
+T2AV:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "ocean waves crashing on rocks" \
+    --sound \
+    --out .cache/cosmos3_t2av
+```
+
+The defaults are `720x1280`, `189` frames, and `35` steps. That is heavy. For a smoke test, shrink the run first:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --num-frames 49 \
+    --height 480 \
+    --width 832 \
+    --steps 10 \
+    --out .cache/cosmos3_smoke
+```
+
+The script prints phase timings: `model_load`, `preprocess`, `inference`, `to_cpu`, and `encode`. `inference` includes the denoising loop plus VAE / AVAE decode. `encode` is PyAV mp4 writing time.
+
+# Current limitations
+
+- This is a single-GPU `ws1` path. Tensor parallelism, sequence parallelism, continuous batching, and request scheduling are outside its scope.
+- The examples disable CUDA graph. The denoising loop is a Python-level UniPC loop, built for clarity and reference alignment first.
+- T2AV loads `sound_tokenizer` / AVAE and advances sound latent at every step, so memory use and runtime go up.
+- Prompt tokenization and media saving happen outside the engine. If you are measuring the model itself, separate `preprocess`, `to_cpu`, and `encode` from `inference`.
+- PhyAI has not yet built dedicated kernels, graph capture, batching, or end-to-end throughput optimization for Cosmos3 T2V/T2AV. This page shows the baseline road, not the performance endpoint.
+
+# Full example
+
+```python
+import math
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+checkpoint_dir = "/path/to/Cosmos3-Nano"
+device = "cuda"
+dtype = torch.bfloat16
+num_frames = 189
+height = 720
+width = 1280
+fps = 24.0
+with_sound = False
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3",
+        plugin_args=Cosmos3Args(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+            load_sound=(True if with_sound else None),
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=fps,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=device,
+    )
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+
+    output = engine.step(request)
+    postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+    media = postprocessor.postprocess(output)
+    postprocessor.save_mp4(media, ".cache/cosmos3_t2v.mp4")
+finally:
+    engine.close()
+```

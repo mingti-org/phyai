@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -62,6 +64,16 @@ class Cosmos3TokenizedPrompt:
 
     text_ids: torch.Tensor  # [1, S] int64
     text_mask: torch.Tensor  # [1, S] int64 (all ones — no padding)
+
+
+@dataclass
+class Cosmos3GenerationOutput:
+    """CPU-ready media output from the Cosmos3 generation plugin."""
+
+    frames: torch.Tensor  # [T, H, W, 3] uint8 RGB, CPU
+    video: torch.Tensor  # [B, 3, T, H, W] or [3, T, H, W], CPU float in [0, 1]
+    waveform: torch.Tensor | None = None  # CPU float in [-1, 1]
+    sample_rate: int | None = None
 
 
 class Cosmos3Processor:
@@ -169,6 +181,128 @@ class Cosmos3Processor:
             self.tokenize(prompt, device=device, augment=True),
             self.tokenize(negative_prompt, device=device, augment=False),
         )
+
+
+class Cosmos3GenerationPostProcessor:
+    """Postprocess and save Cosmos3 generation media.
+
+    ``cosmos3`` engine outputs are already VAE-decoded by the plugin:
+    video-only requests return pixels in ``[0, 1]`` and T2AV requests return a
+    ``{"video", "sound", "sample_rate"}`` dict. This class handles the output-side
+    media glue: move tensors to CPU, convert video pixels to uint8 RGB frames, and
+    optionally mux video + audio into one mp4 via PyAV.
+    """
+
+    def __init__(self, fps: float) -> None:
+        self.fps = float(fps)
+
+    @staticmethod
+    def _to_uint8_frames(video: torch.Tensor) -> torch.Tensor:
+        """Convert ``[1,3,T,H,W]`` or ``[3,T,H,W]`` pixels to CPU uint8 frames."""
+        if video.ndim == 5:
+            video = video[0]
+        if video.ndim != 4 or video.shape[0] != 3:
+            raise ValueError(
+                "Expected video shaped [1, 3, T, H, W] or [3, T, H, W], got "
+                f"{tuple(video.shape)}."
+            )
+        return (
+            (video.clamp(0, 1) * 255)
+            .round()
+            .to(torch.uint8)
+            .permute(1, 2, 3, 0)
+            .cpu()
+            .contiguous()
+        )
+
+    def postprocess(
+        self, output: torch.Tensor | dict[str, torch.Tensor | int]
+    ) -> Cosmos3GenerationOutput:
+        """Move generation output to CPU and prepare frames for media encoding."""
+        if isinstance(output, dict):
+            video = output["video"]
+            waveform = output.get("sound")
+            sample_rate = output.get("sample_rate")
+        else:
+            video = output
+            waveform = None
+            sample_rate = None
+        if not isinstance(video, torch.Tensor):
+            raise TypeError(f"Expected video tensor, got {type(video)!r}.")
+
+        frames = self._to_uint8_frames(video)
+        video_cpu = video.detach().cpu()
+        waveform_cpu = (
+            waveform.detach().clamp(-1.0, 1.0).float().cpu()
+            if isinstance(waveform, torch.Tensor)
+            else None
+        )
+        sample_rate_int = int(sample_rate) if sample_rate is not None else None
+        return Cosmos3GenerationOutput(
+            frames=frames,
+            video=video_cpu,
+            waveform=waveform_cpu,
+            sample_rate=sample_rate_int,
+        )
+
+    def save_mp4(
+        self,
+        output: Cosmos3GenerationOutput,
+        path: str | Path,
+        *,
+        crf: str = "18",
+    ) -> None:
+        """Encode frames, and optional waveform, into one mp4 via PyAV."""
+        import av
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arr = output.frames.numpy()  # [T, H, W, 3] uint8 RGB
+        with av.open(str(path), mode="w") as container:
+            video_stream = container.add_stream(
+                "h264", rate=Fraction(self.fps).limit_denominator(10000)
+            )
+            video_stream.width = int(arr.shape[2])
+            video_stream.height = int(arr.shape[1])
+            video_stream.pix_fmt = "yuv420p"
+            video_stream.options = {"crf": crf}
+
+            audio_stream = None
+            audio_samples = None
+            audio_layout = "stereo"
+            if output.waveform is not None and output.sample_rate is not None:
+                wav = output.waveform
+                if wav.ndim == 3:
+                    wav = wav[0]
+                if wav.ndim == 1:
+                    wav = wav.reshape(1, -1)
+                if wav.ndim != 2:
+                    raise ValueError(
+                        "Expected waveform shaped [1, channels, samples], "
+                        "[channels, samples], or [samples], got "
+                        f"{tuple(output.waveform.shape)}."
+                    )
+                audio_samples = wav.numpy()
+                audio_layout = "stereo" if audio_samples.shape[0] >= 2 else "mono"
+                audio_stream = container.add_stream("aac", rate=int(output.sample_rate))
+                audio_stream.layout = audio_layout
+
+            for frame_data in arr:
+                frame = av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+                for packet in video_stream.encode(frame):
+                    container.mux(packet)
+            for packet in video_stream.encode():
+                container.mux(packet)
+
+            if audio_stream is not None:
+                audio_frame = av.AudioFrame.from_ndarray(
+                    audio_samples, format="fltp", layout=audio_layout
+                )
+                audio_frame.sample_rate = int(output.sample_rate)
+                for packet in audio_stream.encode(audio_frame):
+                    container.mux(packet)
+                for packet in audio_stream.encode():
+                    container.mux(packet)
 
 
 @dataclass
@@ -422,6 +556,8 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
 
 
 __all__ = [
+    "Cosmos3GenerationOutput",
+    "Cosmos3GenerationPostProcessor",
     "Cosmos3PolicyProcessedInputs",
     "Cosmos3PolicyProcessor",
     "Cosmos3Processor",
