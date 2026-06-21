@@ -1,39 +1,4 @@
-"""ABC + per-call types for `phyai.layers.attention.diffusion` (action-expert paged attention).
-
-This subpackage is **paged-KV attention** for the diffusion / action
-expert side of a model: K/V are scattered into a
-:class:`~phyai.cache.kv_cache_pool.KVCachePool` then read back via
-flashinfer's paged kernel (or an eager contiguous-slab fallback).
-
-Per-call lifecycle
-------------------
-The runner owns one backend instance per stack and threads a
-:class:`DiffusionAttnCtx` through every layer. Layers do not store
-backends; they route via ``ctx.backend.forward(layer, q, k, v, ctx)``.
-The four-hook contract drives metadata staging:
-
-1. :meth:`DiffusionAttentionBackend.init_cuda_graph_state`
-2. :meth:`DiffusionAttentionBackend.init_capture_metadata`
-3. :meth:`DiffusionAttentionBackend.replay_metadata`
-4. :meth:`DiffusionAttentionBackend.init_forward_metadata`
-
-Sibling stack: :mod:`phyai.layers.attention.ar` is structurally
-identical (paged kernel, write-pool-then-read) but typed independently
-for the LM-side role. The implementations of
-:class:`FlashInferDiffusionBackend` and
-:class:`FlashInferARBackend` are byte-identical today and **must be
-kept in sync** when fixed.
-
-AR vs Diffusion
----------------
-The class name marks the layer's **role** (LM side vs action expert
-side), not a causality contract. Both stacks accept a ``causal`` flag
-at construction. In pi0.5, both PaliGemma (``ARAttention``,
-``causal=False``) and the action expert (``DiffusionAttention``,
-``causal=False``) use the block-prefix mask implemented at the runner
-level rather than per-token causal masking. The default for
-:class:`DiffusionAttention` is ``causal=False``.
-"""
+"""ABC + per-call types for `phyai.layers.attention.diffusion` (action-expert paged attention)."""
 
 from __future__ import annotations
 

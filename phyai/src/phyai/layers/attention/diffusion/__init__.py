@@ -1,22 +1,8 @@
-"""`phyai.layers.attention.diffusion` — diffusion / action-expert paged attention.
-
-Layer + backends + types for the diffusion / action-expert side of a
-model. K/V are scattered into a
-:class:`~phyai.cache.kv_cache_pool.KVCachePool` then read back via
-flashinfer's paged kernel (or an eager contiguous-slab fallback).
-
-Backends: ``"flashinfer"`` (default) and ``"eager"`` (CPU/CI).
-
-Sibling stacks: :mod:`phyai.layers.attention.attention` (no cache,
-ViT use case) and :mod:`phyai.layers.attention.ar` (LM-side; same
-paged kernel today, separate type tree).
-"""
+"""`phyai.layers.attention.diffusion` — diffusion / action-expert paged attention."""
 
 from __future__ import annotations
 
 from phyai.layers.attention.diffusion.backends import (
-    EagerDiffusionBackend,
-    EagerDiffusionPlan,
     FlashInferDiffusionBackend,
     FlashInferDiffusionPlan,
 )
@@ -44,8 +30,6 @@ __all__ = [
     "DiffusionAttnCtx",
     "DiffusionAttnMetadata",
     "DiffusionAttnPlanHandle",
-    "EagerDiffusionBackend",
-    "EagerDiffusionPlan",
     "FlashInferDiffusionBackend",
     "FlashInferDiffusionPlan",
     "get_backend_factory",

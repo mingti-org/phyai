@@ -1,37 +1,4 @@
-"""Static-allocation cache-pool-aware varlen attention for the autoregressive LM stack.
-
-The attention layer here is the bridge between the
-:class:`~phyai.cache.kv_cache_pool.KVCachePool` and the per-layer Q/K/V
-projections in the model. Q/K/V come in already-projected; the
-backend (selected by the runner, threaded through ``ctx.backend``)
-scatters K/V into the pool at ``ctx.write_indices`` then computes
-attention reading K/V back through paged flashinfer or an eager
-fallback.
-
-Two production backends:
-
-* ``"flashinfer"`` — runs a
-  :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper`
-  whose ``plan()`` was called outside the captured CUDA graph. The
-  wrapper is constructed by the backend with ``use_cuda_graph=True``
-  and pre-bound static index buffers; replay's ``plan()`` ``.copy_()``-es
-  new metadata into those buffers.
-* ``"eager"`` — pure-PyTorch reference path. Requires CONTIGUOUS
-  per-sample KV slabs (verified at plan time) and slices
-  ``K_pool[start:start+len]`` directly. CPU/CI; not graph-captureable.
-
-Forward contract
-----------------
-The layer's ``forward(q, k, v, ctx)`` requires a runner-built
-:class:`ARAttnCtx` carrying the backend, the plan handle, the
-kv_pool, and write_indices. The runner builds the ctx once per
-inference and threads it through every layer in the stack — there is
-no per-layer plan call.
-
-Sibling: :class:`~phyai.layers.attention.diffusion.DiffusionAttention`
-shares the same paged kernel today but is typed independently for
-the action-expert / diffusion role.
-"""
+"""Static-allocation cache-pool-aware varlen attention for the autoregressive LM stack."""
 
 from __future__ import annotations
 
@@ -73,8 +40,9 @@ class ARAttention(nn.Module):
         pi0.5 PaliGemma) override to ``False``.
     backend:
         Canonical name of the backend the runner will resolve for
-        this stack (``"flashinfer"`` for GPU paged-KV, ``"eager"``
-        for CPU/CI). Validated against
+        this stack (``"flashinfer"`` for GPU paged-KV — the only
+        backend; the AR paged stack is flashinfer-only).
+        Validated against
         :func:`~phyai.layers.attention.ar.registry.get_backend_factory`
         at construction; the layer itself does not instantiate the
         backend.
@@ -112,10 +80,6 @@ class ARAttention(nn.Module):
         self.backend: str = getattr(factory, "name", str(backend))
         self.backend_kwargs: dict[str, Any] = dict(backend_kwargs or {})
 
-    # ------------------------------------------------------------------ #
-    # Forward                                                            #
-    # ------------------------------------------------------------------ #
-
     def forward(
         self,
         q: torch.Tensor,
@@ -125,8 +89,17 @@ class ARAttention(nn.Module):
     ) -> torch.Tensor:
         """Compute AR attention via ``ctx.backend``.
 
-        Returns ``(N, H_q, D)`` — same row count as ``q``. The backend
+        Returns ``(N_q, H_q, D)`` — same row count as ``q``. The backend
         is responsible for scattering K/V into ``ctx.kv_pool``.
+
+        Q and K/V row counts may differ (``S_q != S_kv``). The K/V rows
+        passed here are the rows *written* into the pool this step, so
+        ``k.shape[0]`` must match ``ctx.write_indices`` (the slots they
+        scatter into) — NOT ``q.shape[0]``. This is what lets the AR
+        stack express cross-attention (Q from one sequence, fresh K/V
+        from another) and general extend (a short query chunk appended
+        to a longer cached KV span). For plain self-attention the two
+        counts coincide, as before.
         """
         if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
             raise ValueError(
@@ -145,15 +118,16 @@ class ARAttention(nn.Module):
         ):
             raise ValueError(
                 f"k/v shape mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}, "
-                f"expected ({q.shape[0]}, {self.num_kv_heads}, "
-                f"{self.head_dim})."
+                f"expected (N_kv, {self.num_kv_heads}, {self.head_dim})."
             )
-        if k.shape[0] != q.shape[0]:
-            raise ValueError(f"k row count {k.shape[0]} != q row count {q.shape[0]}.")
+        if k.shape[0] != ctx.write_indices.shape[0]:
+            raise ValueError(
+                f"k/v row count {k.shape[0]} != write_indices row count "
+                f"{ctx.write_indices.shape[0]}; K/V rows must pair 1:1 with "
+                f"the cache slots they are scattered into."
+            )
 
         return ctx.backend.forward(self, q, k, v, ctx)
-
-    # ------------------------------------------------------------------ #
 
     def extra_repr(self) -> str:
         return (

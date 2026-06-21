@@ -1,28 +1,4 @@
-"""Static-allocation cache-pool-aware varlen attention for diffusion / action-expert stacks.
-
-Structurally identical to :class:`~phyai.layers.attention.ar.ARAttention`:
-the same paged-KV kernel scatters K/V into the
-:class:`~phyai.cache.kv_cache_pool.KVCachePool` and reads them back.
-The class is typed independently to mark the layer's **role** (action
-expert / diffusion side) and to allow the two stacks to evolve
-divergently in the future.
-
-Default ``causal=False`` (the typical diffusion / action-expert case);
-override at construction if needed.
-
-Two production backends:
-
-* ``"flashinfer"`` — paged-KV flashinfer wrapper with cuda-graph
-  capture support.
-* ``"eager"`` — pure-PyTorch reference path (contiguous slab only,
-  CPU/CI use).
-
-Forward contract
-----------------
-The layer's ``forward(q, k, v, ctx)`` requires a runner-built
-:class:`DiffusionAttnCtx` carrying the backend, the plan handle, the
-kv_pool, and write_indices.
-"""
+"""Static-allocation cache-pool-aware varlen attention for diffusion / action-expert stacks."""
 
 from __future__ import annotations
 
@@ -105,6 +81,18 @@ class DiffusionAttention(nn.Module):
         v: torch.Tensor,
         ctx: DiffusionAttnCtx,
     ) -> torch.Tensor:
+        """Compute diffusion / action-expert attention via ``ctx.backend``.
+
+        Returns ``(N_q, H_q, D)`` — same row count as ``q``. The backend
+        scatters K/V into ``ctx.kv_pool``.
+
+        Q and K/V row counts may differ (``S_q != S_kv``). The K/V rows
+        passed here are the rows *written* into the pool this step, so
+        ``k.shape[0]`` must match ``ctx.write_indices`` (the slots they
+        scatter into) — NOT ``q.shape[0]``. This lets the stack express
+        cross-attention and general extend; for plain self-attention the
+        two counts coincide, as before.
+        """
         if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
             raise ValueError(
                 f"q/k/v must be 3-D (N, H, D); got q={tuple(q.shape)}, "
@@ -122,11 +110,18 @@ class DiffusionAttention(nn.Module):
         ):
             raise ValueError(
                 f"k/v shape mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}, "
-                f"expected ({q.shape[0]}, {self.num_kv_heads}, "
-                f"{self.head_dim})."
+                f"expected (N_kv, {self.num_kv_heads}, {self.head_dim})."
             )
-        if k.shape[0] != q.shape[0]:
-            raise ValueError(f"k row count {k.shape[0]} != q row count {q.shape[0]}.")
+        # Invariant: the K/V rows handed in are exactly the rows written
+        # into the pool this step, so they must pair 1:1 with the write
+        # slots. Decoupling K/V count from q count is what enables
+        # S_q != S_kv (cross-attention / extend).
+        if k.shape[0] != ctx.write_indices.shape[0]:
+            raise ValueError(
+                f"k/v row count {k.shape[0]} != write_indices row count "
+                f"{ctx.write_indices.shape[0]}; K/V rows must pair 1:1 with "
+                f"the cache slots they are scattered into."
+            )
 
         return ctx.backend.forward(self, q, k, v, ctx)
 

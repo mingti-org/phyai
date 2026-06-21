@@ -70,14 +70,19 @@ def _engine_to_paged_backend(attn_backend: str) -> str:
     """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
     paged backend name.
 
-    ``"flashinfer"`` and ``"eager"`` are registered in both the AR and
-    Diffusion subpackages under those names. ``"sdpa"`` has no paged
-    backend (SDPA cannot read paged KV) and falls back to ``"eager"``
-    — the contiguous-slab reference path.
+    The AR and Diffusion paged stacks are **flashinfer-only** (GPU):
+    ``"flashinfer"`` is the only backend registered in either
+    subpackage. ``"sdpa"`` / ``"eager"`` have no paged backend (SDPA
+    cannot read paged KV; there is no CPU reference path), so any
+    non-flashinfer name is rejected here rather than silently coerced.
     """
     canonical = attn_backend.lower().replace("_", "-")
-    if canonical == "sdpa":
-        return "eager"
+    if canonical != "flashinfer":
+        raise ValueError(
+            f"AR / Diffusion paged stacks are flashinfer-only (GPU); got "
+            f"attn_backend={attn_backend!r}. pi0.5 inference requires "
+            f"backend='flashinfer'."
+        )
     return canonical
 
 
@@ -421,23 +426,21 @@ class PI05VisionTower(nn.Module):
             if prefix
             else "multi_modal_projector",
         )
-        self.projection_scale = float(config.projection_dim) ** 0.5
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # Upcast the incoming pixels to the vision compute dtype (bf16 -> fp32
         # on the parity path; a no-op when the tower is bf16), run the tower +
-        # projector + scale in that dtype, then cast back to the model's
-        # io_dtype. Mirrors lerobot's ``embed_image``. The casts are captured
-        # into the vision CUDA graph; its external interface stays io_dtype.
+        # projector in that dtype, then cast back to the model's io_dtype. The
+        # casts are captured into the vision CUDA graph; its external interface
+        # stays io_dtype.
         x = pixel_values.to(self.compute_dtype)
         h = self.vision_tower(x)  # (B, N, hidden)
         h = self.multi_modal_projector(h)  # (B, N, projection_dim)
-        h = h * self.projection_scale
         return h.to(self.io_dtype)
 
 
 class PaliGemmaEmbedTokens(nn.Module):
-    """Gemma vocab embedding with the pi0.5-specific double scaling."""
+    """Gemma vocab embedding with the sqrt(hidden) input scaling."""
 
     def __init__(
         self,
@@ -455,7 +458,7 @@ class PaliGemmaEmbedTokens(nn.Module):
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             params_dtype=params_dtype,
-            embed_scale=float(config.hidden_size),
+            embed_scale=float(config.hidden_size) ** 0.5,
             prefix=prefix,
         )
 
