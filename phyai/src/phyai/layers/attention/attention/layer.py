@@ -1,41 +1,4 @@
-"""Stateless prefill attention — no KV cache, no radix.
-
-The math is ``softmax(Q K^T / sqrt(D) + mask) V``; nothing is cached
-between calls. Three kernel backends share one forward contract,
-selected at construction time via ``backend=``:
-
-* ``"flashinfer"`` (default) — :mod:`flashinfer.prefill`. Uses
-  ``single_prefill_with_kv_cache`` when the batch is one sequence and
-  :class:`BatchPrefillWithRaggedKVCacheWrapper` otherwise.
-* ``"sdpa"`` — :func:`torch.nn.functional.scaled_dot_product_attention`.
-  Wrapped with :func:`torch.compile` (``dynamic=True``) by default so
-  the mask build / soft-cap fallback / SDPA call fuse on first use;
-  toggle via ``backend_kwargs={"compile": False}``.
-* ``"eager"`` — pure PyTorch matmul + masked softmax. Reference path,
-  slow but exact.
-
-Optional left sliding window: each query attends to at most
-``sliding_window`` keys, with the current position counted toward the
-window (HF / Mistral / Qwen / Gemma2 convention). Sliding window is
-causal-only.
-
-This module is the attention *op* — Q/K/V projection and RoPE are the
-caller's responsibility. Q/K/V come in already-projected and the
-attention output goes back out in the same layout.
-
-Per-call ctx
-------------
-``forward(q, k, v, ctx=None, *, cu_seqlens_q=None, cu_seqlens_kv=None)``.
-Two usage modes:
-
-* **Convenience (vision tower / unit tests)** — pass ``ctx=None``.
-  The layer infers the layout from ``q.ndim``, lazily constructs a
-  backend instance the first call (cached on ``self``), and builds a
-  degenerate :class:`AttnCtx` in-place.
-* **Runner-coordinated** — pass an explicit :class:`AttnCtx`. Used by
-  callers that share one runner-scoped backend across many layers and
-  pre-stage metadata via the four-hook contract.
-"""
+"""Stateless prefill attention — no KV cache, no radix."""
 
 from __future__ import annotations
 
@@ -84,8 +47,9 @@ class Attention(nn.Module):
         through :func:`~phyai.layers.attention.attention.registry.get_backend_factory`.
     backend_kwargs:
         Optional dict forwarded to the backend factory after ``runner``.
-        ``"sdpa"`` accepts ``{"compile": bool}``; ``"flashinfer"``
-        accepts ``{"fi_workspace": Tensor, "workspace_bytes": int}``.
+        ``"sdpa"`` accepts ``{"compile": bool, "select_kernel": bool}``;
+        ``"flashinfer"`` accepts
+        ``{"fi_workspace": Tensor, "workspace_bytes": int}``.
 
     Forward shape conventions
     -------------------------

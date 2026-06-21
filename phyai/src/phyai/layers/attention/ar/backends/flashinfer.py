@@ -1,19 +1,4 @@
-"""flashinfer paged-KV backend for AR (LM-side) attention.
-
-Owns its own ``cu_q`` / ``paged_kv_indptr`` / ``paged_kv_indices`` /
-``paged_kv_last_page_len`` static buffers and the
-:class:`BatchPrefillWithPagedKVCacheWrapper`. Buffers are
-allocated in :meth:`init_cuda_graph_state` and bound into the
-wrapper via flashinfer's ``use_cuda_graph=True`` aliasing
-contract; :meth:`replay_metadata` updates their contents in place
-so a captured ``run`` sees fresh metadata on each replay.
-
-**Sibling implementation**:
-:class:`phyai.layers.attention.diffusion.backends.flashinfer.FlashInferDiffusionBackend`.
-The two are byte-identical today (same flashinfer paged kernel). Bug
-fixes here MUST be mirrored to that file. Duplication is intentional
-— the two stacks are typed independently to allow divergent evolution.
-"""
+"""flashinfer paged-KV backend for AR (LM-side) attention."""
 
 from __future__ import annotations
 
@@ -64,7 +49,8 @@ class FlashInferARBackend(ARAttentionBackend):
         except ImportError as e:
             raise ImportError(
                 "backend='flashinfer' (ar) but flashinfer is not installed; "
-                "either install flashinfer-python or pick backend='eager'."
+                "install flashinfer-python. The AR paged stack is "
+                "flashinfer-only (GPU)."
             ) from e
         self._wrapper = None
         self._cu_q_buf: torch.Tensor | None = None

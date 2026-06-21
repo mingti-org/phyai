@@ -187,7 +187,7 @@ class PI05LLMRunner(ModelRunner):
     buffers in :meth:`init_cuda_graph_state` and
     re-plans them in place per inference via
     :meth:`replay_metadata` (graph) or
-    :meth:`init_forward_metadata` (eager fallback).
+    :meth:`init_forward_metadata` (non-cuda-graph path).
 
     Returns ``None`` from :meth:`forward` — the cache pool side-effect
     is the only output the scheduler consumes.
@@ -252,9 +252,9 @@ class PI05LLMRunner(ModelRunner):
     def setup(self, n_per_sample_buckets: list[int] | None = None) -> None:
         all_ranks_log(logger, logging.INFO, "Entering PI05LLMRunner.setup")
         # Always allocate static buffers + build wrapper — graph mode
-        # needs them, and eager mode benefits from stable addresses. They
-        # are sized for the *largest* bucket (``self.n_per_sample``);
-        # shorter buckets under-fill them.
+        # needs them, and the non-cuda-graph path benefits from stable
+        # addresses. They are sized for the *largest* bucket
+        # (``self.n_per_sample``); shorter buckets under-fill them.
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.batch_size,
             max_num_tokens=self.batch_size * self.n_per_sample,
@@ -378,8 +378,8 @@ class PI05LLMRunner(ModelRunner):
         """Stage attention metadata for the next ``forward`` call.
 
         Graph mode: re-plan the captured backend buffers in place via
-        :meth:`ARAttentionBackend.replay_metadata`. Eager mode: build a
-        fresh plan via :meth:`ARAttentionBackend.init_forward_metadata`.
+        :meth:`ARAttentionBackend.replay_metadata`. Non-graph mode: build
+        a fresh plan via :meth:`ARAttentionBackend.init_forward_metadata`.
         """
         if self.use_cuda_graph:
             self.attn_backend.replay_metadata(self._capture_plan, meta)
@@ -393,7 +393,7 @@ class PI05LLMRunner(ModelRunner):
 
         ``n_per_sample`` selects which captured graph to replay (the
         scheduler builds ``batch`` at that bucket's length). ``None`` uses
-        the largest bucket. Ignored on the eager fallback.
+        the largest bucket. Ignored in the non-cuda-graph path.
         """
         if self.use_cuda_graph and self.graphs:
             n_ps = n_per_sample if n_per_sample is not None else self.n_per_sample
@@ -411,7 +411,7 @@ class PI05LLMRunner(ModelRunner):
                 }
             )
             return None
-        # Eager fallback (eager backend or non-cuda-graph mode).
+        # Non-cuda-graph path.
         self._fwd(
             hidden_states=batch.hidden_states,
             position_ids=batch.position_ids,

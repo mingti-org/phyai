@@ -200,7 +200,9 @@ def test_eager_sdpa_padded_match_gqa():
     assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
 
 
-def test_eager_sdpa_ragged_match():
+def test_sdpa_ragged_raises():
+    """SDPA is padded-only — ragged (3-D varlen) input must raise and point
+    to flashinfer. SDPA has no varlen API; varlen is flashinfer's job."""
     torch.manual_seed(5)
     H, D = 4, 16
     cu_q = torch.tensor([0, 5, 12], dtype=torch.int32)
@@ -208,7 +210,6 @@ def test_eager_sdpa_ragged_match():
     q = torch.randn(N, H, D)
     k = torch.randn(N, H, D)
     v = torch.randn(N, H, D)
-    eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=False)
     sdpa = Attention(
         num_heads=H,
         head_dim=D,
@@ -216,9 +217,8 @@ def test_eager_sdpa_ragged_match():
         causal=False,
         backend_kwargs={"compile": False},
     )
-    out_e = eager(q, k, v, cu_seqlens_q=cu_q)
-    out_s = sdpa(q, k, v, cu_seqlens_q=cu_q)
-    assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
+    with pytest.raises(NotImplementedError, match="flashinfer"):
+        sdpa(q, k, v, cu_seqlens_q=cu_q)
 
 
 # --------------------------------------------------------------------- #
@@ -353,6 +353,55 @@ def test_eager_sdpa_padded_match_rectangular():
     out_s = sdpa(q, k, v)
     assert out_e.shape == (B, S_q, H, D)
     assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs CUDA"
+            ),
+        ),
+    ],
+)
+def test_sdpa_select_kernel_matches_default(device: str):
+    """The CUDA kernel-priority context must not perturb results.
+
+    ``select_kernel`` only biases which fused kernel CUDA dispatches to; it is
+    a no-op on CPU. Same inputs through ``select_kernel=True`` and ``False``
+    must agree. On CPU the context is a no-op (trivially exact); the ``cuda``
+    parametrization is the real guard — it enters the ``sdpa_kernel`` priority
+    context and checks the chosen kernel still matches default dispatch.
+    """
+    torch.manual_seed(13)
+    # head_dim=64 + fp16 on CUDA exercises a real fused kernel; CPU uses fp32.
+    B, S, H, H_kv, D = 2, 8, 4, 2, 64
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, H_kv, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, H_kv, D, device=device, dtype=dtype)
+    sel = Attention(
+        num_heads=H,
+        head_dim=D,
+        num_kv_heads=H_kv,
+        backend="sdpa",
+        causal=True,
+        backend_kwargs={"compile": False, "select_kernel": True},
+    )
+    nosel = Attention(
+        num_heads=H,
+        head_dim=D,
+        num_kv_heads=H_kv,
+        backend="sdpa",
+        causal=True,
+        backend_kwargs={"compile": False, "select_kernel": False},
+    )
+    out_sel = sel(q, k, v)
+    out_nosel = nosel(q, k, v)
+    assert torch.allclose(out_sel, out_nosel, atol=1e-3, rtol=1e-3)
 
 
 def test_padded_rectangular_matches_ragged():

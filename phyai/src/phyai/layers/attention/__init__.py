@@ -1,44 +1,4 @@
-"""phyai.layers.attention — three-flavor attention API.
-
-Three structurally independent attention stacks live as subpackages:
-
-* :mod:`phyai.layers.attention.attention` — :class:`Attention`, no
-  cache. ViT / encoder use case. Backends:
-  ``"flashinfer"`` / ``"sdpa"`` / ``"eager"``.
-* :mod:`phyai.layers.attention.ar` — :class:`ARAttention`, paged-KV
-  for the autoregressive language-model side. Backends:
-  ``"flashinfer"`` / ``"eager"``.
-* :mod:`phyai.layers.attention.diffusion` — :class:`DiffusionAttention`,
-  paged-KV for the diffusion / action-expert side. Backends:
-  ``"flashinfer"`` / ``"eager"``.
-
-Each subpackage has its own ABC, ``Ctx``, ``Metadata``, ``PlanHandle``,
-and registry. Backends are resolved per-stack. Adding a new backend
-means picking the right subpackage's ``register_backend`` decorator,
-subclassing the matching ABC, and importing the new module from the
-subpackage's ``backends/__init__.py``.
-
-Shared primitives across the three stacks:
-
-* :class:`AttnMode` and :class:`AttnLayout` enums (in :mod:`enums`).
-* :func:`eager_attn` / :func:`repeat_kv` / :func:`build_padded_mask`
-  (in :mod:`common`, used internally by the backend modules).
-* The flashinfer scratch helpers (in :mod:`utils`) — one process-global
-  uint8 workspace per device shared across all three stacks.
-
-AR vs Diffusion
----------------
-The class names mark the layer's **role** (LM side vs action expert
-side), not a causality contract. Both stacks accept a ``causal``
-flag. AR's default is ``causal=True`` and Diffusion's default is
-``causal=False``, but pi0.5 overrides both to ``causal=False``
-because the block-prefix mask is implemented at the runner level.
-
-The two paged backends (``FlashInferARBackend`` /
-``FlashInferDiffusionBackend`` and the two eager equivalents) are
-**byte-identical implementations today** — sibling code paths kept
-in sync manually so the two stacks can evolve independently later.
-"""
+"""phyai.layers.attention"""
 
 from __future__ import annotations
 
@@ -49,8 +9,6 @@ from phyai.layers.attention.ar import (
     ARAttnCtx,
     ARAttnMetadata,
     ARAttnPlanHandle,
-    EagerARBackend,
-    EagerARPlan,
     FlashInferARBackend,
     FlashInferARPlan,
 )
@@ -93,8 +51,6 @@ from phyai.layers.attention.diffusion import (
     DiffusionAttnCtx,
     DiffusionAttnMetadata,
     DiffusionAttnPlanHandle,
-    EagerDiffusionBackend,
-    EagerDiffusionPlan,
     FlashInferDiffusionBackend,
     FlashInferDiffusionPlan,
 )
@@ -144,8 +100,6 @@ __all__ = [
     "ARAttnCtx",
     "ARAttnMetadata",
     "ARAttnPlanHandle",
-    "EagerARBackend",
-    "EagerARPlan",
     "FlashInferARBackend",
     "FlashInferARPlan",
     "get_ar_backend_factory",
@@ -157,8 +111,6 @@ __all__ = [
     "DiffusionAttnCtx",
     "DiffusionAttnMetadata",
     "DiffusionAttnPlanHandle",
-    "EagerDiffusionBackend",
-    "EagerDiffusionPlan",
     "FlashInferDiffusionBackend",
     "FlashInferDiffusionPlan",
     "get_diffusion_backend_factory",

@@ -1,41 +1,4 @@
-"""ABC + per-call types for `phyai.layers.attention.ar` (LM-side paged attention).
-
-This subpackage is **paged-KV attention** for the autoregressive
-language-model side of a model: K/V are scattered into a
-:class:`~phyai.cache.kv_cache_pool.KVCachePool` then read back via
-flashinfer's paged kernel (or an eager contiguous-slab fallback).
-
-Per-call lifecycle
-------------------
-The runner owns one backend instance per stack and threads an
-:class:`ARAttnCtx` through every layer. Layers do not store backends;
-they route via ``ctx.backend.forward(layer, q, k, v, ctx)``. The
-four-hook contract drives metadata staging:
-
-1. :meth:`ARAttentionBackend.init_cuda_graph_state` — once at runner
-   setup; backend allocates static buffers + builds wrapper.
-2. :meth:`ARAttentionBackend.init_capture_metadata` — once at capture
-   warmup; produces a plan handle whose tensor refs stay stable
-   across replays.
-3. :meth:`ARAttentionBackend.replay_metadata` — every step before
-   ``graph.replay()``; backend writes new metadata into its static
-   buffers in place.
-4. :meth:`ARAttentionBackend.init_forward_metadata` — every step in
-   the eager (non-graph) path.
-
-Sibling stack: :mod:`phyai.layers.attention.diffusion` is structurally
-identical (paged kernel, write-pool-then-read) but typed independently
-for the action-expert / diffusion role.
-
-AR vs Diffusion
----------------
-The class name marks the layer's **role** in the model (LM side vs
-action expert side), not a causality contract. Both stacks accept a
-``causal`` flag at construction time. In pi0.5, both PaliGemma
-(``ARAttention``) and the action expert (``DiffusionAttention``) use
-``causal=False`` because the block-prefix mask is implemented at the
-runner level rather than as a per-token causal mask.
-"""
+"""ABC + per-call types for `phyai.layers.attention.ar` (LM-side paged attention)."""
 
 from __future__ import annotations
 
@@ -58,7 +21,7 @@ class ARAttnMetadata:
 
     Built by the scheduler from per-batch tensors, handed to an
     :class:`ARAttentionBackend` via :meth:`init_forward_metadata`
-    (eager) or :meth:`replay_metadata` (graph replay).
+    (non-graph) or :meth:`replay_metadata` (graph replay).
     """
 
     mode: AttnMode
@@ -160,7 +123,7 @@ class ARAttentionBackend(ABC):
         :meth:`replay_metadata` may then update their contents but
         not their identity.
 
-        Default no-op for backends without static state (eager).
+        Default no-op for backends without static state.
         """
         return None
 

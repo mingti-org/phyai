@@ -6,6 +6,7 @@ from phyai_kernel import jit_utils
 from phyai_kernel.jit_utils import jit
 from phyai_kernel.triton import (
     adarmsnorm,
+    create_paged_kv_indices,
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
@@ -23,6 +24,7 @@ except PackageNotFoundError:  # raw source tree, not installed
 __all__ = [
     "__version__",
     "adarmsnorm",
+    "create_paged_kv_indices",
     "fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",

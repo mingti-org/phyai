@@ -93,11 +93,11 @@ class BackendConfig:
         :class:`~phyai.layers.attention.DiffusionAttention`); each
         stack's per-construction lookup resolves it against its own
         registry. Production names: ``"flashinfer"`` (default) /
-        ``"sdpa"`` / ``"eager"``. ``"sdpa"`` only registers in the
-        no-cache stack — code that picks paged backends for AR or
-        diffusion derives ``"eager"`` as the fallback when ``attn`` is
-        ``"sdpa"`` (see ``_engine_to_paged_backend`` in pi05's
-        ``modeling_pi05``).
+        ``"sdpa"`` / ``"eager"``. ``"sdpa"`` and ``"eager"`` only
+        register in the no-cache stack — the AR and diffusion paged
+        stacks are flashinfer-only (GPU). Code that picks paged
+        backends rejects non-flashinfer names (see
+        ``_engine_to_paged_backend`` in pi05's ``modeling_pi05``).
     norm:
         :class:`~phyai.layers.layer_norm.RMSNorm` / ``LayerNorm``
         backend (``"flashinfer"`` / ``"phyai-kernel"``).
