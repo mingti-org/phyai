@@ -36,11 +36,37 @@ control to ``fn`` inside the capture region.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Hashable
+import contextlib
+from contextvars import ContextVar
+from typing import Any, Callable, Hashable, Iterator
 
 import torch
 
 from phyai.parallel.state import graph_capture
+
+_capture_stream_override: ContextVar["torch.cuda.Stream | None"] = ContextVar(
+    "phyai_cuda_graph_capture_stream", default=None
+)
+
+
+@contextlib.contextmanager
+def capture_on_stream(stream: "torch.cuda.Stream | None") -> Iterator[None]:
+    """Pin all :meth:`CudaGraph.capture` calls in this scope onto ``stream``.
+
+    Use it around model / runner construction that captures graphs, when the
+    capture must land on a specific (e.g. green-context) stream so the captured
+    kernels are confined to that stream's SM partition::
+
+        with vgpu.activate(), capture_on_stream(vgpu.stream):
+            engine = build_engine(...)   # graphs captured on the green stream
+
+    Passing ``None`` is a no-op (restores the default fresh-stream capture).
+    """
+    token = _capture_stream_override.set(stream)
+    try:
+        yield
+    finally:
+        _capture_stream_override.reset(token)
 
 
 class CudaGraphError(RuntimeError):
@@ -168,13 +194,24 @@ class CudaGraph:
             self._input_buffers[name].copy_(t)
 
         # Side-stream warmup so JIT autotuners and one-shot allocators
-        # finalise before the capture region.
+        # finalise before the capture region. The warmup ALWAYS runs on a fresh
+        # normal stream (never the override): flashinfer's first-call path
+        # (cuDNN plan build / autotuner profiling) is not valid on a
+        # green-context stream and raises cuCtxPushCurrent(201) there. Running
+        # it on a normal stream lets those one-shot inits complete cleanly;
+        # only the capture region itself goes on the override stream so the
+        # captured grids size to its SM partition.
+        override = _capture_stream_override.get()
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(self.num_warmup_iters):
                 fn(**self._input_buffers)
         torch.cuda.current_stream().wait_stream(s)
+        if override is not None:
+            # Make the override (capture) stream wait on the warmup so all
+            # one-shot inits are visible before capture begins.
+            override.wait_stream(s)
 
         # Capture. ``graph_capture()`` flips the phyai dispatcher
         # contextvar so kernel selection (Linear backends, parallel
@@ -185,6 +222,8 @@ class CudaGraph:
         graph_kwargs: dict[str, Any] = {}
         if self.mempool is not None:
             graph_kwargs["pool"] = self.mempool
+        if override is not None:
+            graph_kwargs["stream"] = override
         with graph_capture(), torch.cuda.graph(self._graph, **graph_kwargs):
             self._output = fn(**self._input_buffers)
 

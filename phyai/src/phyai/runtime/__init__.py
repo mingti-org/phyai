@@ -27,6 +27,7 @@ from phyai.runtime.cuda_graph_manager import (
     CudaGraph,
     CudaGraphError,
     CudaGraphRegistry,
+    capture_on_stream,
 )
 from phyai.runtime.ipc_buffer import (
     CudaIpcBuffer,
@@ -50,6 +51,7 @@ __all__ = [
     "CudaGraph",
     "CudaGraphError",
     "CudaGraphRegistry",
+    "capture_on_stream",
     "CudaIpcBuffer",
     "CudaIpcHandle",
     "FilterFn",
