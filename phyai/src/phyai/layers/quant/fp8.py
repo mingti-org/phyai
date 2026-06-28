@@ -145,7 +145,6 @@ class Fp8Spec:
                 .clamp(-_FP8_E4M3_AMAX, _FP8_E4M3_AMAX)
                 .to(torch.float8_e4m3fn)
             )
-            layer.input_scale = nn.Parameter(layer.input_scale.view(1, 1).expand(x.shape[0], 1).contiguous(), requires_grad=False)
             return ActivationView(x_q, layer.input_scale, Granularity.PER_TENSOR)
 
         if self.granularity in (Granularity.PER_CHANNEL, Granularity.BLOCK):
