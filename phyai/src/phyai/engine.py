@@ -210,19 +210,19 @@ class Engine:
         return tuple(cls._plugins.keys())
 
     def __init__(self, args: EngineArgs) -> None:
-        # 1. Resolve EngineConfig and seed the process singleton so every
-        #    model constructor downstream picks up the requested
-        #    device / dtype / backends without explicit plumbing.
-        #    ``from_env(base=args.config)`` makes the explicit config the
-        #    base and overlays any set ``PHYAI_*`` env var on top, so a
-        #    var like PHYAI_DEBUG_TENSOR_DUMP_DIR is honoured even when the
-        #    caller passed a config (env = run-time toggle). ``args.config``
-        #    is None -> the base falls back to ``auto()`` inside from_env.
-        #    When a tensor-dump directory ends up set, force eager *before*
-        #    installing the singleton: the dumper's forward hooks can't
-        #    fire inside a captured CUDA-graph replay, and the pi05
-        #    scheduler reads ``use_cuda_graph`` off this singleton at
-        #    setup time, so the flip has to land before any runner builds.
+        # Resolve EngineConfig and seed the process singleton so every
+        # model constructor downstream picks up the requested
+        # device / dtype / backends without explicit plumbing.
+        # ``from_env(base=args.config)`` makes the explicit config the
+        # base and overlays any set ``PHYAI_*`` env var on top, so a
+        # var like PHYAI_DEBUG_TENSOR_DUMP_DIR is honoured even when the
+        # caller passed a config (env = run-time toggle). ``args.config``
+        # is None -> the base falls back to ``auto()`` inside from_env.
+        # When a tensor-dump directory ends up set, force eager *before*
+        # installing the singleton: the dumper's forward hooks can't
+        # fire inside a captured CUDA-graph replay, and the pi05
+        # scheduler reads ``use_cuda_graph`` off this singleton at
+        # setup time, so the flip has to land before any runner builds.
         resolved = EngineConfig.from_env(base=args.config)
         self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
         if self._dump_enabled:
@@ -243,9 +243,9 @@ class Engine:
 
         device_type = torch.device(self.config.device.target).type
 
-        # 2. Per-concern bootstrap. Each ``init_*`` is independently
-        #    callable; this method is the only orchestrator. Saved
-        #    default dtype is restored in :meth:`close`.
+        # Per-concern bootstrap. Each ``init_*`` is independently
+        # callable; this method is the only orchestrator. Saved
+        # default dtype is restored in :meth:`close`.
         self._saved_default_dtype: torch.dtype = init_cuda(
             self.config.device.target, self.config.device.params_dtype
         )
@@ -255,27 +255,30 @@ class Engine:
             world_size=parallel.world_size, device_type=device_type
         )
 
-        # 3. phyai mesh + linear dispatcher. Both are process-level
-        #    singletons; building them here means model constructors
-        #    don't have to. The mesh is always 5-axis
-        #    (dp / ep / sp / cp / tp); axes the user didn't size stay at
-        #    ``1`` and short-circuit through the collective ops without
-        #    any process-group traffic, while existing model code that
-        #    addresses ``axis="tp"`` keeps working unchanged.
+        # phyai mesh + linear dispatcher. Both are process-level
+        # singletons; building them here means model constructors
+        # don't have to. The mesh is always 6-axis
+        # (dp / cfg / ep / sp / cp / tp); axes the user didn't size stay
+        # at ``1`` and short-circuit through the collective ops without
+        # any process-group traffic, while existing model code that
+        # addresses ``axis="tp"`` keeps working unchanged. ``cfg`` sits
+        # just outside ``tp`` so each CFG-parallel group is a contiguous
+        # tensor-parallel block.
         P.init(
             layout=(
                 parallel.dp_size,
+                parallel.cfg_size,
                 parallel.ep_size,
                 parallel.sp_size,
                 parallel.cp_size,
                 parallel.tp_size,
             ),
-            mesh_dim_names=("dp", "ep", "sp", "cp", "tp"),
+            mesh_dim_names=("dp", "cfg", "ep", "sp", "cp", "tp"),
             device=device_type,
         )
         L.init()
 
-        # 4. Resolve the requested plugin and validate the args bundle.
+        # Resolve the requested plugin and validate the args bundle.
         entry_cls = self._plugins.get(args.plugin)
         if entry_cls is None:
             raise ValueError(
@@ -288,16 +291,16 @@ class Engine:
                 f"{type(args.plugin_args).__name__}."
             )
 
-        # 5. Instantiate the entry and run setup. The entry owns its
-        #    model / scheduler / runners from this point on.
+        # Instantiate the entry and run setup. The entry owns its
+        # model / scheduler / runners from this point on.
         self.args = args
         self.entry: Entry = entry_cls()
         self.entry.setup(args.plugin_args)
 
-        # 6. If tensor dumping is on, attach the dumper to the modules the
-        #    plugin exposes. Built after setup() so the model + weights are
-        #    fully constructed; the runners were already forced eager in
-        #    step 1, so the leaf forward hooks will actually fire.
+        # If tensor dumping is on, attach the dumper to the modules the
+        # plugin exposes. Built after setup() so the model + weights are
+        # fully constructed; the runners were already forced eager in
+        # step 1, so the leaf forward hooks will actually fire.
         if self._dump_enabled:
             self._dumper = self._build_dumper()
 
@@ -388,4 +391,8 @@ from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
 from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
 from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
+)
+from phyai.models.cosmos3 import main_cosmos3_wn as _main_cosmos3_wn  # noqa: E402, F401
+from phyai.models.cosmos3 import (  # noqa: E402, F401
+    main_cosmos3_policy_wn as _main_cosmos3_policy_wn,
 )

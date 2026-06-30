@@ -29,8 +29,36 @@ class Cosmos3VAERunner(ModelRunner):
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Latents ``[B, z, t, h, w]`` -> pixels ``[B, 3, T, H, W]`` in ``[-1, 1]``."""
-        return self.vae.decode(latents.to(self.device, self.dtype))
+        """Latents ``[B, z, t, h, w]`` -> pixels ``[B, 3, T, H, W]`` in ``[-1, 1]``.
+
+        Under tensor / CFG parallelism (``cfg_size * tp_size > 1``) the WAN VAE is
+        replicated on every rank and the latent is identical across ranks, so the
+        decode payload is split spatially across all of them
+        (:meth:`Cosmos3WanVAE.decode_parallel`) and the blended frame is identical
+        on every rank. At combined parallel size 1 this is the byte-identical
+        single-card :meth:`Cosmos3WanVAE.decode`.
+        """
+        x = latents.to(self.device, self.dtype)
+        if self._decode_parallel_size() > 1:
+            return self.vae.decode_parallel(x)
+        return self.vae.decode(x)
+
+    @staticmethod
+    def _decode_parallel_size() -> int:
+        """Product of the axes the decode splits across (``cfg_size * tp_size``).
+
+        Each axis defaults to 1 when absent / no mesh, so this is 1 on a single
+        card and the runner routes to the plain :meth:`Cosmos3WanVAE.decode`.
+        """
+        import phyai.parallel as P
+
+        def _size(name: str) -> int:
+            try:
+                return P.default_mesh().axis_size(name)
+            except Exception:
+                return 1
+
+        return _size("cfg") * _size("tp")
 
     @torch.no_grad()
     def encode(

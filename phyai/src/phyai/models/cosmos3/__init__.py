@@ -32,6 +32,8 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
     Cosmos3ActionRequest,
     Cosmos3PolicyScheduler,
 )
+from phyai.models.cosmos3.scheduler_wn_cosmos3 import Cosmos3T2VWNScheduler
+from phyai.models.cosmos3.scheduler_wn_cosmos3_policy import Cosmos3PolicyWNScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 
 
@@ -49,6 +51,8 @@ __all__ = [
     "cosmos3_avae_weight_remap",
     "Cosmos3T2VScheduler",
     "Cosmos3PolicyScheduler",
+    "Cosmos3T2VWNScheduler",
+    "Cosmos3PolicyWNScheduler",
     "Cosmos3T2VRunner",
     "Cosmos3ActionRunner",
     "Cosmos3VAERunner",

@@ -15,7 +15,7 @@ from phyai.engine_config import get_engine_config, resolve_engine_defaults
 from phyai.layers.attention.attention.layer import Attention
 from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.linear import (
-    ColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -107,6 +107,25 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def local_head_counts(
+    tp_size: int, num_attention_heads: int, num_key_value_heads: int
+) -> tuple[int, int]:
+    """Per-rank ``(num_q_heads, num_kv_heads)`` for a tensor-parallel attention block."""
+    if num_attention_heads % tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads={num_attention_heads} not divisible by "
+            f"tp_size={tp_size}."
+        )
+    if num_key_value_heads % tp_size != 0:
+        raise ValueError(
+            f"num_key_value_heads={num_key_value_heads} not divisible by "
+            f"tp_size={tp_size}: cosmos3 uses separate K/V projections that cannot "
+            f"replicate KV heads across ranks, so tensor parallelism requires "
+            f"tp_size <= num_key_value_heads with an even split."
+        )
+    return num_attention_heads // tp_size, num_key_value_heads // tp_size
 
 
 class TimestepEmbedder(nn.Module):
@@ -227,32 +246,21 @@ class Cosmos3CausalAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.to_q = ColumnParallelLinear(
-            hidden_size,
-            num_attention_heads * head_dim,
+        # Fused Q/K/V column-parallel projection: one matmul (one hidden read,
+        # one kernel) instead of three separate to_q/to_k/to_v. The separate
+        # checkpoint leaves (to_q/to_k/to_v) still load via the fused loader's
+        # per-leg hf_legs, so the weight remap is unchanged.
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_dim=head_dim,
+            num_heads=num_attention_heads,
+            num_kv_heads=num_key_value_heads,
             bias=False,
             gather_output=False,
             params_dtype=params_dtype,
-            prefix=f"{prefix}.to_q" if prefix else "",
-        )
-        self.to_k = ColumnParallelLinear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=False,
-            gather_output=False,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.to_k" if prefix else "",
-        )
-        self.to_v = ColumnParallelLinear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=False,
-            gather_output=False,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.to_v" if prefix else "",
+            hf_legs={"q": "to_q", "k": "to_k", "v": "to_v"},
+            prefix=f"{prefix}.qkv_proj" if prefix else "",
         )
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
@@ -262,6 +270,11 @@ class Cosmos3CausalAttention(nn.Module):
             params_dtype=params_dtype,
             prefix=f"{prefix}.to_out" if prefix else "",
         )
+        # Per-rank Q/K/V widths come straight off the fused layer's partition
+        # sizes (it already encodes the head split + any GQA replication).
+        self.q_size, self.k_size, self.v_size = self.qkv_proj.output_partition_sizes
+        self.num_local_heads = self.q_size // head_dim
+        self.num_local_kv_heads = self.k_size // head_dim
         self.norm_q = RMSNorm(
             head_dim,
             eps=rms_norm_eps,
@@ -277,9 +290,9 @@ class Cosmos3CausalAttention(nn.Module):
             prefix=f"{prefix}.norm_k" if prefix else "",
         )
         self.attn = Attention(
-            num_heads=num_attention_heads,
+            num_heads=self.num_local_heads,
             head_dim=head_dim,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=self.num_local_kv_heads,
             causal=True,
             backend=attn_backend,
         )
@@ -291,12 +304,11 @@ class Cosmos3CausalAttention(nn.Module):
         freqs_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, S, _ = hidden_states.shape
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
-        q = q.view(B, S, self.num_heads, self.head_dim)
-        k = k.view(B, S, self.num_kv_heads, self.head_dim)
-        v = v.view(B, S, self.num_kv_heads, self.head_dim)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q = q.view(B, S, self.num_local_heads, self.head_dim)
+        k = k.view(B, S, self.num_local_kv_heads, self.head_dim)
+        v = v.view(B, S, self.num_local_kv_heads, self.head_dim)
         q = self.norm_q(q)
         k = self.norm_k(k)
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -323,32 +335,18 @@ class Cosmos3CrossAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.to_q = ColumnParallelLinear(
-            hidden_size,
-            num_attention_heads * head_dim,
+        # Fused Q/K/V column-parallel projection (see Cosmos3CausalAttention).
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_dim=head_dim,
+            num_heads=num_attention_heads,
+            num_kv_heads=num_key_value_heads,
             bias=False,
             gather_output=False,
             params_dtype=params_dtype,
-            prefix=f"{prefix}.to_q" if prefix else "",
-        )
-        self.to_k = ColumnParallelLinear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=False,
-            gather_output=False,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.to_k" if prefix else "",
-        )
-        self.to_v = ColumnParallelLinear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=False,
-            gather_output=False,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.to_v" if prefix else "",
+            hf_legs={"q": "to_q", "k": "to_k", "v": "to_v"},
+            prefix=f"{prefix}.qkv_proj" if prefix else "",
         )
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
@@ -358,6 +356,11 @@ class Cosmos3CrossAttention(nn.Module):
             params_dtype=params_dtype,
             prefix=f"{prefix}.to_out" if prefix else "",
         )
+        # Per-rank Q/K/V widths from the fused layer; the cached UND K/V are sharded
+        # identically, so the cross-attention concat stays aligned.
+        self.q_size, self.k_size, self.v_size = self.qkv_proj.output_partition_sizes
+        self.num_local_heads = self.q_size // head_dim
+        self.num_local_kv_heads = self.k_size // head_dim
         self.norm_q = RMSNorm(
             head_dim,
             eps=rms_norm_eps,
@@ -373,9 +376,9 @@ class Cosmos3CrossAttention(nn.Module):
             prefix=f"{prefix}.norm_k" if prefix else "",
         )
         self.attn = Attention(
-            num_heads=num_attention_heads,
+            num_heads=self.num_local_heads,
             head_dim=head_dim,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=self.num_local_kv_heads,
             causal=False,
             backend=attn_backend,
         )
@@ -389,12 +392,11 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, S_gen, _ = hidden_states.shape
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
-        q = q.view(B, S_gen, self.num_heads, self.head_dim)
-        k = k.view(B, S_gen, self.num_kv_heads, self.head_dim)
-        v = v.view(B, S_gen, self.num_kv_heads, self.head_dim)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q = q.view(B, S_gen, self.num_local_heads, self.head_dim)
+        k = k.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
+        v = v.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
         q = self.norm_q(q)
         k = self.norm_k(k)
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -1145,4 +1147,5 @@ __all__ = [
     "cosmos3_weight_remap",
     "compute_mrope_position_ids_text",
     "compute_mrope_position_ids_vision",
+    "local_head_counts",
 ]

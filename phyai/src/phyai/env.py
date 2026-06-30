@@ -158,6 +158,7 @@ class envs:
     # ---------- parallel ---------- #
     PHYAI_WORLD_SIZE = EnvField("PHYAI_WORLD_SIZE", None, int)
     PHYAI_DP_SIZE = EnvField("PHYAI_DP_SIZE", None, int)
+    PHYAI_CFG_SIZE = EnvField("PHYAI_CFG_SIZE", None, int)
     PHYAI_EP_SIZE = EnvField("PHYAI_EP_SIZE", None, int)
     PHYAI_SP_SIZE = EnvField("PHYAI_SP_SIZE", None, int)
     PHYAI_CP_SIZE = EnvField("PHYAI_CP_SIZE", None, int)

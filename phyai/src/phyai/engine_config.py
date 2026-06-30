@@ -255,6 +255,11 @@ class ParallelConfig:
 
     * ``dp`` — data parallel: full model replica per group, different
       micro-batches.
+    * ``cfg`` — classifier-free-guidance parallel: the conditional and
+      unconditional CFG branches of a diffusion step run concurrently on
+      disjoint groups (each a full ``tp`` group), recombined with one
+      cross-``cfg`` all-gather. Sits just outside ``tp`` so every cfg group
+      is a contiguous tensor-parallel block.
     * ``ep`` — expert parallel: distinct MoE experts per rank.
     * ``sp`` — sequence parallel: shards activations along the sequence
       axis (Megatron-style sub-mode of TP).
@@ -265,12 +270,13 @@ class ParallelConfig:
       interconnect.
 
     Single-axis runs leave the unused sizes at 1; the engine still
-    builds a 5-axis mesh so model code addressing ``axis="tp"`` keeps
-    working unchanged.
+    builds a 6-axis mesh so model code addressing ``axis="tp"`` keeps
+    working unchanged (size-1 axes short-circuit through the collectives).
     """
 
     world_size: int = 1
     dp_size: int = 1
+    cfg_size: int = 1
     ep_size: int = 1
     sp_size: int = 1
     cp_size: int = 1
@@ -280,6 +286,7 @@ class ParallelConfig:
         for name in (
             "world_size",
             "dp_size",
+            "cfg_size",
             "ep_size",
             "sp_size",
             "cp_size",
@@ -483,6 +490,8 @@ class EngineConfig:
             parallel_kw["world_size"] = v
         if (v := envs.PHYAI_DP_SIZE.get()) is not None:
             parallel_kw["dp_size"] = v
+        if (v := envs.PHYAI_CFG_SIZE.get()) is not None:
+            parallel_kw["cfg_size"] = v
         if (v := envs.PHYAI_EP_SIZE.get()) is not None:
             parallel_kw["ep_size"] = v
         if (v := envs.PHYAI_SP_SIZE.get()) is not None:
