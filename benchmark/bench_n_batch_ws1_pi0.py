@@ -117,9 +117,7 @@ def make_dummy_request(
     )
     input_ids[:, 0] = 2  # any non-pad token id
     lang_lens = torch.ones(batch_size, dtype=torch.int64, device=device)
-    state = torch.rand(
-        batch_size, plugin_cfg.max_state_dim, dtype=dtype, device=device
-    )
+    state = torch.rand(batch_size, plugin_cfg.max_state_dim, dtype=dtype, device=device)
 
     noise = None
     if fixed_noise:

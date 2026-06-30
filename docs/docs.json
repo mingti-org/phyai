@@ -71,6 +71,12 @@
             "group": "模型",
             "pages": [
               {
+                "group": "PI0",
+                "pages": [
+                  "zh/models/pi0/ws1"
+                ]
+              },
+              {
                 "group": "PI0.5",
                 "pages": [
                   "zh/models/pi05/ws1",

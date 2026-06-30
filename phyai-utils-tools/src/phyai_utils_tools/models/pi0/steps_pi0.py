@@ -44,7 +44,9 @@ class PadStateStep(ProcessorStep):
         if state.dim() == 1:
             state = state.unsqueeze(0)
         if state.dim() != 2:
-            raise ValueError(f"STATE must be 2-D (B, state_dim), got shape {tuple(state.shape)}.")
+            raise ValueError(
+                f"STATE must be 2-D (B, state_dim), got shape {tuple(state.shape)}."
+            )
 
         state_dim = int(state.shape[-1])
         if state_dim > self.max_state_dim:
