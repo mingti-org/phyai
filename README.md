@@ -22,6 +22,7 @@ models that run in interactive systems.
 
 ## News
 
+- [2026/07] 🚀 Support Cosmos3-Super (TP + CFG parallel) in the Cosmos3 [WN generation path](https://phyai.mintlify.app/models/cosmos/wn).
 - [2026/06] 🚀 Support [Pi0.5](https://phyai.mintlify.app/models/pi05/ws1) and Cosmos3-Nano's [policy mode](https://phyai.mintlify.app/models/cosmos/ws1_policy) & [gen mode](https://phyai.mintlify.app/models/cosmos/ws1).
 
 ## Installation

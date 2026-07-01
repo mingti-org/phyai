@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 620" role="img"
+     aria-labelledby="title desc"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+  <title id="title">Cosmos3 WN parallel topology with TP=4 and CFG=2</title>
+  <desc id="desc">Eight GPU ranks are split into two CFG groups. Each group contains four tensor-parallel ranks that run the same branch together in parallel. The first group runs the conditional branch, the second group runs the unconditional branch, then velocities are gathered across the CFG axis and combined on every rank.</desc>
+
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-neutral" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#64748b"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.8" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .small { font-size: 13px; fill: #475569; }
+      .tiny { font-size: 11px; fill: #64748b; }
+      .label { font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    </style>
+  </defs>
+
+  <rect width="1120" height="620" fill="#f8fafc"/>
+
+  <text x="34" y="38" font-size="13" font-weight="700" fill="#003399">PhyAI</text>
+  <text x="560" y="40" text-anchor="middle" font-size="24" font-weight="750" fill="#0f172a">Cosmos3 WN parallel layout</text>
+  <text x="560" y="64" text-anchor="middle" class="small">Example: TP=4, CFG=2, world_size=8</text>
+
+  <g transform="translate(48, 96)">
+    <rect x="0" y="0" width="1024" height="410" rx="16" fill="#ffffff" stroke="#dbe4ee" filter="url(#shadow)"/>
+
+    <g transform="translate(28, 28)">
+      <rect x="0" y="0" width="460" height="270" rx="14" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+      <text x="24" y="34" class="label" fill="#1d4ed8">CFG group 0</text>
+      <text x="24" y="56" class="small">cfg_rank=0 · conditional branch</text>
+      <text x="24" y="82" class="tiny mono">branch = "cond"</text>
+
+      <g transform="translate(24, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#1d4ed8">GPU 0</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 0</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=0</text>
+      </g>
+      <g transform="translate(126, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#1d4ed8">GPU 1</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 1</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=1</text>
+      </g>
+      <g transform="translate(228, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#1d4ed8">GPU 2</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 2</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=2</text>
+      </g>
+      <g transform="translate(330, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#1d4ed8">GPU 3</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 3</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=3</text>
+      </g>
+
+      <g transform="translate(40, 202)">
+        <rect x="0" y="0" width="376" height="28" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+        <text x="188" y="18" text-anchor="middle" class="tiny mono">4 TP ranks run transformer.forward(cond) together</text>
+      </g>
+    </g>
+
+    <g transform="translate(536, 28)">
+      <rect x="0" y="0" width="460" height="270" rx="14" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+      <text x="24" y="34" class="label" fill="#15803d">CFG group 1</text>
+      <text x="24" y="56" class="small">cfg_rank=1 · unconditional branch</text>
+      <text x="24" y="82" class="tiny mono">branch = "uncond"</text>
+
+      <g transform="translate(24, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#4ade80" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#15803d">GPU 4</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 4</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=0</text>
+      </g>
+      <g transform="translate(126, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#4ade80" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#15803d">GPU 5</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 5</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=1</text>
+      </g>
+      <g transform="translate(228, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#4ade80" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#15803d">GPU 6</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 6</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=2</text>
+      </g>
+      <g transform="translate(330, 110)">
+        <rect x="0" y="0" width="92" height="92" rx="12" fill="#ffffff" stroke="#4ade80" stroke-width="1.5"/>
+        <text x="46" y="32" text-anchor="middle" font-size="18" font-weight="800" fill="#15803d">GPU 7</text>
+        <text x="46" y="54" text-anchor="middle" class="tiny mono">rank 7</text>
+        <text x="46" y="74" text-anchor="middle" class="tiny mono">tp=3</text>
+      </g>
+
+      <g transform="translate(40, 202)">
+        <rect x="0" y="0" width="376" height="28" rx="14" fill="#dcfce7" stroke="#86efac"/>
+        <text x="188" y="18" text-anchor="middle" class="tiny mono">4 TP ranks run transformer.forward(uncond) together</text>
+      </g>
+    </g>
+
+    <path d="M 488 158 H 536" stroke="#94a3b8" stroke-width="2" stroke-dasharray="5 5"/>
+    <text x="512" y="142" text-anchor="middle" class="tiny mono">cfg axis</text>
+
+    <g transform="translate(234, 326)">
+      <rect x="0" y="0" width="556" height="58" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+      <path d="M 82 -22 C 156 -6 196 -6 272 0" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-neutral)"/>
+      <path d="M 474 -22 C 400 -6 360 -6 284 0" fill="none" stroke="#16a34a" stroke-width="2.2" marker-end="url(#arrow-neutral)"/>
+      <text x="278" y="22" text-anchor="middle" class="label">P.all_gather(axis="cfg")</text>
+      <text x="278" y="44" text-anchor="middle" class="small">each rank receives [cond_velocity, uncond_velocity]</text>
+    </g>
+  </g>
+
+  <g transform="translate(138, 530)">
+    <rect x="0" y="0" width="844" height="56" rx="14" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="24" y="24" class="label" fill="#c2410c">Local combine on every rank</text>
+    <text x="24" y="44" class="small mono">guided = uncond + guidance_scale * (cond - uncond) · then UniPC step(video/action/sound)</text>
+    <path d="M 420 -24 V -2" stroke="#64748b" stroke-width="2" marker-end="url(#arrow-neutral)"/>
+  </g>
+</svg>

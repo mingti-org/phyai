@@ -1,0 +1,235 @@
+---
+title: "多卡运行 Cosmos3 生成模式"
+description: "scheduler_wn_cosmos3 使用指南"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano / Cosmos3-Super"
+  icon="C"
+  rows={{
+    "模型类型": "World Foundation Model",
+    "权重": <div className="flex flex-col gap-1.5"><a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano</a><a href="https://huggingface.co/nvidia/Cosmos3-Super" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Super</a></div>,
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3T2VWNScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3_wn</code>,
+    "源码": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">scheduler_wn_cosmos3.py</code>,
+    "并行轴": ["tp", "cfg"],
+    "支持路径": ["T2V", "I2V", "T2AV", "I2AV"],
+    "采样器": "UniPC",
+  }}
+/>
+
+# 概述
+
+Cosmos3 是面向 Physical AI 的 omnimodal world model。它可以从 text、image、video、audio 和 action trajectory 等组合输入中生成 video、image、audio、action 等输出，用在世界生成、未来预测、动作推理和 embodied policy learning 这类任务上。
+
+本页讲的是 Cosmos3 的多卡生成路径，也就是 `cosmos3_wn` plugin。它覆盖 T2V/I2V/T2AV/I2AV：视频 latent 和可选 sound latent 在同一个 denoise loop 里推进，最后由 VAE/AVAE decode 成可保存的媒体。
+
+PhyAI 目前在这条路径上支持两类并行：transformer forward 沿 `tp` 轴做 tensor parallel；当 `cfg=2` 且 `guidance_scale > 1` 时，cond / uncond 两个 CFG branch 会被分到两个 TP group 上并行运行。视频 VAE decode 也会按 rank 做空间 tile 切分，并用 halo overlap 合并边界。
+
+# 并行拓扑
+
+下面用 `TP=4`、`CFG=2`、`world_size=8` 作为例子。8 张卡被拆成两个 CFG group：rank 0-3 是 cond branch 的一个 TP group，rank 4-7 是 uncond branch 的另一个 TP group。每个 denoise step 结束前，两个 branch 的 velocity 会沿 `cfg` 轴 all-gather 到所有 rank，再在本地完成 CFG combine。
+
+![Cosmos3 WN TP=4 CFG=2 的 8 卡并行拓扑](/images/models/cosmos/tp4-cfg2-topology.svg)
+
+`cfg=2` 只在 `guidance_scale > 1` 时有收益。否则 scheduler 会打印 warning，因为 uncond 分支仍然会被分配 rank 和计算，但 CFG 实际没有打开。Cosmos3 只有 cond 和 uncond 两个 CFG 分支，示例脚本也把 `--cfg` 限制为 `1` 或 `2`。
+
+# Decode 与输出
+
+`Cosmos3T2VWNScheduler.step()` 只负责生成 latent。`Cosmos3WNEntry.step()` 会在 scheduler 返回后调用 decode：
+
+| 请求类型 | Scheduler 返回 | Entry 返回 |
+| --- | --- | --- |
+| T2V/I2V | `video` latent，shape `[1, C, t, h, w]` | pixels，shape `[B, 3, T, H, W]`，范围 `[0, 1]` |
+| T2AV/I2AV | `{"video": video_latent, "sound": sound_latent}` | `{"video": pixels, "sound": waveform, "sample_rate": int}` |
+
+视频 decode 使用 `Cosmos3VAERunner.decode()`。当并行规模大于 1 时，runner 会走 WAN VAE 的并行 decode，把空间 tile 分配给不同 rank，并在 halo 处理后合并结果。音频 decode 使用 `Cosmos3SoundVAERunner.decode()`。
+
+VAE 的 8 卡切分示意如下，`cfg` 作为 outer axis，`tp` 作为 inner axis：
+
+![Cosmos3 WAN VAE 8 卡空间切分示意](/images/models/cosmos/vae8-tile-split.svg)
+
+# 运行路径
+
+<Steps>
+  <Step title="准备权重和拓扑">
+    准备一份 <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer">Cosmos3-Nano</a> 或 <a href="https://huggingface.co/nvidia/Cosmos3-Super" target="_blank" rel="noreferrer">Cosmos3-Super</a> checkpoint。WN 路径仍然需要 transformer、VAE、text tokenizer；T2AV 还需要 `sound_tokenizer`。
+
+    ```text
+    /path/to/Cosmos3-Nano/
+      transformer/
+      vae/
+      text_tokenizer/
+      sound_tokenizer/   # T2AV 需要
+      scheduler/
+    ```
+
+    多卡拓扑由 `cfg_size * tp_size` 决定。启动时，`torchrun --nproc_per_node` 必须等于这个乘积。
+  </Step>
+
+  <Step title="构造多卡 Engine">
+    插件名是 `"cosmos3_wn"`。`ParallelConfig` 里显式写出 `world_size`、`cfg_size` 和 `tp_size`，engine 初始化时会先建立 mesh，再让 transformer parallel layer 按 `tp` 轴切分。
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import (
+        DeviceConfig,
+        EngineConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
+    from phyai.models.cosmos3.main_cosmos3_wn import Cosmos3WNArgs
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano"
+    local_rank = 0
+    cfg_size = 1
+    tp_size = 4
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_wn",
+            plugin_args=Cosmos3WNArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=False,
+                load_sound=None,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(
+                    target=f"cuda:{local_rank}",
+                    params_dtype=torch.bfloat16,
+                ),
+                parallel=ParallelConfig(
+                    world_size=cfg_size * tp_size,
+                    cfg_size=cfg_size,
+                    tp_size=tp_size,
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    示例脚本会从 `LOCAL_RANK` 读取 `local_rank`，并检查 `WORLD_SIZE == cfg_size * tp_size`。
+  </Step>
+
+  <Step title="Tokenize prompt">
+    Scheduler 不做 tokenizer。和单卡生成路径一样，正向和负向 prompt 都由 `Cosmos3Processor` 转成 tensor。
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=24.0,
+        num_frames=189,
+        height=720,
+        width=1280,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=f"cuda:{local_rank}",
+    )
+    ```
+  </Step>
+
+  <Step title="构造 Request">
+    `Cosmos3T2VRequest` 不包含并行信息。并行信息属于 engine config；request 只描述这次生成的文本条件、latent grid、采样参数和可选音频长度。
+
+    ```python
+    import math
+
+    from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+
+    num_frames = 189
+    height = 720
+    width = 1280
+    fps = 24.0
+    with_sound = False
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+    ```
+  </Step>
+
+  <Step title="所有 rank 同时运行">
+    每个 rank 都必须调用 `engine.step(request)`。scheduler 内部会在 `tp` 和 `cfg` 轴上触发 collective，不能只让 rank 0 运行。
+
+    ```python
+    result = engine.step(request)
+    ```
+
+    T2V/I2V 最终得到 pixels；T2AV/I2AV 得到 `{"video", "sound", "sample_rate"}`。这些结果在所有 rank 上保持一致。
+  </Step>
+
+  <Step title="只在 rank 0 保存媒体">
+    WN 示例只让 rank 0 做 postprocess 和 mp4 写入，避免多个进程写同一个文件。
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3GenerationPostProcessor
+
+    if local_rank == 0:
+        postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+        media = postprocessor.postprocess(result)
+        postprocessor.save_mp4(media, ".cache/cosmos3_t2v_wn.mp4")
+    ```
+  </Step>
+</Steps>
+
+# 运行示例
+
+TP-only 的 4 卡 T2V：
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --out .cache/cosmos3_t2v_wn
+```
+
+CFG parallel + TP 的 8 卡 T2V：
+
+```bash
+torchrun --nproc_per_node=8 examples/cosmos3/run_cosmos3_wn.py \
+    --cfg 2 \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --guidance-scale 6.0 \
+    --out .cache/cosmos3_t2v_wn
+```
+
+带音频的 T2AV：
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "ocean waves crashing on rocks" \
+    --sound \
+    --out .cache/cosmos3_t2av_wn
+```
+
+`--nproc_per_node` 必须等于 `--cfg * --tp`。Cosmos3-Nano 是 32 个 attention heads / 8 个 KV heads，示例脚本建议的 `--tp` 是 `1`、`2`、`4` 或 `8`。
+
+# 实现注意
+
+- 这条路径仍然是一次处理一个 request 的示例/基线路径，不是 continuous batching scheduler。

@@ -9,6 +9,7 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
+        exclude: '\.svg$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.4
     hooks:

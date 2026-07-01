@@ -37,6 +37,8 @@
                 "pages": [
                   "models/cosmos/ws1",
                   "models/cosmos/ws1_policy",
+                  "models/cosmos/wn",
+                  "models/cosmos/wn_policy",
                   "models/cosmos/processors"
                 ]
               }
@@ -76,6 +78,8 @@
                 "pages": [
                   "zh/models/cosmos/ws1",
                   "zh/models/cosmos/ws1_policy",
+                  "zh/models/cosmos/wn",
+                  "zh/models/cosmos/wn_policy",
                   "zh/models/cosmos/processors"
                 ]
               }
