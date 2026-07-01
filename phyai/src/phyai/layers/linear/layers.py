@@ -79,18 +79,31 @@ class LinearBase(nn.Module):
     def _attach_optional_scales(layer: nn.Module, hf_base: str) -> None:
         """Attach hf_keys/weight_loader/optional=True to spec-allocated scales.
 
-        ``Fp8Spec`` (and any future quant spec) creates ``weight_scale`` /
-        ``input_scale`` as parameters on the layer. They are absent in
-        non-quant checkpoints, so they're marked optional — missing keys
-        don't raise under ``strict=True`` and the spec's
+        ``Fp8Spec`` / ``Nvfp4Spec`` (and any future quant spec) create
+        scale parameters on the layer. They are absent in non-quant
+        checkpoints, so they're marked optional — missing keys don't
+        raise under ``strict=True`` and the spec's
         :meth:`process_after_loading` handles any shape fixup.
         """
-        for name in ("weight_scale", "input_scale"):
+        for name in ("weight_scale", "input_scale", "weight_global_scale"):
             p = getattr(layer, name, None)
             if isinstance(p, nn.Parameter):
                 p.hf_keys = [(f"{hf_base}.{name}", None)]
                 p.weight_loader = replicated()
                 p.optional = True
+
+    @staticmethod
+    def _attach_weight_loader(layer: nn.Module, loader) -> None:
+        load_weight = getattr(layer.spec, "load_weight", None)
+        if callable(load_weight):
+            layer.weight.weight_loader = lambda _param, loaded, shard_id: load_weight(
+                layer,
+                loaded,
+                shard_id,
+                loader,
+            )
+        else:
+            layer.weight.weight_loader = loader
 
 
 class ReplicatedLinear(LinearBase):
@@ -141,8 +154,9 @@ class ReplicatedLinear(LinearBase):
             self.register_parameter("bias", None)
 
         if prefix:
+            weight_loader = replicated()
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = replicated()
+            self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
                 self.bias.weight_loader = replicated()
@@ -251,8 +265,9 @@ class ColumnParallelLinear(LinearBase):
         # Non-fused column-parallel: subclasses (Merged / QKV) override
         # by re-attaching after super().__init__ returns.
         if prefix and len(per_rank_sizes) == 1:
+            weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
+            self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
                 self.bias.weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
@@ -344,9 +359,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     bias_keys.append((f"{hf_base}.bias", i))
                 offset += per_rank
             self.weight.hf_keys = keys
-            self.weight.weight_loader = fused(
-                fuse_dim=0, legs=leg_dict, mesh=self._mesh
-            )
+            weight_loader = fused(fuse_dim=0, legs=leg_dict, mesh=self._mesh)
+            self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = bias_keys
                 self.bias.weight_loader = fused(
@@ -465,9 +479,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 if self.bias is not None:
                     bias_keys.append((f"{hf_base}.bias", kind))
             self.weight.hf_keys = keys
-            self.weight.weight_loader = fused(
-                fuse_dim=0, legs=leg_dict, mesh=self._mesh
-            )
+            weight_loader = fused(fuse_dim=0, legs=leg_dict, mesh=self._mesh)
+            self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = bias_keys
                 self.bias.weight_loader = fused(
@@ -550,8 +563,9 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
         if prefix:
+            weight_loader = sharded(dim=1, axis=axis, mesh=mesh_obj)
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = sharded(dim=1, axis=axis, mesh=mesh_obj)
+            self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 # Bias is replicated for row-parallel — full copy, no slice.
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]

@@ -46,7 +46,7 @@ from phyai.layers.linear.registry import (
     list_registered_linear_kernels,
     register_linear_kernel,
 )
-from phyai.layers.linear.spec import ActivationView, Bf16Spec, Fp8Spec
+from phyai.layers.linear.spec import ActivationView, Bf16Spec, Fp8Spec, Nvfp4Spec
 from phyai.layers.quant import AllocationRequest, WeightSpec
 from phyai.utils.cuda import sm_arch
 
@@ -74,6 +74,8 @@ def supported_specs_for_sm(sm: int) -> list[str]:
     if sm >= 100:
         # flashinfer gemm_fp8_nt_groupwise (DeepSeek-V3 block-fp8).
         specs.append("fp8_block_128_128")
+        # flashinfer mm_fp4 (Blackwell NVFP4) with 128x4 scale layout.
+        specs.append("nvfp4_block_16_128x4")
     return specs
 
 
@@ -136,6 +138,7 @@ __all__ = [
     # specs
     "Bf16Spec",
     "Fp8Spec",
+    "Nvfp4Spec",
     "ActivationView",
     "AllocationRequest",
     "WeightSpec",

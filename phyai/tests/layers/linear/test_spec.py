@@ -9,14 +9,17 @@ import pytest
 import torch
 import torch.nn as nn
 
+from phyai.layers.linear.backends.torch import _dequant_nvfp4_weight
 from phyai.layers.quant import (
     ActivationView,
     AllocationRequest,
     Bf16Spec,
     Fp8Spec,
     Granularity,
+    Nvfp4Spec,
 )
 from phyai.layers.quant.fp8 import _convert_to_channelwise
+from phyai.layers.quant.nvfp4 import _quantize_nvfp4_linear
 
 
 # ---------------------------------------------------------------------------
@@ -202,3 +205,83 @@ def test_fp8_spec_id_format():
         Fp8Spec(granularity=Granularity.BLOCK, block_shape=(64, 256)).spec_id
         == "fp8_block_64_256"
     )
+
+
+# ---------------------------------------------------------------------------
+# Nvfp4Spec
+# ---------------------------------------------------------------------------
+
+
+def test_nvfp4_linear_shapes():
+    spec = Nvfp4Spec(scale_layout="linear")
+    layer = nn.Module()
+    spec.allocate(layer, _request(weight_shape=(128, 64)))
+    assert layer.weight.shape == (128, 32)
+    assert layer.weight.dtype == torch.uint8
+    assert layer.weight_scale.shape == (128, 4)
+    assert layer.weight_scale.dtype == torch.float8_e4m3fn
+    assert layer.weight_global_scale.shape == (1,)
+    assert spec.spec_id == "nvfp4_block_16_linear"
+
+
+def test_nvfp4_128x4_scale_shape_pads():
+    spec = Nvfp4Spec(scale_layout="128x4")
+    layer = nn.Module()
+    spec.allocate(layer, _request(weight_shape=(129, 80)))
+    assert layer.weight.shape == (129, 40)
+    # N padded to 256; K/16=5 padded to 8.
+    assert layer.weight_scale.shape == (256, 8)
+    assert spec.spec_id == "nvfp4_block_16_128x4"
+
+
+def test_nvfp4_enforces_k_divisible_by_16():
+    spec = Nvfp4Spec()
+    layer = nn.Module()
+    with pytest.raises(ValueError, match="not divisible"):
+        spec.allocate(layer, _request(weight_shape=(64, 60)))
+
+
+def test_nvfp4_rejects_non_2d_shape():
+    spec = Nvfp4Spec()
+    layer = nn.Module()
+    with pytest.raises(ValueError, match="2-D weight_shape"):
+        spec.allocate(
+            layer,
+            AllocationRequest(
+                weight_shape=(8, 16, 32),
+                logical_widths=[8],
+            ),
+        )
+
+
+def test_nvfp4_rejects_nonstandard_block_size():
+    with pytest.raises(ValueError, match="block_size=16"):
+        Nvfp4Spec(block_size=32)
+
+
+def test_nvfp4_quantize_loaded_weight_linear_layout():
+    spec = Nvfp4Spec(scale_layout="linear")
+    layer = nn.Module()
+    spec.allocate(layer, _request(weight_shape=(2, 16)))
+    weight = torch.ones(2, 16, dtype=torch.bfloat16)
+
+    spec.quantize_loaded_weight(layer, weight)
+
+    torch.testing.assert_close(
+        _dequant_nvfp4_weight(layer),
+        weight.float(),
+        atol=0.05,
+        rtol=0.05,
+    )
+    assert layer.weight_scale.shape == (2, 1)
+    assert layer.weight_global_scale.shape == (1,)
+
+
+def test_quantize_nvfp4_linear_round_trips_simple_values():
+    weight = torch.ones(2, 16, dtype=torch.bfloat16)
+    packed, scale, global_scale = _quantize_nvfp4_linear(weight, 16)
+    assert packed.shape == (2, 8)
+    assert packed.dtype == torch.uint8
+    assert scale.shape == (2, 1)
+    assert scale.dtype == torch.float8_e4m3fn
+    assert global_scale.shape == (1,)

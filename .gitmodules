@@ -1,3 +1,6 @@
 [submodule ".claude/skills/ncu-report-skill"]
 	path = .claude/skills/ncu-report-skill
 	url = https://github.com/mit-han-lab/ncu-report-skill.git
+[submodule "third_party/mirage"]
+	path = third_party/mirage
+	url = https://github.com/mirage-project/mirage

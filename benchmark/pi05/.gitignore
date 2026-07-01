@@ -1,0 +1,5 @@
+traces/
+figures/
+__pycache__/
+*.json
+*.log
