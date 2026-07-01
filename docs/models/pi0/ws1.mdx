@@ -1,0 +1,350 @@
+---
+title: "Single-GPU Inference for PI0"
+description: "How PhyAI runs pi0 inference on a single GPU"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="pi0"
+  subtitle="Vision-Language-Action · Single-GPU Inference"
+  icon="π"
+  rows={{
+    "Model Type": "VLA",
+    "Weights": "HF-style pi0 PyTorch checkpoint",
+    "Tags": ["VLA", "flow-matching", "PaliGemma", "SigLIP", "single-GPU"],
+    "Image Input": "2 or 3 RGB cameras · 224×224",
+    "Tokenizer Length": "48",
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">PI0WS1Scheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">pi0</code>,
+    "Param Precision": "bf16, with fp32 vision by default",
+    "Action Chunk": "50 steps × 32 dims",
+  }}
+/>
+
+# Overview
+
+pi0 is a vision-language-action model that combines a PaliGemma-style image and language prefix with a Gemma action expert. In PhyAI, the `ws1` path runs the full end-to-end inference loop on one GPU: encode cameras and task text, cache the prefix, condition the expert on robot state, and integrate the action chunk with flow matching.
+
+This page describes the single-card implementation. There is no tensor parallelism, no continuous batching, and no preemption in `PI0WS1Scheduler`.
+
+<Note>
+  pi0 differs from pi0.5 in how robot state enters the model. pi0 keeps state as a numeric expert-side token. pi0.5 folds discretized state bins into the language prompt.
+</Note>
+
+# Architecture
+
+PhyAI uses the same <Tooltip headline="Engine + plugin" tip="Engine resolves an Entry by plugin name. Entry.setup() builds the model, loads weights, and prepares the scheduler. Entry.step() accepts the canonical request and returns the model output.">engine + plugin contract</Tooltip> as the other model integrations. The pi0 path is split across configuration, model modules, runners, and a scheduler:
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/pi0" defaultOpen>
+    <Tree.File name="main_pi0.py" />
+    <Tree.File name="scheduler_ws1_pi0.py" />
+    <Tree.File name="model_runner_pi0.py" />
+    <Tree.File name="modeling_pi0.py" />
+    <Tree.File name="configuration_pi0.py" />
+  </Tree.Folder>
+</Tree>
+
+| Component | Responsibility |
+| --- | --- |
+| `PI0Entry` | Registers the `"pi0"` engine plugin, builds `PI0Model`, loads weights, and creates the scheduler |
+| `PI0Config` | Stores vision, text, expert, action chunk, tokenizer, and camera-count geometry |
+| `PI0Model` | Owns the SigLIP/PaliGemma vision tower, PaliGemma text stack, Gemma expert stack, RoPE, and action/time heads |
+| `PI0VisionRunner` | Runs the vision tower, with optional CUDA graph capture |
+| `PI0LLMRunner` | Runs the PaliGemma prefix pass and writes prefix K/V into the shared cache |
+| `PI0ExpertRunner` | Runs the expert state/action passes for each flow-matching step |
+| `PI0WS1Scheduler` | Orchestrates one complete inference request on a single GPU |
+
+# Model layout
+
+`PI0Model` is built from three major stacks:
+
+| Stack | Default shape | Notes |
+| --- | --- | --- |
+| Vision | SigLIP, 27 layers, 224×224 images, 14×14 patches | Produces image tokens projected into the PaliGemma text width |
+| Text | PaliGemma/Gemma, 18 layers, hidden size 2048 | Processes image + language prefix and writes prefix K/V |
+| Expert | Gemma action expert, 18 layers, hidden size 1024 | Processes one state token plus the full action chunk |
+
+The top-level config defaults are:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `chunk_size` | `50` | Number of action tokens returned per engine step |
+| `max_state_dim` | `32` | Padded robot-state width |
+| `max_action_dim` | `32` | Padded action width |
+| `num_inference_steps` | `10` | Flow-matching Euler steps |
+| `tokenizer_max_length` | `48` | Right-padded PaliGemma task prompt length |
+| `empty_cameras` | `0` | `num_images = 3 - empty_cameras`; pi0 supports 2 or 3 cameras |
+
+The model uses `params_dtype` for the language and expert stacks. The vision tower has a separate `vision_params_dtype`, which defaults to fp32 for reference parity. Set `PI0Args(vision_params_dtype=torch.bfloat16)` only when you intentionally want bf16 vision execution.
+
+# Request contract
+
+`PI0Request` is the scheduler's canonical input:
+
+| Field | Shape | Notes |
+| --- | --- | --- |
+| `pixel_values` | `(B, num_images, 3, image_size, image_size)` | Already resized and normalized camera tensors |
+| `input_ids` | `(B, tokenizer_max_length)` int64 | Right-padded PaliGemma token ids |
+| `lang_lens` | `(B,)` int64 | Real task-prompt length for each sample |
+| `state` | `(B, max_state_dim)` | Numeric robot state, padded before the expert |
+| `noise` | `(B, chunk_size, max_action_dim)` or `None` | Optional initial action noise; when `None`, the scheduler samples Gaussian noise |
+
+`B` can be any value in `[1, max_batch_size]`. The scheduler pads smaller batches to `max_batch_size` internally and slices the result back to `actual_B` before returning.
+
+# Scheduler phases
+
+One `engine.step(request)` maps to the following scheduler phases:
+
+| Phase | Work |
+| --- | --- |
+| `pi0.vision_loop` | Move camera tensors to the vision dtype and run `PI0VisionRunner` once per real batch item |
+| `pi0.lang_pack` | Embed language ids, then pack image tokens and language tokens into the per-sample prefix buffer |
+| `pi0.llm_prefix_plan` | Reset static caches and prepare ragged prefix attention metadata |
+| `pi0.llm_prefix_fwd` | Run the PaliGemma text stack and write prefix K/V into `KVCachePool` |
+| `pi0.expert_plan` | Prepare state and action expert attention metadata over prefix + suffix slots |
+| `pi0.expert_loop` | Initialize or copy action noise and run flow-matching integration |
+| `pi0.expert_step` | One expert velocity prediction and Euler update inside `pi0.expert_loop` |
+
+The prefix tokens are cached once per request. The expert then attends over:
+
+```text
+state query  -> prefix + state
+action query -> prefix + state + action chunk
+```
+
+This is why pi0's suffix length is `1 + chunk_size`: one state token followed by the action tokens.
+
+# CUDA graphs
+
+When `RuntimeConfig(use_cuda_graph=True)`, the pi0 runners capture CUDA graphs during `scheduler.setup()`:
+
+| Runner | Captured shape |
+| --- | --- |
+| `PI0VisionRunner` | `(num_images, 3, image_size, image_size)` |
+| `PI0LLMRunner` | `(max_batch_size * n_per_sample, text_hidden_size)` |
+| `PI0ExpertRunner` | `state`, `x_t`, and `time` buffers at fixed `max_batch_size` |
+
+During `scheduler.step()`, the runners update static graph input buffers and replay the captured graphs. Attention metadata is staged outside the captured region through the attention backend's capture-aware metadata buffers.
+
+<Tip>
+  Disable CUDA graphs when you want a more expanded Nsight Systems trace:
+
+  ```bash
+  uv run python benchmark/bench_n_batch_ws1_pi0.py \
+      --batch-sizes 4 \
+      --no-cuda-graph
+  ```
+</Tip>
+
+# Running pi0
+
+<Steps>
+  <Step title="Prepare weights">
+    Prepare a HF-style pi0 PyTorch checkpoint directory with `config.json` and `model.safetensors` files. You can also omit `--checkpoint` for random-weight smoke tests.
+  </Step>
+
+  <Step title="Construct the engine">
+    The plugin name is `"pi0"`. The engine handles setup, optional weight loading, runner setup, and CUDA graph capture.
+
+    ```python
+    import torch
+    from pathlib import Path
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.pi0.main_pi0 import PI0Args
+
+    engine = Engine(
+        EngineArgs(
+            plugin="pi0",
+            plugin_args=PI0Args(
+                checkpoint_dir=Path("/path/to/pi0_pytorch"),
+                max_batch_size=4,
+                vision_params_dtype=torch.float32,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=True),
+            ),
+        )
+    )
+    ```
+
+    `max_batch_size` fixes the captured graph shapes. Rebuild the engine if you need a different maximum batch.
+  </Step>
+
+  <Step title="Build a request">
+    Use `PI0Processor` to convert raw robot observations into model-ready tensors. The processor lives outside the engine in `phyai-utils-tools`.
+
+    ```python
+    from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
+    from phyai_utils_tools.models.pi0 import PI0Processor
+
+    processor = PI0Processor(
+        image_size=224,
+        num_channels=3,
+        num_images=3,
+        tokenizer_max_length=48,
+        max_state_dim=32,
+        action_dim=7,
+        device="cuda",
+        params_dtype=torch.bfloat16,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": [cam0, cam1, cam2],
+            "task": ["pick up the object"],
+            "state": state,
+        }
+    )
+
+    request = PI0Request(
+        pixel_values=processed.pixel_values,
+        input_ids=processed.input_ids,
+        lang_lens=processed.lang_lens,
+        state=processed.state,
+    )
+    ```
+  </Step>
+
+  <Step title="Run one step">
+    ```python
+    actions = engine.step(request)  # (B, chunk_size, max_action_dim)
+    ```
+
+    If you constructed a processor with `action_dim`, call `processor.postprocess(actions)` to slice the padded action width and unnormalize actions when dataset stats are available.
+  </Step>
+
+  <Step title="Close the engine">
+    ```python
+    engine.close()
+    ```
+  </Step>
+</Steps>
+
+# End-to-end example
+
+`examples/pi0/run_pi0.py` exercises both raw and processor-backed request paths:
+
+```bash
+uv run python examples/pi0/run_pi0.py \
+    --checkpoint /path/to/pi0_pytorch \
+    --batch-size 1
+```
+
+For a random-weight smoke test, omit `--checkpoint`:
+
+```bash
+uv run python examples/pi0/run_pi0.py --raw --batch-size 1
+```
+
+Use `--num-images 2` when your checkpoint uses one empty camera:
+
+```bash
+uv run python examples/pi0/run_pi0.py \
+    --checkpoint /path/to/pi0_pytorch \
+    --num-images 2
+```
+
+# Benchmarking and profiling
+
+`benchmark/bench_n_batch_ws1_pi0.py` sweeps batch sizes and can open a tight profile window for Nsight Systems:
+
+```bash
+uv run python benchmark/bench_n_batch_ws1_pi0.py \
+    --batch-sizes 1 2 4 \
+    --n-warmup 5 \
+    --n-timed 30 \
+    --result-file ./pi0_ws1_results.jsonl
+```
+
+Nsight Systems capture:
+
+```bash
+nsys profile \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=stop \
+    -o ./prof/pi0_ws1 \
+    uv run python benchmark/bench_n_batch_ws1_pi0.py \
+        --batch-sizes 4 \
+        --profile-backend nsys \
+        --profile-start-step 5 \
+        --profile-num-steps 3
+```
+
+Set `--vision-dtype bfloat16` only when you intentionally want bf16 vision timing. The default keeps the vision tower in fp32.
+
+# Current limitations
+
+- This path is single-GPU only.
+- `max_batch_size` is fixed at engine construction.
+- The vision tower is replayed once per real batch item.
+- The scheduler expects already preprocessed tensors. Image resize, tokenization, state padding, and action unnormalization belong to `PI0Processor`.
+- CUDA graph capture is shape-fixed. Change camera count, image size, tokenizer length, or max batch by rebuilding the engine.
+
+# Full example
+
+```python
+from pathlib import Path
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi0.configuration_pi0 import PI0Config
+from phyai.models.pi0.main_pi0 import PI0Args
+from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
+from phyai.utils import load_config
+
+CHECKPOINT_DIR = Path("/path/to/pi0_pytorch")
+BATCH_SIZE = 1
+
+cfg = load_config(CHECKPOINT_DIR, PI0Config)
+device = torch.device("cuda")
+dtype = torch.bfloat16
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi0",
+        plugin_args=PI0Args(
+            checkpoint_dir=CHECKPOINT_DIR,
+            max_batch_size=BATCH_SIZE,
+            vision_params_dtype=torch.float32,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+
+try:
+    input_ids = torch.zeros(
+        BATCH_SIZE, cfg.tokenizer_max_length, dtype=torch.int64, device=device
+    )
+    input_ids[:, 0] = 2
+
+    request = PI0Request(
+        pixel_values=torch.rand(
+            BATCH_SIZE,
+            cfg.num_images,
+            cfg.vision.num_channels,
+            cfg.vision.image_size,
+            cfg.vision.image_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        input_ids=input_ids,
+        lang_lens=torch.ones(BATCH_SIZE, dtype=torch.int64, device=device),
+        state=torch.rand(BATCH_SIZE, cfg.max_state_dim, dtype=dtype, device=device),
+    )
+
+    actions = engine.step(request)
+    print(f"action chunk shape={tuple(actions.shape)}, dtype={actions.dtype}")
+finally:
+    engine.close()
+```
