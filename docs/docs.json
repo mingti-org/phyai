@@ -55,6 +55,12 @@
             "pages": [
               "tools/tensor-dump"
             ]
+          },
+          {
+            "group": "Developer guide",
+            "pages": [
+              "developer_guide/code-of-conduct"
+            ]
           }
         ]
       },
@@ -101,6 +107,12 @@
             "group": "工具",
             "pages": [
               "zh/tools/tensor-dump"
+            ]
+          },
+          {
+            "group": "开发者指南",
+            "pages": [
+              "zh/developer_guide/code-of-conduct"
             ]
           }
         ]
