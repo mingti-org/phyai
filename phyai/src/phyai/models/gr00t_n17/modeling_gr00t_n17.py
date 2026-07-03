@@ -367,7 +367,12 @@ class GR00TN17Backbone(nn.Module):
         self, inputs: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         vl_input = self.prepare_input(inputs)
-        required_keys = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+        required_keys = (
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+        )
         optional_keys = (
             "mm_token_type_ids",
             "position_ids",
@@ -379,7 +384,9 @@ class GR00TN17Backbone(nn.Module):
         if missing:
             raise KeyError(f"backbone inputs missing keys: {missing}")
         model_inputs = {key: vl_input[key] for key in required_keys}
-        model_inputs.update({key: vl_input[key] for key in optional_keys if key in vl_input})
+        model_inputs.update(
+            {key: vl_input[key] for key in optional_keys if key in vl_input}
+        )
         self._ensure_qwen3vl_model_device(model_inputs["input_ids"].device)
         return model_inputs
 
@@ -444,10 +451,12 @@ def _swish(x: torch.Tensor) -> torch.Tensor:
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
-    return 0.5 * x * (
-        1.0
-        + torch.tanh(
-            math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3))
+    return (
+        0.5
+        * x
+        * (
+            1.0
+            + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))
         )
     )
 
@@ -590,9 +599,7 @@ class GR00TN17SinusoidalPositionalEncoding(nn.Module):
                 f"{tuple(timesteps.shape)}."
             )
         half_dim = self.embedding_dim // 2
-        exponent = -torch.arange(
-            half_dim, dtype=torch.float32, device=timesteps.device
-        )
+        exponent = -torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
         exponent = exponent * (math.log(10000.0) / half_dim)
         freqs = timesteps.float().unsqueeze(-1) * exponent.exp()
         enc = torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=-1)
@@ -628,7 +635,9 @@ class GR00TN17CategorySpecificLinear(nn.Module):
     def attach_hf_keys(self, prefix: str) -> None:
         """Load official stacked W/b tensors into per-embodiment linears."""
 
-        def _load_weight(_param: nn.Parameter, tensor: torch.Tensor, _shard_id: object) -> None:
+        def _load_weight(
+            _param: nn.Parameter, tensor: torch.Tensor, _shard_id: object
+        ) -> None:
             if tuple(tensor.shape) != (
                 self.num_categories,
                 self.input_dim,
@@ -647,7 +656,9 @@ class GR00TN17CategorySpecificLinear(nn.Module):
                     )
                 )
 
-        def _load_bias(_param: nn.Parameter, tensor: torch.Tensor, _shard_id: object) -> None:
+        def _load_bias(
+            _param: nn.Parameter, tensor: torch.Tensor, _shard_id: object
+        ) -> None:
             if tuple(tensor.shape) != (self.num_categories, self.output_dim):
                 raise ValueError(
                     f"{prefix}.b shape mismatch: expected "
@@ -686,8 +697,7 @@ class GR00TN17CategorySpecificLinear(nn.Module):
                     f"{len(static_cat_ids)} vs {x.shape[0]}."
                 )
             if any(
-                cat_id < 0 or cat_id >= self.num_categories
-                for cat_id in static_cat_ids
+                cat_id < 0 or cat_id >= self.num_categories for cat_id in static_cat_ids
             ):
                 raise ValueError(
                     f"static category ids must be in [0, {self.num_categories})."
@@ -855,7 +865,9 @@ class GR00TN17Attention(nn.Module):
         self.to_v = GR00TN17Linear(kv_dim, self.inner_dim, bias=bias)
         self.to_out = GR00TN17Linear(self.inner_dim, query_dim, bias=True)
         self.dropout = float(dropout)
-        backend_kwargs = {"compile": False} if self.attention_backend == "sdpa" else None
+        backend_kwargs = (
+            {"compile": False} if self.attention_backend == "sdpa" else None
+        )
         self.prefill_attention = Attention(
             self.num_heads,
             self.head_dim,
@@ -885,9 +897,7 @@ class GR00TN17Attention(nn.Module):
     ) -> torch.Tensor:
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         if attention_mask is not None:
-            scores = scores.masked_fill(
-                ~attention_mask, torch.finfo(scores.dtype).min
-            )
+            scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
         attn = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
         if attention_mask is not None:
             attn = attn * attention_mask.to(dtype=attn.dtype)
@@ -1094,9 +1104,7 @@ class GR00TN17DiT(nn.Module):
                 GR00TN17BasicTransformerBlock(
                     self.inner_dim,
                     config,
-                    cross_attention_dim=None
-                    if use_self_attn
-                    else cross_attention_dim,
+                    cross_attention_dim=None if use_self_attn else cross_attention_dim,
                 )
             )
         self.transformer_blocks = nn.ModuleList(blocks)
@@ -1156,9 +1164,9 @@ class GR00TN17DiT(nn.Module):
             all_hidden_states.append(hidden_states)
 
         shift, scale = self.proj_out_1(_swish(temb)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[
-            :, None
-        ]
+        hidden_states = (
+            self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        )
         output = self.proj_out_2(hidden_states)
         if return_all_hidden_states:
             return output, all_hidden_states
@@ -1226,9 +1234,9 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
             all_hidden_states.append(hidden_states)
 
         shift, scale = self.proj_out_1(_swish(temb)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[
-            :, None
-        ]
+        hidden_states = (
+            self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        )
         output = self.proj_out_2(hidden_states)
         if return_all_hidden_states:
             return output, all_hidden_states
@@ -1296,9 +1304,7 @@ class GR00TN17SelfAttentionBlock(nn.Module):
             backend=attention_backend,
         )
         self.norm3 = GR00TN17LayerNorm(dim, eps=1e-5, elementwise_affine=True)
-        self.ff = GR00TN17FeedForward(
-            dim, dropout=dropout, final_dropout=final_dropout
-        )
+        self.ff = GR00TN17FeedForward(dim, dropout=dropout, final_dropout=final_dropout)
 
     def forward(
         self,
@@ -1435,7 +1441,9 @@ class GR00TN17ActionHead(nn.Module):
         state_features = self.state_encoder(state, action_input.embodiment_id)
         return backbone_output.backbone_features, state_features
 
-    def _positioned_action_features(self, action_features: torch.Tensor) -> torch.Tensor:
+    def _positioned_action_features(
+        self, action_features: torch.Tensor
+    ) -> torch.Tensor:
         if not self.config.add_pos_embed:
             return action_features
         if action_features.shape[1] > self.config.max_seq_len:

@@ -402,7 +402,9 @@ def apply_sin_cos_encoding(values: np.ndarray) -> np.ndarray:
     return np.concatenate([np.sin(values), np.cos(values)], axis=-1)
 
 
-def normalize_values_minmax(values: np.ndarray, params: dict[str, np.ndarray]) -> np.ndarray:
+def normalize_values_minmax(
+    values: np.ndarray, params: dict[str, np.ndarray]
+) -> np.ndarray:
     """Min-max normalize to ``[-1, 1]`` (degenerate dims map to 0)."""
     min_vals = params["min"]
     max_vals = params["max"]
@@ -426,7 +428,9 @@ def unnormalize_values_minmax(
     ) + min_vals
 
 
-def normalize_values_meanstd(values: np.ndarray, params: dict[str, np.ndarray]) -> np.ndarray:
+def normalize_values_meanstd(
+    values: np.ndarray, params: dict[str, np.ndarray]
+) -> np.ndarray:
     """Mean-std normalize (zero-std dims pass through unchanged)."""
     mean_vals = params["mean"]
     std_vals = params["std"]
@@ -447,9 +451,9 @@ def unnormalize_values_meanstd(
     std_vals = params["std"]
     unnormalized = np.zeros_like(normalized_values)
     mask = std_vals != 0
-    unnormalized[..., mask] = normalized_values[..., mask] * std_vals[
-        ..., mask
-    ] + mean_vals[..., mask]
+    unnormalized[..., mask] = (
+        normalized_values[..., mask] * std_vals[..., mask] + mean_vals[..., mask]
+    )
     unnormalized[..., ~mask] = normalized_values[..., ~mask]
     return unnormalized
 

@@ -113,9 +113,7 @@ class GR00TN17ProcessorConfig(PretrainedConfig):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "image_crop_size", _tuple2(self.image_crop_size))
-        object.__setattr__(
-            self, "image_target_size", _tuple2(self.image_target_size)
-        )
+        object.__setattr__(self, "image_target_size", _tuple2(self.image_target_size))
         if self.shortest_image_edge is not None and self.shortest_image_edge <= 0:
             raise ValueError("shortest_image_edge must be positive when set.")
         if self.crop_fraction is not None and self.crop_fraction <= 0:
@@ -129,9 +127,7 @@ class GR00TN17BackboneConfig(PretrainedConfig):
     """Cosmos-Reason2 / Qwen3-VL backbone knobs."""
 
     model_name: str = "nvidia/Cosmos-Reason2-2B"
-    qwen3vl: Qwen3VLConfig | None = field(
-        default_factory=_default_gr00t_qwen3vl_config
-    )
+    qwen3vl: Qwen3VLConfig | None = field(default_factory=_default_gr00t_qwen3vl_config)
     backbone_model_type: str = "qwen"
     model_revision: str | None = None
     backbone_embedding_dim: int = 2048
@@ -335,9 +331,7 @@ class GR00TN17Config(PretrainedConfig):
 
     model_type: str = "Gr00tN1d7"
     model_dtype: str = "bfloat16"
-    processor: GR00TN17ProcessorConfig = field(
-        default_factory=GR00TN17ProcessorConfig
-    )
+    processor: GR00TN17ProcessorConfig = field(default_factory=GR00TN17ProcessorConfig)
     backbone: GR00TN17BackboneConfig = field(default_factory=GR00TN17BackboneConfig)
     action_head: GR00TN17ActionHeadConfig = field(
         default_factory=GR00TN17ActionHeadConfig
@@ -382,7 +376,9 @@ class GR00TN17Config(PretrainedConfig):
 
     def __post_init__(self) -> None:
         if self.model_type != "Gr00tN1d7":
-            raise ValueError(f"expected model_type='Gr00tN1d7', got {self.model_type!r}.")
+            raise ValueError(
+                f"expected model_type='Gr00tN1d7', got {self.model_type!r}."
+            )
         if not self.model_dtype:
             raise ValueError("model_dtype must be non-empty.")
         if self.action_head.dit.output_dim != self.action_head.hidden_size:

@@ -60,7 +60,9 @@ class GR00TN17WS1Scheduler(Scheduler):
         self.model = model
         self.model.eval()
         self.max_batch_size = int(max_batch_size)
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
         self.use_cuda_graph = bool(use_cuda_graph)
         self.backbone_runner = GR00TN17BackboneRunner(model)
         self.action_head_runner = GR00TN17ActionHeadRunner(

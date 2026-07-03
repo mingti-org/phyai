@@ -225,9 +225,8 @@ def _has_local_tokenizer_files(path: Path) -> bool:
     """Whether ``path`` can satisfy ``AutoTokenizer.from_pretrained(path)``."""
     if not path.is_dir() or not (path / "tokenizer_config.json").exists():
         return False
-    return (
-        (path / "tokenizer.json").exists()
-        or ((path / "vocab.json").exists() and (path / "merges.txt").exists())
+    return (path / "tokenizer.json").exists() or (
+        (path / "vocab.json").exists() and (path / "merges.txt").exists()
     )
 
 
@@ -388,7 +387,10 @@ class GR00TProcessor:
         state_data = {key: observation.state[key] for key in state_keys}
         if self.exclude_state:
             normalized_states = torch.cat(
-                [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys],
+                [
+                    torch.from_numpy(np.zeros_like(state_data[key]))
+                    for key in state_keys
+                ],
                 dim=-1,
             )
         else:
@@ -406,7 +408,10 @@ class GR00TProcessor:
             self.max_state_dim - normalized_states.shape[-1],
         )
         normalized_states = torch.cat(
-            [normalized_states, torch.zeros(padding_shape, dtype=normalized_states.dtype)],
+            [
+                normalized_states,
+                torch.zeros(padding_shape, dtype=normalized_states.dtype),
+            ],
             dim=-1,
         )
         batch = normalized_states.shape[0]
@@ -416,9 +421,7 @@ class GR00TProcessor:
                 f"Action horizon {action_horizon} exceeds "
                 f"max_action_horizon {self.max_action_horizon}."
             )
-        action_mask = torch.zeros(
-            (batch, self.max_action_horizon), dtype=torch.float32
-        )
+        action_mask = torch.zeros((batch, self.max_action_horizon), dtype=torch.float32)
         action_mask[:, :action_horizon] = 1.0
         embodiment_id = torch.full(
             (batch,),
@@ -468,7 +471,9 @@ class GR00TProcessor:
 
     # -------------------------------------------- #
 
-    def preprocess(self, observation: GR00TObservation | dict[str, Any]) -> GR00TProcessedInputs:
+    def preprocess(
+        self, observation: GR00TObservation | dict[str, Any]
+    ) -> GR00TProcessedInputs:
         """Alias for :meth:`process_observation` (accepts a raw dict too)."""
         return self.process_observation(ensure_numpy_observation(observation))
 
@@ -757,7 +762,9 @@ class GR00TProcessor:
 
     def _native_tokenizer(self) -> Any:
         if self._tokenizer is None:
-            tokenizer = get_tokenizer(self.model_name, **self.transformers_loading_kwargs)
+            tokenizer = get_tokenizer(
+                self.model_name, **self.transformers_loading_kwargs
+            )
             tokenizer.padding_side = "left"
             self._tokenizer = tokenizer
         return self._tokenizer

@@ -148,9 +148,9 @@ class GR00TN17QwenRMSNorm(nn.Module):
         hidden_states = hidden_states.float()
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight.to(device=hidden_states.device, dtype=input_dtype) * hidden_states.to(
-            input_dtype
-        )
+        return self.weight.to(
+            device=hidden_states.device, dtype=input_dtype
+        ) * hidden_states.to(input_dtype)
 
 
 class GR00TN17QwenLayerNorm(nn.Module):
@@ -199,7 +199,9 @@ class GR00TN17QwenEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty(num_embeddings, embedding_dim, dtype=params_dtype, device=device),
+            torch.empty(
+                num_embeddings, embedding_dim, dtype=params_dtype, device=device
+            ),
             requires_grad=False,
         )
         _attach_replicated_hf_key(self.weight, f"{prefix}.weight")
@@ -267,18 +269,20 @@ class GR00TN17QwenVisionRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.theta = float(theta)
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        seq = torch.arange(
+            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
         return torch.outer(seq, self.inv_freq)
 
 
 class GR00TN17QwenVisionMLP(nn.Module):
-    def __init__(self, config: Any, *, prefix: str, params_dtype=None, device=None) -> None:
+    def __init__(
+        self, config: Any, *, prefix: str, params_dtype=None, device=None
+    ) -> None:
         super().__init__()
         self.linear_fc1 = GR00TN17QwenLinear(
             config.hidden_size,
@@ -408,9 +412,7 @@ class GR00TN17QwenVisionAttention(nn.Module):
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         query_states, key_states, value_states = (
-            qkv.reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
+            qkv.reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb_vision(
@@ -444,13 +446,17 @@ class GR00TN17QwenVisionAttention(nn.Module):
             ]
             out = torch.cat(outs, dim=1).reshape(seq_length, -1).contiguous()
         else:
-            out = self.attn(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-            ).reshape(seq_length, -1).contiguous()
+            out = (
+                self.attn(
+                    query_states,
+                    key_states,
+                    value_states,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                )
+                .reshape(seq_length, -1)
+                .contiguous()
+            )
         return self.proj(out)
 
 
@@ -643,7 +649,9 @@ class GR00TN17QwenVisionModel(nn.Module):
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+                pos_embed.view(
+                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
+                )
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
@@ -734,16 +742,19 @@ class GR00TN17QwenTextRotaryEmbedding(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
         base = config.rope_theta
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
         )
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.attention_scaling = 1.0
         self.mrope_section = list(config.mrope_section)
 
     @staticmethod
-    def apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+    def apply_interleaved_mrope(
+        freqs: torch.Tensor, mrope_section: list[int]
+    ) -> torch.Tensor:
         freqs_t = freqs[0].clone()
         for dim, offset in enumerate((1, 2), start=1):
             length = mrope_section[dim] * 3
@@ -751,12 +762,16 @@ class GR00TN17QwenTextRotaryEmbedding(nn.Module):
             freqs_t[..., idx] = freqs[dim, ..., idx]
         return freqs_t
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         inv_freq = self.inv_freq.to(device=x.device)
-        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(
-            3, position_ids.shape[1], -1, 1
+        inv_freq_expanded = (
+            inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
         )
         position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
@@ -765,7 +780,9 @@ class GR00TN17QwenTextRotaryEmbedding(nn.Module):
         return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
 
 
-def _apply_text_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _apply_text_rotary(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -786,7 +803,9 @@ class GR00TN17QwenTextAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = int(layer_idx)
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = int(config.num_attention_heads)
         self.num_key_value_heads = int(config.num_key_value_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -863,9 +882,8 @@ class GR00TN17QwenTextAttention(nn.Module):
         v = self.v_proj(hidden_states).view(kv_shape).transpose(1, 2)
         cos, sin = position_embeddings
         q, k = _apply_text_rotary(q, k, cos, sin)
-        if (
-            attention_mask is None
-            and (self.attention_backend != "flashinfer" or q.is_cuda)
+        if attention_mask is None and (
+            self.attention_backend != "flashinfer" or q.is_cuda
         ):
             out = self.attn(
                 q.transpose(1, 2),
@@ -887,7 +905,9 @@ class GR00TN17QwenTextAttention(nn.Module):
 
 
 class GR00TN17QwenTextMLP(nn.Module):
-    def __init__(self, config: Any, *, prefix: str, params_dtype=None, device=None) -> None:
+    def __init__(
+        self, config: Any, *, prefix: str, params_dtype=None, device=None
+    ) -> None:
         super().__init__()
         self.gate_proj = GR00TN17QwenLinear(
             config.hidden_size,
@@ -1045,10 +1065,19 @@ class GR00TN17QwenTextModel(nn.Module):
         else:
             causal = text_position_ids[:, None, :] > text_position_ids[:, :, None]
             causal = causal[:, None, :, :].to(device=inputs_embeds.device)
-        mask = torch.zeros(batch, 1, seq_len, seq_len, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        mask = torch.zeros(
+            batch,
+            1,
+            seq_len,
+            seq_len,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
         mask = mask.masked_fill(causal, min_dtype)
         if attention_mask is not None:
-            key_padding = attention_mask[:, None, None, :].to(device=inputs_embeds.device).bool()
+            key_padding = (
+                attention_mask[:, None, None, :].to(device=inputs_embeds.device).bool()
+            )
             mask = mask.masked_fill(~key_padding, min_dtype)
         return mask
 
@@ -1147,7 +1176,9 @@ class GR00TN17QwenTextModel(nn.Module):
             rope_position_ids = position_ids
         else:
             text_position_ids = position_ids
-            rope_position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+            rope_position_ids = position_ids[None, ...].expand(
+                3, position_ids.shape[0], -1
+            )
         attention_mask_4d = self._causal_mask(
             inputs_embeds, attention_mask, text_position_ids
         )
@@ -1237,9 +1268,12 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
         position_width = torch.arange(llm_grid_w, device=device) + start_position
         position_height = torch.arange(llm_grid_h, device=device) + start_position
         position_width = position_width.repeat(llm_grid_h * llm_grid_t)
-        position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
+        position_height = position_height.repeat_interleave(llm_grid_w).repeat(
+            llm_grid_t
+        )
         position_temporal = (
-            position_temporal.repeat_interleave(llm_grid_h * llm_grid_w) + start_position
+            position_temporal.repeat_interleave(llm_grid_h * llm_grid_w)
+            + start_position
         )
         return torch.stack([position_temporal, position_height, position_width], dim=0)
 
@@ -1252,7 +1286,9 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = torch.repeat_interleave(
+                video_grid_thw, video_grid_thw[:, 0], dim=0
+            )
             video_grid_thw[:, 0] = 1
         spatial_merge_size = self.config.vision.spatial_merge_size
         position_ids = torch.zeros(
@@ -1273,7 +1309,9 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
                 current_input_ids = current_input_ids[attention_mask[batch_idx].bool()]
                 input_type = input_type[attention_mask[batch_idx].bool()]
             groups = []
-            for key, group in itertools.groupby(enumerate(input_type.tolist()), lambda x: x[1]):
+            for key, group in itertools.groupby(
+                enumerate(input_type.tolist()), lambda x: x[1]
+            ):
                 group = list(group)
                 groups.append((key, group[0][0], group[-1][0] + 1))
             current_pos = 0
@@ -1301,11 +1339,17 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
                     current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
             llm_positions = torch.cat(pos_list, dim=1).reshape(3, -1)
             if attention_mask is not None:
-                position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions
+                position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = (
+                    llm_positions
+                )
             else:
                 position_ids[:, batch_idx] = llm_positions
-            mrope_position_deltas.append(llm_positions.max() + 1 - len(current_input_ids))
-        return position_ids, torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+            mrope_position_deltas.append(
+                llm_positions.max() + 1 - len(current_input_ids)
+            )
+        return position_ids, torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)
 
     def get_image_features(
         self,
@@ -1315,8 +1359,12 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
         vision_output = self.visual(
             pixel_values.type(self.visual.dtype), grid_thw=image_grid_thw
         )
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        vision_output.pooler_output = torch.split(vision_output.pooler_output, split_sizes)
+        split_sizes = (
+            image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
+        ).tolist()
+        vision_output.pooler_output = torch.split(
+            vision_output.pooler_output, split_sizes
+        )
         return vision_output
 
     def get_placeholder_mask(
@@ -1401,7 +1449,9 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         if mm_token_type_ids is None:
             mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
-            mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == self.config.image_token_id, 1)
+            mm_token_type_ids = mm_token_type_ids.masked_fill(
+                input_ids == self.config.image_token_id, 1
+            )
         seq_len = int(input_ids.shape[1])
         if graph_seq_len_buckets is not None:
             bucket = next((b for b in graph_seq_len_buckets if seq_len <= b), None)
@@ -1421,10 +1471,7 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
                 image_grid_thw=image_grid_thw,
                 attention_mask=attention_mask,
             )
-        if not (
-            position_ids.ndim == 3
-            and position_ids.shape[0] == 3
-        ):
+        if not (position_ids.ndim == 3 and position_ids.shape[0] == 3):
             return None
         pixel_values = pixel_values.type(self.visual.dtype)
         device = pixel_values.device
@@ -1512,7 +1559,9 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
         :meth:`backbone_graph_plan`; this module holds no graph state."""
         if mm_token_type_ids is None:
             mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
-            mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == self.config.image_token_id, 1)
+            mm_token_type_ids = mm_token_type_ids.masked_fill(
+                input_ids == self.config.image_token_id, 1
+            )
         if position_ids is None:
             position_ids, _ = self.get_rope_index(
                 input_ids,
