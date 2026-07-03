@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ext = ["phyai-ext"]
+fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

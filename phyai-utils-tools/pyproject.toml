@@ -14,8 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# fastokens accelerates phyai_utils_tools.tokenizer (moved here with the
-# processors; the engine no longer tokenizes).
+# fastokens accelerates phyai_utils_tools.tokenizer and processor utilities.
 fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
