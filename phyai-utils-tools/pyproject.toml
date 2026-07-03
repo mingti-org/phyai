@@ -7,9 +7,16 @@ dependencies = [
     "av>=14.0.0",
     "huggingface-hub",
     "numpy",
+    "pillow",
     "torch==2.11",
+    "torchvision",
     "transformers==5.8.1",
 ]
+
+[project.optional-dependencies]
+# fastokens accelerates phyai_utils_tools.tokenizer (moved here with the
+# processors; the engine no longer tokenizes).
+fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
