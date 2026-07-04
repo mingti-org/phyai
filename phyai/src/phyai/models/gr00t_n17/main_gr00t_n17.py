@@ -20,7 +20,7 @@ from phyai.utils import load_config
 from phyai.weights import load_pretrained
 
 
-_GR00TN17_PENDING_DROP_PREFIXES: tuple[str, ...] = ()
+_GR00TN17_PENDING_DROP_PREFIXES: tuple[str, ...] = ("backbone.model.lm_head.weight",)
 
 
 def gr00t_n17_weight_remap(name: str) -> str | None:
@@ -176,4 +176,4 @@ class GR00TN17Entry(Entry):
         return {"model": self.model}
 
 
-__all__ = ["GR00TN17Args", "GR00TN17Entry"]
+__all__ = ["GR00TN17Args", "GR00TN17Entry", "gr00t_n17_weight_remap"]

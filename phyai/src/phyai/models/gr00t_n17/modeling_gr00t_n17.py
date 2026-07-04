@@ -12,15 +12,11 @@ without importing the reference implementation:
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass
 import math
-import os
 from typing import Any
 
 import torch
-from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -32,58 +28,22 @@ from phyai.models.gr00t_n17.configuration_gr00t_n17 import (
     GR00TN17DiTConfig,
     GR00TN17VLSelfAttentionConfig,
 )
+from phyai.models.gr00t_n17.qwen3_vl_adapter import GR00TN17Qwen3VLBackbone
+from phyai.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from phyai.utils import load_config
 from phyai.weights.shards import replicated
 
 
-_DIT_SDPA_MATH_ENV = "PHYAI_GR00T_DIT_SDPA_MATH"
-_STATIC_CATEGORY_IDS: ContextVar[tuple[int, ...] | None] = ContextVar(
-    "_STATIC_CATEGORY_IDS",
-    default=None,
-)
-
-
-@contextmanager
-def gr00t_n17_static_category_ids(category_ids: tuple[int, ...] | None):
-    """Specialize embodiment-conditioned linears for fixed CUDA graphs."""
-    token = _STATIC_CATEGORY_IDS.set(category_ids)
-    try:
-        yield
-    finally:
-        _STATIC_CATEGORY_IDS.reset(token)
-
-
-def _dit_math_sdpa_context():
-    """SDPA backend context for the action-head DiT ``"sdpa"`` attention.
-
-    Default: a no-op context, so SDPA uses PyTorch's normal dispatch (flash for
-    the unmasked self-attn, mem-efficient for the masked cross-attn on A40);
-    end-to-end action parity vs the reference is ~0.0221.
-
-    Set ``PHYAI_GR00T_DIT_SDPA_MATH`` truthy to force the **math** SDPA backend
-    instead — mirroring the official Isaac-GR00T DiT, which forces math via
-    ``sdp_kernel(enable_flash=False)`` / ``GR00T_DIT_SDPA_MODE=math`` — for
-    tighter parity (~0.0190). Both paths are CUDA-graph captureable (the backend
-    is baked in at capture). Neither is byte-exact: ``"eager"`` does the softmax
-    in fp32 and is the only 0.0166 path (kept for debug).
-    """
-    if os.environ.get(_DIT_SDPA_MATH_ENV, "").strip().lower() in {
-        "1",
-        "on",
-        "true",
-        "yes",
-    }:
-        return sdpa_kernel([SDPBackend.MATH])
-    return nullcontext()
-
-
 # ============================================================================ #
-# 1. Shared primitives / PhyAI wrappers                                         #
+# Shared primitives / PhyAI wrappers                                            #
 # ============================================================================ #
 
 
 def _resolve_backbone_config_dir(
-    model_name_or_path: str, *, local_files_only: bool = False
+    model_name_or_path: str,
+    *,
+    local_files_only: bool = False,
+    revision: str | None = None,
 ) -> str:
     """Return a local directory holding the backbone ``config.json``.
 
@@ -103,6 +63,7 @@ def _resolve_backbone_config_dir(
 
     return snapshot_download(
         model_name_or_path,
+        revision=revision,
         allow_patterns=["config.json"],
         local_files_only=local_files_only,
     )
@@ -114,7 +75,11 @@ class GR00TN17NativeImplementationError(NotImplementedError):
 
 @dataclass(frozen=True)
 class GR00TN17BackboneOutput:
-    """Backbone output consumed by the action head."""
+    """Backbone output consumed by the action head.
+
+    ``image_mask`` keeps the historical field name, but it is a visual-token
+    mask: image tokens and video tokens are both ``True`` when present.
+    """
 
     backbone_features: torch.Tensor
     backbone_attention_mask: torch.Tensor
@@ -123,7 +88,13 @@ class GR00TN17BackboneOutput:
 
 @dataclass(frozen=True)
 class GR00TN17ActionInput:
-    """Action-head inputs after preprocessing."""
+    """Action-head inputs after preprocessing.
+
+    ``action_mask`` is applied to the final normalized action chunk. Supported
+    shapes cover valid action dimensions and/or horizon steps:
+    ``(action_dim,)``, ``(B, action_dim)``, ``(B, action_horizon)``, and
+    ``(B, action_horizon, action_dim)``.
+    """
 
     state: torch.Tensor
     embodiment_id: torch.Tensor
@@ -177,7 +148,15 @@ class GR00TN17LayerNorm(PhyAILayerNorm):
         self.prefix = ""
         self.register_buffer("weight", torch.ones(self.hidden_size), persistent=False)
         self.register_buffer("_zero_beta", None, persistent=False)
-        self._layernorm = None
+        self._layernorm = self._load_kernel(self.backend)
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        if not self.elementwise_affine:
+            weight = self._buffers.get("weight")
+            if weight is not None and weight.dtype != torch.float32:
+                self._buffers["weight"] = weight.float()
+        return self
 
     @staticmethod
     def _torch_layer_norm(
@@ -206,17 +185,18 @@ class GR00TN17LayerNorm(PhyAILayerNorm):
         if self.elementwise_affine:
             return super().forward(x)
 
-        if self._layernorm is None:
-            from phyai_kernel import layernorm
-
-            self._layernorm = layernorm
         needs_reshape = x.dim() != 2
         if needs_reshape:
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])
+        if self.weight.device != x.device or self.weight.dtype != torch.float32:
+            raise RuntimeError(
+                "non-affine GR00TN17LayerNorm weight must be moved to the input "
+                "device and kept in fp32 before forward."
+            )
         out = self._layernorm(
             x,
-            self.weight.to(device=x.device, dtype=torch.float32),
+            self.weight,
             None,
             self.variance_epsilon,
         )
@@ -239,7 +219,7 @@ class GR00TN17ReplicatedEmbedding(nn.Module):
 
 
 # ============================================================================ #
-# 2. Qwen3-VL backbone boundary                                                 #
+# Qwen3-VL backbone boundary                                                    #
 # ============================================================================ #
 
 
@@ -257,10 +237,10 @@ class GR00TN17Backbone(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config.backbone
-        self.qwen3vl_model = qwen3vl_model
         self.params_dtype = params_dtype
         self.target_device = torch.device(device) if device is not None else None
         self.transformers_loading_kwargs = dict(transformers_loading_kwargs or {})
+        self.qwen3vl_model = self._build_qwen3vl_model(qwen3vl_model)
 
     def prepare_input(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return dict(batch)
@@ -282,22 +262,11 @@ class GR00TN17Backbone(nn.Module):
         for name, param in qwen3vl_model.named_parameters():
             _attach_replicated_hf_key(param, f"backbone.model.{name}")
 
-    def _load_qwen3vl_model(self) -> nn.Module:
-        if not self.config.use_native_qwen3vl:
-            raise RuntimeError(
-                "GR00T-N1.7 no longer supports the Transformers Qwen3VL model "
-                "fallback. Set use_native_qwen3vl=True and use the PhyAI native "
-                "backbone."
-            )
-        if self.qwen3vl_model is not None:
-            self._truncate_language_layers(self.qwen3vl_model)
-            self._attach_qwen3vl_weight_keys(self.qwen3vl_model)
-            return self.qwen3vl_model
-
-        from phyai.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-        from phyai.models.gr00t_n17.qwen3_vl_native import (
-            GR00TN17NativeQwen3VLForConditionalGeneration,
-        )
+    def _build_qwen3vl_model(self, qwen3vl_model: nn.Module | None) -> nn.Module:
+        if qwen3vl_model is not None:
+            self._truncate_language_layers(qwen3vl_model)
+            self._attach_qwen3vl_weight_keys(qwen3vl_model)
+            return qwen3vl_model
 
         qwen3vl_config = self.config.qwen3vl
         if qwen3vl_config is None:
@@ -306,6 +275,7 @@ class GR00TN17Backbone(nn.Module):
                 local_files_only=self.transformers_loading_kwargs.get(
                     "local_files_only", False
                 ),
+                revision=self.config.model_revision,
             )
             qwen3vl_config = load_config(backbone_dir, Qwen3VLConfig)
         dtype = (
@@ -313,23 +283,38 @@ class GR00TN17Backbone(nn.Module):
             if self.config.load_bf16
             else self.params_dtype or torch.get_default_dtype()
         )
-        self.qwen3vl_model = GR00TN17NativeQwen3VLForConditionalGeneration(
+        return GR00TN17Qwen3VLBackbone(
             qwen3vl_config,
             select_layer=self.config.select_layer,
             params_dtype=dtype,
             device=self.target_device,
             attention_backend=self.config.attention_backend,
         ).eval()
+
+    def _load_qwen3vl_model(self) -> nn.Module:
+        """Return the already-built Qwen3-VL backbone.
+
+        Kept for existing callers that need to force construction before weight
+        loading; construction now happens in ``__init__`` so this method has no
+        forward-time side effects.
+        """
         return self.qwen3vl_model
 
     def prepare_position_ids(
         self, batch: dict[str, torch.Tensor]
     ) -> torch.Tensor | None:
         vl_input = self.prepare_input(batch)
-        required_keys = ("input_ids", "attention_mask", "image_grid_thw")
+        required_keys = ("input_ids", "attention_mask")
         missing = [key for key in required_keys if key not in vl_input]
         if missing:
             raise KeyError(f"backbone position-id inputs missing keys: {missing}")
+        has_image = "image_grid_thw" in vl_input
+        has_video = "video_grid_thw" in vl_input
+        if not has_image and not has_video:
+            raise KeyError(
+                "backbone position-id inputs require image_grid_thw, "
+                "video_grid_thw, or both."
+            )
         qwen3vl_model = self._load_qwen3vl_model()
         native_model = getattr(qwen3vl_model, "model", None)
         if native_model is None or not hasattr(native_model, "get_rope_index"):
@@ -342,52 +327,58 @@ class GR00TN17Backbone(nn.Module):
             mm_token_type_ids = mm_token_type_ids.masked_fill(
                 input_ids == image_token_id, 1
             )
+            video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
+            if video_token_id is not None:
+                mm_token_type_ids = mm_token_type_ids.masked_fill(
+                    input_ids == int(video_token_id), 2
+                )
         position_ids, _ = native_model.get_rope_index(
             input_ids,
-            mm_token_type_ids,
-            image_grid_thw=vl_input["image_grid_thw"],
+            image_grid_thw=vl_input.get("image_grid_thw"),
+            video_grid_thw=vl_input.get("video_grid_thw"),
             attention_mask=vl_input["attention_mask"],
+            mm_token_type_ids=mm_token_type_ids,
         )
         return position_ids
-
-    def _ensure_qwen3vl_model_device(self, device: torch.device) -> None:
-        qwen3vl_model = self._load_qwen3vl_model()
-        try:
-            current_device = next(iter(qwen3vl_model.parameters())).device
-        except StopIteration:
-            return
-        if current_device == device:
-            return
-        if self.config.load_bf16:
-            qwen3vl_model.to(device=device, dtype=torch.bfloat16)
-        else:
-            qwen3vl_model.to(device=device)
 
     def _prepare_model_inputs(
         self, inputs: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         vl_input = self.prepare_input(inputs)
-        required_keys = (
-            "input_ids",
-            "attention_mask",
-            "pixel_values",
-            "image_grid_thw",
-        )
+        required_keys = ("input_ids", "attention_mask")
         optional_keys = (
             "mm_token_type_ids",
             "position_ids",
+            "pixel_values",
+            "image_grid_thw",
             "pixel_values_videos",
             "video_grid_thw",
-            "second_per_grid_ts",
         )
         missing = [key for key in required_keys if key not in vl_input]
         if missing:
             raise KeyError(f"backbone inputs missing keys: {missing}")
+        has_image = "pixel_values" in vl_input or "image_grid_thw" in vl_input
+        has_video = "pixel_values_videos" in vl_input or "video_grid_thw" in vl_input
+        if has_image and not {"pixel_values", "image_grid_thw"} <= vl_input.keys():
+            raise KeyError(
+                "backbone image inputs require both pixel_values and image_grid_thw."
+            )
+        if (
+            has_video
+            and not {"pixel_values_videos", "video_grid_thw"} <= vl_input.keys()
+        ):
+            raise KeyError(
+                "backbone video inputs require both pixel_values_videos and "
+                "video_grid_thw."
+            )
+        if not has_image and not has_video:
+            raise KeyError(
+                "backbone inputs require image tensors, video tensors, or both."
+            )
         model_inputs = {key: vl_input[key] for key in required_keys}
         model_inputs.update(
             {key: vl_input[key] for key in optional_keys if key in vl_input}
         )
-        self._ensure_qwen3vl_model_device(model_inputs["input_ids"].device)
         return model_inputs
 
     def _build_output(
@@ -395,30 +386,26 @@ class GR00TN17Backbone(nn.Module):
         backbone_features: torch.Tensor,
         model_inputs: dict[str, torch.Tensor],
     ) -> GR00TN17BackboneOutput:
-        image_token_id = self._load_qwen3vl_model().config.image_token_id
+        qwen3vl_model = self._load_qwen3vl_model()
+        if "mm_token_type_ids" in model_inputs:
+            visual_mask = model_inputs["mm_token_type_ids"] != 0
+        else:
+            image_token_id = qwen3vl_model.config.image_token_id
+            visual_mask = model_inputs["input_ids"] == image_token_id
+            video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
+            if video_token_id is not None:
+                visual_mask = visual_mask | (
+                    model_inputs["input_ids"] == int(video_token_id)
+                )
         return GR00TN17BackboneOutput(
             backbone_features=backbone_features,
             backbone_attention_mask=model_inputs["attention_mask"] == 1,
-            image_mask=model_inputs["input_ids"] == image_token_id,
+            image_mask=visual_mask,
         )
 
     def backbone_graph_plan(self, inputs: dict[str, torch.Tensor]):
-        """Runner-facing host-sync preamble for the single backbone CUDA graph.
-
-        Returns ``(core_fn, buffers, key, model_inputs)`` for the **runner** to
-        capture/replay, or ``None`` when the input is not graph-eligible (the
-        runner then falls back to the eager :meth:`forward`). The capture itself
-        lives in the runner, so the backbone modeling holds no graph state.
-        """
-        model_inputs = self._prepare_model_inputs(inputs)
-        plan = self._load_qwen3vl_model().model.backbone_graph_plan(
-            **model_inputs,
-            graph_seq_len_buckets=self.config.graph_seq_len_buckets,
-        )
-        if plan is None:
-            return None
-        core_fn, buffers, key, graph_model_inputs = plan
-        return core_fn, buffers, key, graph_model_inputs
+        del inputs
+        return None
 
     def build_graph_output(
         self,
@@ -431,18 +418,20 @@ class GR00TN17Backbone(nn.Module):
     def forward(self, inputs: dict[str, torch.Tensor]) -> GR00TN17BackboneOutput:
         model_inputs = self._prepare_model_inputs(inputs)
         outputs = self._load_qwen3vl_model()(**model_inputs)
-        # Pre-final-norm features, returned directly by the text model so the
-        # value is valid under CUDA-graph replay (a forward_pre_hook would not
-        # re-fire). Falls back to the last hidden state for any model variant
-        # that does not expose it.
-        backbone_features = getattr(outputs, "pre_norm_hidden_state", None)
-        if backbone_features is None:
-            backbone_features = outputs.hidden_states[-1]
+        # Native Qwen3-VL returns the pre-final-norm tensor directly when the
+        # GR00T adapter requests it. Keep the object fallback for injected test
+        # doubles and older backbone wrappers.
+        if torch.is_tensor(outputs):
+            backbone_features = outputs
+        else:
+            backbone_features = getattr(outputs, "pre_norm_hidden_state", None)
+            if backbone_features is None:
+                backbone_features = outputs.hidden_states[-1]
         return self._build_output(backbone_features, model_inputs)
 
 
 # ============================================================================ #
-# 6. Action head: encoders + DiT + decoder                                      #
+# Action head: encoders + DiT + decoder                                         #
 # ============================================================================ #
 
 
@@ -512,13 +501,22 @@ def _attach_replicated_hf_key(param: nn.Parameter, hf_key: str) -> None:
     param.weight_loader = replicated()
 
 
-def _is_cuda_graph_capturing(x: torch.Tensor) -> bool:
-    if not x.is_cuda:
-        return False
-    try:
-        return bool(torch.cuda.is_current_stream_capturing())
-    except RuntimeError:
-        return False
+def _check_integer_category_ids(cat_ids: torch.Tensor, *, name: str) -> None:
+    if (
+        torch.is_floating_point(cat_ids)
+        or torch.is_complex(cat_ids)
+        or cat_ids.dtype == torch.bool
+    ):
+        raise TypeError(f"{name} must be an integer tensor, got {cat_ids.dtype}.")
+
+
+def _invalid_category_values(
+    cat_ids: torch.Tensor,
+    *,
+    num_categories: int,
+) -> torch.Tensor:
+    bad = (cat_ids < 0) | (cat_ids >= num_categories)
+    return cat_ids[bad].detach().cpu()
 
 
 def _replicated_linear(linear: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
@@ -684,7 +682,13 @@ class GR00TN17CategorySpecificLinear(nn.Module):
             first.bias.hf_keys = [(f"{prefix}.b", None)]
             first.bias.weight_loader = _load_bias
 
-    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cat_ids: torch.Tensor,
+        *,
+        static_cat_ids: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(f"x must have shape (B, T, C), got {tuple(x.shape)}.")
         if cat_ids.ndim != 1 or cat_ids.shape[0] != x.shape[0]:
@@ -692,7 +696,7 @@ class GR00TN17CategorySpecificLinear(nn.Module):
                 "cat_ids must have shape (B,), got "
                 f"{tuple(cat_ids.shape)} for batch {x.shape[0]}."
             )
-        static_cat_ids = _STATIC_CATEGORY_IDS.get()
+        _check_integer_category_ids(cat_ids, name="cat_ids")
         if static_cat_ids is not None:
             if len(static_cat_ids) != x.shape[0]:
                 raise ValueError(
@@ -713,16 +717,17 @@ class GR00TN17CategorySpecificLinear(nn.Module):
                 for row, cat_id in enumerate(static_cat_ids)
             ]
             return torch.cat(outs, dim=0)
-        if _is_cuda_graph_capturing(x):
-            out = x.new_zeros(x.shape[0], x.shape[1], self.output_dim)
-            cat_ids = cat_ids.long()
-            for cat_id, linear in enumerate(self.linears):
-                cat_out = _replicated_linear(linear, x)
-                mask = (cat_ids == cat_id).to(dtype=cat_out.dtype)[:, None, None]
-                out = out + cat_out * mask
-            return out
-        out = x.new_empty(x.shape[0], x.shape[1], self.output_dim)
         cat_ids = cat_ids.long()
+        invalid = _invalid_category_values(
+            cat_ids,
+            num_categories=self.num_categories,
+        )
+        if invalid.numel() > 0:
+            raise ValueError(
+                f"cat_ids must be in [0, {self.num_categories}); got invalid "
+                f"values: {invalid.tolist()}."
+            )
+        out = x.new_empty(x.shape[0], x.shape[1], self.output_dim)
         for cat_id, linear in enumerate(self.linears):
             indices = torch.nonzero(cat_ids == cat_id, as_tuple=False).flatten()
             if indices.numel() == 0:
@@ -751,8 +756,15 @@ class GR00TN17CategorySpecificMLP(nn.Module):
             num_categories, hidden_dim, output_dim
         )
 
-    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
-        return self.layer2(torch.relu(self.layer1(x, cat_ids)), cat_ids)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cat_ids: torch.Tensor,
+        *,
+        static_cat_ids: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        hidden = self.layer1(x, cat_ids, static_cat_ids=static_cat_ids)
+        return self.layer2(torch.relu(hidden), cat_ids, static_cat_ids=static_cat_ids)
 
 
 class GR00TN17MultiEmbodimentActionEncoder(nn.Module):
@@ -777,6 +789,8 @@ class GR00TN17MultiEmbodimentActionEncoder(nn.Module):
         actions: torch.Tensor,
         timesteps: torch.Tensor,
         cat_ids: torch.Tensor,
+        *,
+        static_cat_ids: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         if actions.ndim != 3:
             raise ValueError(
@@ -788,12 +802,12 @@ class GR00TN17MultiEmbodimentActionEncoder(nn.Module):
                 "timesteps must have shape (B,), got "
                 f"{tuple(timesteps.shape)} for batch {batch}."
             )
-        a_emb = self.W1(actions, cat_ids)
+        a_emb = self.W1(actions, cat_ids, static_cat_ids=static_cat_ids)
         tau = timesteps[:, None].expand(batch, horizon)
         tau_emb = self.pos_encoding(tau).to(dtype=a_emb.dtype)
         x = torch.cat((a_emb, tau_emb), dim=-1)
-        x = _swish(self.W2(x, cat_ids))
-        return self.W3(x, cat_ids)
+        x = _swish(self.W2(x, cat_ids, static_cat_ids=static_cat_ids))
+        return self.W3(x, cat_ids, static_cat_ids=static_cat_ids)
 
 
 class GR00TN17TimestepEncoder(nn.Module):
@@ -941,31 +955,25 @@ class GR00TN17Attention(nn.Module):
             encoder_hidden_states is None
             and attention_mask is None
             and (not self.training or self.dropout == 0.0)
+            and self.attention_backend != "eager"
             and (self.attention_backend != "flashinfer" or q.is_cuda)
         )
-        # The "sdpa" backend runs under a forced-math SDPA context (mirroring the
-        # official DiT) so both the self-attn (prefill) and masked cross-attn
-        # paths match the reference numerics; other backends use no context.
-        ctx = (
-            _dit_math_sdpa_context()
-            if self.attention_backend == "sdpa"
-            else nullcontext()
-        )
-        with ctx:
-            if use_prefill:
-                return self.prefill_attention(
-                    q.transpose(1, 2),
-                    k.transpose(1, 2),
-                    v.transpose(1, 2),
-                ).transpose(1, 2)
-            if self.attention_backend == "eager":
-                return self._eager_attention(q, k, v, attention_mask=attention_mask)
-            # "sdpa" and the "flashinfer" masked cross-attn fallback both land
-            # here: flashinfer's prefill kernel only covers the unmasked
-            # self-attention path, so its masked cross-attention falls back to
-            # SDPA rather than the fp32 eager path (which is reserved for the
-            # explicit "eager" parity-validation backend).
-            return self._sdpa_attention(q, k, v, attention_mask=attention_mask)
+        if use_prefill:
+            return self.prefill_attention(q, k, v)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if self.attention_backend == "eager":
+            out = self._eager_attention(q, k, v, attention_mask=attention_mask)
+            return out.transpose(1, 2)
+        # "sdpa" and the "flashinfer" masked cross-attn fallback both land
+        # here: flashinfer's prefill kernel only covers the unmasked
+        # self-attention path, so its masked cross-attention falls back to
+        # SDPA rather than the fp32 eager path (which is reserved for the
+        # explicit "eager" parity-validation backend).
+        out = self._sdpa_attention(q, k, v, attention_mask=attention_mask)
+        return out.transpose(1, 2)
 
     def forward(
         self,
@@ -982,7 +990,6 @@ class GR00TN17Attention(nn.Module):
 
         q = self.to_q(hidden_states)
         q = q.view(batch, target_len, self.num_heads, self.head_dim)
-        q = q.transpose(1, 2)
         if encoder_kv is None:
             k, v = self.project_kv(key_value_states)
         else:
@@ -995,7 +1002,7 @@ class GR00TN17Attention(nn.Module):
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attn_mask,
         )
-        out = out.transpose(1, 2).contiguous().view(batch, target_len, self.inner_dim)
+        out = out.contiguous().view(batch, target_len, self.inner_dim)
         return self.to_out(out)
 
     def project_kv(
@@ -1006,7 +1013,7 @@ class GR00TN17Attention(nn.Module):
         v = self.to_v(key_value_states)
         k = k.view(batch, source_len, self.num_heads, self.head_dim)
         v = v.view(batch, source_len, self.num_heads, self.head_dim)
-        return k.transpose(1, 2), v.transpose(1, 2)
+        return k, v
 
 
 class GR00TN17FeedForward(nn.Module):
@@ -1177,7 +1184,7 @@ class GR00TN17DiT(nn.Module):
 
 
 class GR00TN17AlternateVLDiT(GR00TN17DiT):
-    """DiT variant alternating text-token and image-token cross attention."""
+    """DiT variant alternating text-token and visual-token cross attention."""
 
     def __init__(
         self,
@@ -1200,18 +1207,27 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
         return_all_hidden_states: bool = False,
         image_mask: torch.Tensor | None = None,
         backbone_attention_mask: torch.Tensor | None = None,
+        image_attention_mask: torch.Tensor | None = None,
+        non_image_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        if image_mask is None:
-            raise ValueError("image_mask is required when use_alternate_vl_dit=True.")
-        if backbone_attention_mask is None:
-            if encoder_attention_mask is None:
-                backbone_attention_mask = torch.ones_like(image_mask, dtype=torch.bool)
-            else:
-                backbone_attention_mask = encoder_attention_mask
-
         temb = self.timestep_encoder(timestep)
-        image_attention_mask = image_mask.bool() & backbone_attention_mask.bool()
-        non_image_attention_mask = (~image_mask.bool()) & backbone_attention_mask.bool()
+        if image_attention_mask is None or non_image_attention_mask is None:
+            if image_mask is None:
+                raise ValueError(
+                    "image_mask is required when use_alternate_vl_dit=True."
+                )
+            if backbone_attention_mask is None:
+                if encoder_attention_mask is None:
+                    raise ValueError(
+                        "backbone_attention_mask is required when "
+                        "use_alternate_vl_dit=True."
+                    )
+                else:
+                    backbone_attention_mask = encoder_attention_mask
+            image_attention_mask = image_mask.bool() & backbone_attention_mask.bool()
+            non_image_attention_mask = (
+                ~image_mask.bool()
+            ) & backbone_attention_mask.bool()
         all_hidden_states = [hidden_states]
         cross_idx = 0
         for idx, block in enumerate(self.transformer_blocks):
@@ -1429,6 +1445,8 @@ class GR00TN17ActionHead(nn.Module):
         self,
         backbone_output: GR00TN17BackboneOutput,
         action_input: GR00TN17ActionInput,
+        *,
+        static_cat_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         backbone_output = self.process_backbone_output(backbone_output)
         state = action_input.state
@@ -1443,11 +1461,18 @@ class GR00TN17ActionHead(nn.Module):
                 f"{self.config.state_history_length}, got {state.shape[1]}."
             )
         state = state.reshape(state.shape[0], 1, -1)
-        state_features = self.state_encoder(state, action_input.embodiment_id)
+        state_features = self.state_encoder(
+            state,
+            action_input.embodiment_id,
+            static_cat_ids=static_cat_ids,
+        )
         return backbone_output.backbone_features, state_features
 
     def _positioned_action_features(
-        self, action_features: torch.Tensor
+        self,
+        action_features: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         if not self.config.add_pos_embed:
             return action_features
@@ -1456,65 +1481,103 @@ class GR00TN17ActionHead(nn.Module):
                 "action horizon exceeds max_seq_len for position embedding: "
                 f"{action_features.shape[1]} > {self.config.max_seq_len}."
             )
-        pos_ids = torch.arange(
-            action_features.shape[1], dtype=torch.long, device=action_features.device
-        )
-        return action_features + self.position_embedding(pos_ids).unsqueeze(0)
+        return action_features + self.position_embedding(position_ids).unsqueeze(0)
 
-    def get_action_with_features(
-        self,
-        *,
-        backbone_features: torch.Tensor,
-        state_features: torch.Tensor,
-        embodiment_id: torch.Tensor,
-        backbone_output: GR00TN17BackboneOutput,
-        action_input: GR00TN17ActionInput,
-        noise: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        actions = self.prepare_initial_actions(backbone_features, noise=noise)
-        encoder_kv_cache = self.precompute_dit_encoder_kv(backbone_features)
-        for step in range(self.num_inference_timesteps):
-            actions = self.denoise_step(
-                actions,
-                step,
-                backbone_features=backbone_features,
-                state_features=state_features,
-                embodiment_id=embodiment_id,
-                backbone_output=backbone_output,
-                action_input=action_input,
-                encoder_kv_cache=encoder_kv_cache,
+    def validate_embodiment_id(self, embodiment_id: torch.Tensor) -> None:
+        if embodiment_id.ndim != 1:
+            raise ValueError(
+                f"embodiment_id must have shape (B,), got {tuple(embodiment_id.shape)}."
             )
-        return actions
+        _check_integer_category_ids(embodiment_id, name="embodiment_id")
+        invalid = _invalid_category_values(
+            embodiment_id.long(),
+            num_categories=self.config.max_num_embodiments,
+        )
+        if invalid.numel() > 0:
+            raise ValueError(
+                "embodiment_id must be in "
+                f"[0, {self.config.max_num_embodiments}); got invalid values: "
+                f"{invalid.tolist()}."
+            )
 
-    def precompute_dit_encoder_kv(
+    @staticmethod
+    def _action_mask_shape_error(
+        action_mask: torch.Tensor,
+        *,
+        batch_size: int,
+        action_horizon: int,
+        action_dim: int,
+    ) -> ValueError:
+        return ValueError(
+            "action_mask must have shape (action_dim,), (B, action_dim), "
+            "(B, action_horizon), or (B, action_horizon, action_dim); got "
+            f"{tuple(action_mask.shape)} for expected actions "
+            f"{(batch_size, action_horizon, action_dim)}."
+        )
+
+    def validate_action_mask(
         self,
-        backbone_features: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
-        return self.model.precompute_encoder_kv(backbone_features)
+        action_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+    ) -> None:
+        if action_mask is None:
+            return
+        h = self.action_horizon
+        d = self.action_dim
+        shape = tuple(action_mask.shape)
+        valid = (
+            (action_mask.ndim == 1 and shape == (d,))
+            or (action_mask.ndim == 2 and shape == (batch_size, d))
+            or (action_mask.ndim == 2 and shape == (batch_size, h))
+            or (action_mask.ndim == 3 and shape == (batch_size, h, d))
+        )
+        if not valid:
+            raise self._action_mask_shape_error(
+                action_mask,
+                batch_size=batch_size,
+                action_horizon=h,
+                action_dim=d,
+            )
+
+    def apply_action_mask(
+        self,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if action_mask is None:
+            return actions
+        mask = action_mask.to(device=actions.device)
+        batch_size, horizon, action_dim = actions.shape
+        if mask.ndim == 1 and mask.shape[0] == action_dim:
+            return actions * mask.to(dtype=actions.dtype)[None, None, :]
+        if mask.ndim == 2 and tuple(mask.shape) == (batch_size, action_dim):
+            return actions * mask.to(dtype=actions.dtype)[:, None, :]
+        if mask.ndim == 2 and tuple(mask.shape) == (batch_size, horizon):
+            return actions * mask.to(dtype=actions.dtype).unsqueeze(-1)
+        if mask.ndim == 3 and tuple(mask.shape) == tuple(actions.shape):
+            return actions * mask.to(dtype=actions.dtype)
+        raise self._action_mask_shape_error(
+            action_mask,
+            batch_size=batch_size,
+            action_horizon=horizon,
+            action_dim=action_dim,
+        )
 
     def prepare_initial_actions(
         self,
         backbone_features: torch.Tensor,
         *,
-        noise: torch.Tensor | None = None,
+        noise: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = backbone_features.shape[0]
         device = backbone_features.device
-        if noise is None:
-            return torch.randn(
-                batch_size,
-                self.action_horizon,
-                self.action_dim,
-                dtype=backbone_features.dtype,
-                device=device,
+        expected = (batch_size, self.action_horizon, self.action_dim)
+        if tuple(noise.shape) != expected:
+            raise ValueError(
+                f"noise must have shape {expected}, got {tuple(noise.shape)}."
             )
-        else:
-            expected = (batch_size, self.action_horizon, self.action_dim)
-            if tuple(noise.shape) != expected:
-                raise ValueError(
-                    f"noise must have shape {expected}, got {tuple(noise.shape)}."
-                )
-            return noise.to(device=device, dtype=backbone_features.dtype)
+        return noise.to(device=device, dtype=backbone_features.dtype)
 
     def denoise_step(
         self,
@@ -1526,33 +1589,37 @@ class GR00TN17ActionHead(nn.Module):
         embodiment_id: torch.Tensor,
         backbone_output: GR00TN17BackboneOutput,
         action_input: GR00TN17ActionInput,
+        timesteps: torch.Tensor,
+        dt: float,
+        action_position_ids: torch.Tensor,
         encoder_kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+        static_cat_ids: tuple[int, ...] | None = None,
+        image_mask: torch.Tensor | None = None,
+        image_attention_mask: torch.Tensor | None = None,
+        non_image_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        dt = 1.0 / self.num_inference_timesteps
-        vel_strength = torch.ones_like(actions)
         if action_input.action is not None:
             raise GR00TN17NativeImplementationError(
                 "RTC/inpainting action inputs are not implemented in the native "
                 "GR00T-N1.7 action-head path yet."
             )
 
-        batch_size = actions.shape[0]
-        device = actions.device
-        t_cont = step / float(self.num_inference_timesteps)
-        t_discretized = int(t_cont * self.num_timestep_buckets)
-        timesteps = torch.full(
-            (batch_size,), t_discretized, dtype=torch.long, device=device
+        action_features = self.action_encoder(
+            actions,
+            timesteps,
+            embodiment_id,
+            static_cat_ids=static_cat_ids,
         )
-        action_features = self.action_encoder(actions, timesteps, embodiment_id)
-        action_features = self._positioned_action_features(action_features)
+        action_features = self._positioned_action_features(
+            action_features,
+            position_ids=action_position_ids,
+        )
         sa_embs = torch.cat((state_features, action_features), dim=1)
         if self.config.use_alternate_vl_dit:
-            image_mask = backbone_output.image_mask
             if image_mask is None:
-                image_mask = torch.zeros(
-                    backbone_output.backbone_attention_mask.shape,
-                    dtype=torch.bool,
-                    device=device,
+                raise ValueError(
+                    "image_mask must be provided by the runner when "
+                    "use_alternate_vl_dit=True."
                 )
             model_output = self.model(
                 sa_embs,
@@ -1561,6 +1628,8 @@ class GR00TN17ActionHead(nn.Module):
                 encoder_kv_cache=encoder_kv_cache,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
+                image_attention_mask=image_attention_mask,
+                non_image_attention_mask=non_image_attention_mask,
             )
         else:
             model_output = self.model(
@@ -1570,42 +1639,26 @@ class GR00TN17ActionHead(nn.Module):
                 encoder_attention_mask=backbone_output.backbone_attention_mask,
                 encoder_kv_cache=encoder_kv_cache,
             )
-        pred = self.action_decoder(model_output, embodiment_id)
+        pred = self.action_decoder(
+            model_output,
+            embodiment_id,
+            static_cat_ids=static_cat_ids,
+        )
         pred_velocity = pred[:, -self.action_horizon :]
-        return actions + dt * pred_velocity * vel_strength
-
-    def get_action(
-        self,
-        backbone_output: GR00TN17BackboneOutput,
-        action_input: GR00TN17ActionInput,
-        *,
-        noise: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        backbone_features, state_features = self._encode_features(
-            backbone_output, action_input
-        )
-        return self.get_action_with_features(
-            backbone_features=backbone_features,
-            state_features=state_features,
-            embodiment_id=action_input.embodiment_id,
-            backbone_output=backbone_output,
-            action_input=action_input,
-            noise=noise,
-        )
+        return actions + dt * pred_velocity
 
 
 # ============================================================================ #
-# 7. Top-level GR00TN17Model                                                    #
+# Top-level GR00TN17Model                                                       #
 # ============================================================================ #
 
 
 class GR00TN17Model(nn.Module):
     """GR00T-N1.7 parameter container.
 
-    This class does not own scheduler state and does
-    not expose a monolithic ``forward``. Runners will call the backbone
-    and action-head pieces independently once their native
-    implementations land.
+    This class does not own scheduler state and does not expose a monolithic
+    ``forward`` or ``get_action``. Runners call the backbone and action-head
+    pieces independently, and own denoising control flow.
     """
 
     def __init__(
@@ -1620,6 +1673,10 @@ class GR00TN17Model(nn.Module):
         super().__init__()
         self.config = config
         self.params_dtype = params_dtype or torch.get_default_dtype()
+        self.action_head = GR00TN17ActionHead(config)
+        self.action_head.attach_hf_keys("action_head")
+        if device is not None or params_dtype is not None:
+            self.action_head.to(device=device, dtype=self.params_dtype)
         self.backbone = GR00TN17Backbone(
             config,
             qwen3vl_model=backbone_qwen3vl_model,
@@ -1627,10 +1684,8 @@ class GR00TN17Model(nn.Module):
             device=device,
             transformers_loading_kwargs=backbone_transformers_loading_kwargs,
         )
-        self.action_head = GR00TN17ActionHead(config)
-        self.action_head.attach_hf_keys("action_head")
-        if device is not None or params_dtype is not None:
-            self.to(device=device, dtype=self.params_dtype)
+        if device is not None:
+            self.backbone.to(device=device)
 
     def prepare_backbone_input(
         self, inputs: dict[str, torch.Tensor]
@@ -1658,37 +1713,69 @@ class GR00TN17Model(nn.Module):
         *,
         device: torch.device | str | None = None,
     ) -> tuple[dict[str, torch.Tensor], GR00TN17ActionInput]:
-        target_device = torch.device(device) if device is not None else self.device
+        explicit_device = torch.device(device) if device is not None else None
+        backbone_device = explicit_device or self.backbone_device
+        action_device = explicit_device or self.action_device
+        backbone_dtype = self.backbone_dtype
+        action_dtype = self.action_dtype
+        action_keys = {"state", "action", "action_mask", "embodiment_id"}
 
-        def move(value: torch.Tensor) -> torch.Tensor:
+        def move(key: str, value: torch.Tensor) -> torch.Tensor:
+            target_device = action_device if key in action_keys else backbone_device
             if torch.is_floating_point(value):
-                return value.to(device=target_device, dtype=self.dtype)
+                target_dtype = action_dtype if key in action_keys else backbone_dtype
+                return value.to(device=target_device, dtype=target_dtype)
             return value.to(device=target_device)
 
         moved = {
-            key: move(value) if isinstance(value, torch.Tensor) else value
+            key: move(key, value) if isinstance(value, torch.Tensor) else value
             for key, value in dict(inputs).items()
         }
         return self.prepare_backbone_input(moved), self.prepare_action_input(moved)
 
-    def get_action(
-        self,
-        inputs: dict[str, torch.Tensor],
-        *,
-        noise: torch.Tensor | None = None,
-        device: torch.device | str | None = None,
-    ) -> torch.Tensor:
-        backbone_inputs, action_inputs = self.prepare_input(inputs, device=device)
-        backbone_output = self.backbone(backbone_inputs)
-        return self.action_head.get_action(backbone_output, action_inputs, noise=noise)
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        for tensor in module.parameters():
+            return tensor.device
+        for tensor in module.buffers():
+            return tensor.device
+        return torch.device("cpu")
+
+    @staticmethod
+    def _module_dtype(module: nn.Module) -> torch.dtype:
+        for tensor in module.parameters():
+            if torch.is_floating_point(tensor):
+                return tensor.dtype
+        for tensor in module.buffers():
+            if torch.is_floating_point(tensor):
+                return tensor.dtype
+        return torch.get_default_dtype()
+
+    @property
+    def backbone_device(self) -> torch.device:
+        return self._module_device(self.backbone)
+
+    @property
+    def backbone_dtype(self) -> torch.dtype:
+        if self.config.backbone.load_bf16:
+            return torch.bfloat16
+        return self._module_dtype(self.backbone)
+
+    @property
+    def action_device(self) -> torch.device:
+        return self._module_device(self.action_head)
+
+    @property
+    def action_dtype(self) -> torch.dtype:
+        return self._module_dtype(self.action_head)
 
     @property
     def device(self) -> torch.device:
-        return next(iter(self.parameters())).device
+        return self.action_device
 
     @property
     def dtype(self) -> torch.dtype:
-        return next(iter(self.parameters())).dtype
+        return self.action_dtype
 
 
 __all__ = [

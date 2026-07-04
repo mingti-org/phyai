@@ -198,15 +198,11 @@ class GR00TN17DiTConfig(PretrainedConfig):
     output_dim: int = 1024
     interleave_self_attention: bool = True
     # Dense no-cache attention backend used inside GR00T's action head.
-    # Default "sdpa" (phyai's recommended F.scaled_dot_product_attention), using
-    # PyTorch's normal SDPA dispatch (flash / mem-efficient). CUDA-graph
-    # captureable. Parity vs the reference: plain sdpa ~0.0221. For tighter parity
-    # set ``PHYAI_GR00T_DIT_SDPA_MATH=1`` to force the math backend (mirroring the
-    # official DiT's ``enable_flash=False`` / ``GR00T_DIT_SDPA_MODE=math``) ->
-    # ~0.0190. Neither is byte-exact: "eager" does the softmax in fp32 and is the
-    # only 0.0166 path (selected explicitly for parity validation). "flashinfer"
-    # is supported for unmasked self-attention; masked cross-attn falls back to
-    # the sdpa path (GR00T uses key-only masks).
+    # Default "sdpa" uses PyTorch's normal SDPA dispatch and is CUDA-graph
+    # captureable. With the shared Qwen3-VL backbone path, end-to-end official
+    # parity is ~0.0095. "eager" keeps an fp32 softmax path for debugging.
+    # "flashinfer" is supported for unmasked self-attention; masked cross-attn
+    # falls back to the sdpa path (GR00T uses key-only masks).
     attention_backend: str = "sdpa"
 
     def __post_init__(self) -> None:

@@ -655,6 +655,7 @@ class Qwen3VLTextModel(nn.Module):
         attn_ctx: "ARAttnCtx | None" = None,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        return_pre_norm_hidden_state: bool = False,
     ) -> torch.Tensor:
         """The caller computes ``(cos, sin)`` once via
         :meth:`RotaryEmbedding.get_cos_sin` and threads them through every layer.
@@ -675,6 +676,8 @@ class Qwen3VLTextModel(nn.Module):
                     visual_pos_masks,
                     deepstack_visual_embeds[layer_idx],
                 )
+        if return_pre_norm_hidden_state:
+            return hidden_states
         return self.norm(hidden_states)
 
 
@@ -739,6 +742,7 @@ class Qwen3VLModel(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute ``(position_ids[3,B,S], mrope_deltas[B,1])``.
 
@@ -772,12 +776,15 @@ class Qwen3VLModel(nn.Module):
 
         for batch_idx, current_input_ids in enumerate(input_ids):
             ids = current_input_ids
+            if mm_token_type_ids is None:
+                token_type = torch.zeros_like(ids)
+                token_type[ids == image_token_id] = 1
+                token_type[ids == video_token_id] = 2
+            else:
+                token_type = mm_token_type_ids[batch_idx]
             if attention_mask is not None:
                 ids = ids[attention_mask[batch_idx].bool()]
-            # token type: 0 text, 1 image, 2 video
-            token_type = torch.zeros_like(ids)
-            token_type[ids == image_token_id] = 1
-            token_type[ids == video_token_id] = 2
+                token_type = token_type[attention_mask[batch_idx].bool()]
 
             groups = []
             for key, group in itertools.groupby(
@@ -927,10 +934,12 @@ class Qwen3VLModel(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_pre_norm_hidden_state: bool = False,
     ) -> torch.Tensor:
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
             self.embed_multimodal(
@@ -945,7 +954,11 @@ class Qwen3VLModel(nn.Module):
         if position_ids is None:
             if image_grid_thw is not None or video_grid_thw is not None:
                 position_ids, _ = self.get_rope_index(
-                    input_ids, image_grid_thw, video_grid_thw, attention_mask
+                    input_ids,
+                    image_grid_thw,
+                    video_grid_thw,
+                    attention_mask,
+                    mm_token_type_ids,
                 )
             else:
                 seq = torch.arange(input_ids.shape[1], device=input_ids.device)
@@ -958,6 +971,7 @@ class Qwen3VLModel(nn.Module):
             sin=sin,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            return_pre_norm_hidden_state=return_pre_norm_hidden_state,
         )
 
 
@@ -982,12 +996,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         device: torch.device | str | None = None,
         text_attn_kind: str = "attention",
         vision_attn_backend: str | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
         self.config = config
+        model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = Qwen3VLModel(
             config,
             params_dtype=params_dtype,
@@ -995,7 +1011,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             attn_backend=attn_backend,
             norm_backend=norm_backend,
             device=device,
-            prefix="model",
+            prefix=model_prefix,
             text_attn_kind=text_attn_kind,
             vision_attn_backend=vision_attn_backend,
         )
@@ -1010,7 +1026,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             bias=False,
             tied_weight=tied,
             params_dtype=params_dtype,
-            prefix="lm_head",
+            prefix=f"{prefix}.lm_head" if prefix else "lm_head",
         )
 
     def forward(
@@ -1019,20 +1035,26 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_pre_norm_hidden_state: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            mm_token_type_ids=mm_token_type_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            return_pre_norm_hidden_state=return_pre_norm_hidden_state,
         )
+        if return_pre_norm_hidden_state:
+            return hidden_states
         logits = self.lm_head(hidden_states)
         return logits
 

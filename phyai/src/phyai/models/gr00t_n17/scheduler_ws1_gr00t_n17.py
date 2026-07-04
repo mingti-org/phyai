@@ -3,9 +3,10 @@
 The engine is strict about inputs: image transform, Qwen3-VL
 patchify, tokenization, and state/action normalization are the **caller's**
 responsibility (see ``phyai_utils_tools.models.gr00t.GR00TProcessor``). The
-scheduler consumes the already-prepared model-input tensors and returns the raw
-normalized action chunk; the caller decodes it back to physical units. This
-keeps the engine free of any processor / tokenizer dependency.
+scheduler consumes the already-prepared model-input tensors and returns the
+normalized action chunk after applying any request ``action_mask``; the caller
+decodes it back to physical units. This keeps the engine free of any processor /
+tokenizer dependency.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ class GR00TN17Request:
     (``GR00TProcessor.process_observation(obs).tensors``): ``state`` /
     ``embodiment_id`` / ``action_mask`` plus the VLM tensors (``pixel_values``,
     ``input_ids``, ``attention_mask``, ``image_grid_thw``, ``mm_token_type_ids``).
+    ``action_mask`` is optional but, when present, is applied to the normalized
+    action chunk before it is returned.
     ``noise`` optionally seeds the flow-matching sampler for deterministic runs.
     """
 
@@ -44,7 +47,7 @@ class GR00TN17WS1Scheduler(Scheduler):
 
     The scheduler owns runner order and the denoising request lifecycle. It does
     not own preprocessing: it receives prepared tensors and emits the normalized
-    action chunk.
+    masked normalized action chunk.
     """
 
     def __init__(
@@ -64,7 +67,11 @@ class GR00TN17WS1Scheduler(Scheduler):
             torch.device(device) if device is not None else torch.device("cpu")
         )
         self.use_cuda_graph = bool(use_cuda_graph)
-        self.backbone_runner = GR00TN17BackboneRunner(model)
+        self.backbone_runner = GR00TN17BackboneRunner(
+            model,
+            device=self.device,
+            use_cuda_graph=self.use_cuda_graph,
+        )
         self.action_head_runner = GR00TN17ActionHeadRunner(
             model,
             max_batch_size=self.max_batch_size,
@@ -81,8 +88,9 @@ class GR00TN17WS1Scheduler(Scheduler):
         """Run backbone + action-head denoising; return the normalized action.
 
         Returns the ``(B, action_horizon, max_action_dim)`` normalized action
-        chunk. The caller maps it back to physical units via the processor's
-        ``decode_action`` (which needs the per-request ``raw_state``).
+        chunk after applying any request ``action_mask``. The caller maps it
+        back to physical units via the processor's ``decode_action`` (which
+        needs the per-request ``raw_state``).
         """
         tensors = request.tensors
         batch = tensors["state"].shape[0]

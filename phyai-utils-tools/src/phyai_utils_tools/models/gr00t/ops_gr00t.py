@@ -450,7 +450,8 @@ def unnormalize_values_meanstd(
     mean_vals = params["mean"]
     std_vals = params["std"]
     unnormalized = np.zeros(
-        normalized_values.shape, dtype=np.result_type(normalized_values.dtype, np.float32)
+        normalized_values.shape,
+        dtype=np.result_type(normalized_values.dtype, np.float32),
     )
     mask = std_vals != 0
     unnormalized[..., mask] = (
