@@ -45,6 +45,22 @@ def env_path(name: str) -> Path | None:
     return Path(value) if value else None
 
 
+class LazySummary(dict):
+    def __init__(self, values_fn_or_items):
+        if callable(values_fn_or_items):
+            super().__init__()
+            self._values_fn = values_fn_or_items
+        else:
+            super().__init__(values_fn_or_items)
+            self._values_fn = None
+
+    def items(self):
+        if self._values_fn is None:
+            return super().items()
+        summary = summarize(self._values_fn())
+        return (summary or {}).items()
+
+
 def summarize(values: list[float]) -> dict[str, float] | None:
     if not values:
         return None
@@ -108,7 +124,6 @@ def make_setup_fn(args: argparse.Namespace):
         model.predict(images, prompt=args.prompt)
         torch.cuda.synchronize()
 
-        internal_summary: dict[str, Any] = {}
         call_count = 0
 
         def step() -> None:
@@ -120,21 +135,19 @@ def make_setup_fn(args: argparse.Namespace):
             # step to make the common runner's timing boundary conservative.
             torch.cuda.synchronize()
             call_count += 1
-            if call_count > args.n_warmup and hasattr(model._pipe, "latency_records"):
-                stats = summarize([float(x) for x in model._pipe.latency_records])
-                internal_summary.clear()
-                if stats is not None:
-                    internal_summary.update(stats)
 
         spec = bnb.BenchSpec(
             name="flashrt_pi05",
             step_callable=step,
             teardown_callable=lambda: None,
         )
-        # extras_fn receives this object before timed steps run; keeping a
-        # mutable dict lets the final BenchResult include FlashRT's own
-        # internal latency_records after the timed loop completes.
-        spec.flashrt_internal_latency_ms = internal_summary  # type: ignore[attr-defined]
+        spec.flashrt_internal_latency_ms = LazySummary(
+            lambda: (
+                [float(x) for x in model._pipe.latency_records]
+                if hasattr(model, "_pipe") and hasattr(model._pipe, "latency_records")
+                else []
+            )
+        )  # type: ignore[attr-defined]
         return spec
 
     return setup_fn

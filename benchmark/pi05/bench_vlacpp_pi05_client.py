@@ -48,6 +48,23 @@ def env_path(name: str) -> Path | None:
     return Path(value) if value else None
 
 
+class LazySummaryMap(dict):
+    def __init__(self, samples_or_items):
+        if isinstance(samples_or_items, dict) and all(
+            isinstance(v, list) for v in samples_or_items.values()
+        ):
+            super().__init__()
+            self._samples = samples_or_items
+        else:
+            super().__init__(samples_or_items)
+            self._samples = None
+
+    def items(self):
+        if self._samples is None:
+            return super().items()
+        return {key: summarize(values) for key, values in self._samples.items()}.items()
+
+
 def summarize(values: list[float]) -> dict[str, float] | None:
     if not values:
         return None
@@ -118,13 +135,7 @@ def make_setup_fn(args: argparse.Namespace):
             "server_prefill_latency_ms": [],
             "server_denoise_latency_ms": [],
         }
-        phase_summary: dict[str, Any] = {}
         call_count = 0
-
-        def update_phase_summary() -> None:
-            phase_summary.clear()
-            for key, values in phase_samples.items():
-                phase_summary[key] = summarize(values)
 
         def step() -> None:
             nonlocal call_count
@@ -146,7 +157,6 @@ def make_setup_fn(args: argparse.Namespace):
             phase_samples["server_denoise_latency_ms"].append(
                 float(r.latency_ms_denoise)
             )
-            update_phase_summary()
 
         def teardown() -> None:
             sock = getattr(client, "sock", None)
@@ -158,9 +168,7 @@ def make_setup_fn(args: argparse.Namespace):
             step_callable=step,
             teardown_callable=teardown,
         )
-        # Attach dynamic summary for extras_fn. The runner copies the dict after
-        # timed steps finish, so it records the final server phase statistics.
-        spec.vlacpp_phase_summary = phase_summary  # type: ignore[attr-defined]
+        spec.vlacpp_phase_summary = LazySummaryMap(phase_samples)  # type: ignore[attr-defined]
         return spec
 
     return setup_fn

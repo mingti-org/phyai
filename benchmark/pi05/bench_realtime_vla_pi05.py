@@ -44,7 +44,7 @@ def env_path(name: str) -> Path | None:
     return Path(value) if value else None
 
 
-def load_checkpoint(path: Path, flashrt_root: Path | None):
+def load_checkpoint(path: Path, flashrt_root: Path | None, trust_pickle: bool):
     if path.is_dir():
         path = path / "model.safetensors"
     if path.suffix == ".safetensors":
@@ -59,8 +59,17 @@ def load_checkpoint(path: Path, flashrt_root: Path | None):
         return convert_pi05_safetensors(path)
     if path.suffix in {".pt", ".pth"}:
         return torch.load(path, map_location="cpu", weights_only=True)
-    with path.open("rb") as f:
-        return pickle.load(f)
+    if path.suffix in {".pkl", ".pickle"}:
+        if not trust_pickle:
+            raise ValueError(
+                "Refusing to load pickle checkpoint without --trust-pickle-checkpoint. "
+                "Only use that flag for checkpoints from a trusted source."
+            )
+        with path.open("rb") as f:
+            return pickle.load(f)  # nosec B301: guarded by --trust-pickle-checkpoint.
+    raise ValueError(
+        f"Unsupported checkpoint suffix {path.suffix!r}; expected .safetensors, .pt, .pth, .pkl, or .pickle"
+    )
 
 
 def make_setup_fn(args: argparse.Namespace):
@@ -72,7 +81,9 @@ def make_setup_fn(args: argparse.Namespace):
         if batch_size != 1:
             raise ValueError("realtime-vla PI0.5 wrapper supports only batch_size=1")
 
-        checkpoint = load_checkpoint(args.checkpoint, args.flashrt_root)
+        checkpoint = load_checkpoint(
+            args.checkpoint, args.flashrt_root, args.trust_pickle_checkpoint
+        )
         if "language_embeds" not in checkpoint:
             # Latency-only fallback for checkpoints that do not include prompt embeds.
             checkpoint["language_embeds"] = torch.randn(
@@ -163,6 +174,11 @@ def main() -> None:
         type=Path,
         required=True,
         help="realtime-vla .pkl/.pt checkpoint, PI0.5 model.safetensors, or a directory containing model.safetensors.",
+    )
+    parser.add_argument(
+        "--trust-pickle-checkpoint",
+        action="store_true",
+        help="Allow loading .pkl/.pickle checkpoints. Only use with trusted checkpoint files.",
     )
     parser.add_argument("--num-views", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=50)
