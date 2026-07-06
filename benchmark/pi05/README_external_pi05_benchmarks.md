@@ -1,4 +1,4 @@
-# External PI0.5 Benchmark Wrappers
+# External PI0.5 benchmark wrappers
 
 This directory contains wrappers for benchmarking external PI0.5 inference runtimes with the same high-level settings and common `bench_n_batch.py` runner used by the PhyAI PI0.5 benchmarks.
 
@@ -6,18 +6,18 @@ These wrappers do **not** call PhyAI's engine. Each wrapper calls the target run
 
 | File | Runtime measured | Main timing scope |
 | --- | --- | --- |
-| `bench_flashrt_pi05.py` | FlashRT | direct `Pi05TorchFrontendRtx.set_prompt(...); infer(...)` hot path after the first graph-building infer |
+| `bench_flashrt_pi05.py` | FlashRT | direct `Pi05TorchFrontendRtx.infer(...)` hot path after `set_prompt`, calibration, and the first graph-building infer |
 | `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward()` hot path |
 | `bench_vlacpp_pi05_client.py` | vla.cpp | ZMQ client request wall time; server phase timings are stored in JSONL `extras` |
 
-## Common Settings
+## Common settings
 
 Use the same settings across machines when possible:
 
 | Setting | Recommended value |
 | --- | --- |
 | batch size | 1 via `--batch-sizes 1` |
-| views | 2 real views |
+| views | 2 synthetic views / camera streams for latency-only runs |
 | chunk size | 50 for strict comparison rows |
 | warmup | 100 via `--n-warmup` |
 | timed iterations | 100 via `--n-timed` |
@@ -44,7 +44,7 @@ The examples below use placeholders rather than host-specific paths:
 | `<TOKENIZER_DIR_OR_ID>` | Local tokenizer directory or HF id used by vla.cpp client |
 | `<LIBERO_STATS_JSON>` | Local LIBERO `meta/stats.json` for PI0.5 state tokenization |
 
-## Environment Setup
+## Environment setup
 
 These scripts assume the target runtime can already be imported or executed. Keep each official repo at a known commit and record it with your results.
 
@@ -81,13 +81,7 @@ export VLACPP_ROOT=<VLACPP_REPO>
 
 Prepare the PI0.5 GGUF model, `mmproj` GGUF, tokenizer, and LIBERO `stats.json` before running. Prefer local tokenizer and stats paths to avoid network/auth issues.
 
-Quick smoke test after setup:
-
-```bash
-python benchmark/pi05/bench_flashrt_pi05.py ... --n-warmup 1 --n-timed 1
-python benchmark/pi05/bench_realtime_vla_pi05.py ... --n-warmup 1 --n-timed 1
-python benchmark/pi05/bench_vlacpp_pi05_client.py ... --n-warmup 1 --n-timed 1
-```
+Quick smoke test after setup: use the runtime-specific command below, replace the real output path with a scratch file, and set `--n-warmup 1 --n-timed 1`.
 
 ## FlashRT
 
