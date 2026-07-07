@@ -51,6 +51,14 @@
             ]
           },
           {
+            "group": "Quantization",
+            "pages": [
+              "quantization/overview",
+              "quantization/configuration",
+              "quantization/internals"
+            ]
+          },
+          {
             "group": "Tools",
             "pages": [
               "tools/tensor-dump"
@@ -101,6 +109,14 @@
                   "zh/models/cosmos/processors"
                 ]
               }
+            ]
+          },
+          {
+            "group": "量化",
+            "pages": [
+              "zh/quantization/overview",
+              "zh/quantization/configuration",
+              "zh/quantization/internals"
             ]
           },
           {

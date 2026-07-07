@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 350"
+     font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.3"/>
+      <feOffset dx="0" dy="1"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.15"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="960" height="350" fill="#fafbfc"/>
+
+  <!-- Brand mark -->
+  <text x="26" y="32" font-size="12" font-weight="700" fill="#003399">PhyAI</text>
+  <text x="26" y="47" font-size="9" fill="#999">© All rights reserved</text>
+
+  <!-- Title -->
+  <text x="480" y="38" text-anchor="middle" font-size="21" font-weight="600" fill="#1a1a1a">Quantization: a layered design</text>
+  <text x="480" y="59" text-anchor="middle" font-size="12" fill="#667">Semantics decided first; the physical format is lowered only when hardware is known.</text>
+
+  <!-- ============ 4-STAGE SPINE ============ -->
+  <!-- Stage 1: Checkpoint config -->
+  <rect x="30" y="100" width="186" height="74" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="1.8" filter="url(#soft-shadow)"/>
+  <text x="123" y="127" text-anchor="middle" font-size="15" font-weight="700" fill="#475569">Checkpoint config</text>
+  <text x="123" y="147" text-anchor="middle" font-size="10.5" fill="#64748b">config.json ·</text>
+  <text x="123" y="162" text-anchor="middle" font-size="10.5" fill="#64748b">hf_quant_config.json</text>
+
+  <!-- Stage 2: QuantPlan (indigo — matches example plan strip) -->
+  <rect x="268" y="100" width="186" height="74" rx="10" fill="#f4f7fb" stroke="#003399" stroke-width="1.8" filter="url(#soft-shadow)"/>
+  <text x="361" y="127" text-anchor="middle" font-size="15" font-weight="700" fill="#003399">QuantPlan</text>
+  <text x="361" y="147" text-anchor="middle" font-size="10.5" fill="#556">ordered rule table</text>
+  <text x="361" y="162" text-anchor="middle" font-size="10" fill="#8aa" font-family="ui-monospace, 'SF Mono', Menlo, monospace">plan.py</text>
+
+  <!-- Stage 3: QuantScheme (green — semantic) -->
+  <rect x="506" y="100" width="186" height="74" rx="10" fill="#f3f9ec" stroke="#7CB342" stroke-width="1.8" filter="url(#soft-shadow)"/>
+  <text x="599" y="127" text-anchor="middle" font-size="15" font-weight="700" fill="#5b8a30">QuantScheme</text>
+  <text x="599" y="147" text-anchor="middle" font-size="10.5" fill="#556">what: dtype, granularity</text>
+  <text x="599" y="162" text-anchor="middle" font-size="10" fill="#9cb384" font-family="ui-monospace, 'SF Mono', Menlo, monospace">scheme.py</text>
+
+  <!-- Stage 4: WeightSpec (orange — physical, matches example fp8) -->
+  <rect x="744" y="100" width="186" height="74" rx="10" fill="#fff7ef" stroke="#F5A65B" stroke-width="1.8" filter="url(#soft-shadow)"/>
+  <text x="837" y="127" text-anchor="middle" font-size="15" font-weight="700" fill="#d98530">WeightSpec</text>
+  <text x="837" y="147" text-anchor="middle" font-size="10.5" fill="#556">how: layout, kernel</text>
+  <text x="837" y="162" text-anchor="middle" font-size="10" fill="#cbab84" font-family="ui-monospace, 'SF Mono', Menlo, monospace">bf16 / fp8 / nvfp4</text>
+
+  <!-- Arrows + transform labels -->
+  <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 216 137 L 260 137"/><path d="M 255 133 L 260 137 L 255 141"/>
+    <path d="M 454 137 L 498 137"/><path d="M 493 133 L 498 137 L 493 141"/>
+    <path d="M 692 137 L 736 137"/><path d="M 731 133 L 736 137 L 731 141"/>
+  </g>
+  <text x="238" y="128" text-anchor="middle" font-size="10" fill="#777" font-style="italic">importers</text>
+  <text x="476" y="128" text-anchor="middle" font-size="10" fill="#777" font-style="italic">resolve()</text>
+  <text x="714" y="128" text-anchor="middle" font-size="10" fill="#d98530" font-style="italic" font-weight="600">materialize()</text>
+
+  <!-- ============ TWO LAYERS ============ -->
+  <!-- Semantic band (device-independent): spans config → scheme -->
+  <rect x="20" y="200" width="672" height="76" rx="10" fill="#f7fbf1" stroke="#d7e8c2" stroke-width="1.3"/>
+  <text x="40" y="224" font-size="12" font-weight="700" fill="#5b8a30" letter-spacing="0.4">SEMANTIC · device-independent</text>
+  <text x="40" y="246" font-size="11" fill="#5c6b4d">Config, plan and scheme describe only what a tensor becomes —</text>
+  <text x="40" y="263" font-size="11" fill="#5c6b4d">no scale layout, no kernel, no device.</text>
+
+  <!-- Physical band (hardware-aware): WeightSpec -->
+  <rect x="710" y="200" width="230" height="76" rx="10" fill="#fff5ea" stroke="#f5d9b8" stroke-width="1.3"/>
+  <text x="726" y="224" font-size="12" font-weight="700" fill="#d98530" letter-spacing="0.4">PHYSICAL · hardware-aware</text>
+  <text x="726" y="246" font-size="11" fill="#8a7050">Storage layout, scales and kernel.</text>
+  <text x="726" y="263" font-size="11" fill="#8a7050">NVFP4 scale layout follows the SM.</text>
+
+  <!-- Boundary marker under the materialize() arrow -->
+  <line x1="701" y1="188" x2="701" y2="286" stroke="#c9c9c9" stroke-width="1.2" stroke-dasharray="3 5"/>
+  <text x="701" y="300" text-anchor="middle" font-size="9.5" fill="#b58a5a" font-style="italic">hardware (sm) enters here</text>
+
+  <!-- Footnote: ties to the example figure -->
+  <text x="20" y="326" font-size="10.5" fill="#8a8f96">Same colors as the companion figure: <tspan fill="#003399" font-weight="600">QuantPlan</tspan> indigo, <tspan fill="#d98530" font-weight="600">WeightSpec / fp8</tspan> orange.</text>
+  <text x="20" y="342" font-size="10.5" fill="#8a8f96">The example zooms into the <tspan fill="#003399" font-weight="600">QuantPlan → WeightSpec</tspan> span with three concrete keys.</text>
+</svg>
