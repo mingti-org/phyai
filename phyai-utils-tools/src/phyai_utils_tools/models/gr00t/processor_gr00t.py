@@ -747,13 +747,6 @@ class GR00TProcessor:
         }
         outputs["pixel_values"] = torch.cat(pixel_chunks, dim=0)
         outputs["image_grid_thw"] = torch.tensor(grid_list, dtype=torch.long)
-        # mm_token_type_ids is 1 at expanded image tokens and 0 elsewhere.
-        input_ids = outputs.get("input_ids")
-        if input_ids is not None:
-            image_id = tokenizer.convert_tokens_to_ids(image_token)
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == image_id] = 1
-            outputs["mm_token_type_ids"] = mm_token_type_ids
         return outputs
 
     def _native_tokenizer(self) -> Any:

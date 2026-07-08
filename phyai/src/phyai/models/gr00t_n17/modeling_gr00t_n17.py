@@ -30,44 +30,12 @@ from phyai.models.gr00t_n17.configuration_gr00t_n17 import (
     GR00TN17VLSelfAttentionConfig,
 )
 from phyai.models.gr00t_n17.qwen3_vl_adapter import GR00TN17Qwen3VLBackbone
-from phyai.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-from phyai.utils import load_config
 from phyai.weights.shards import replicated
 
 
 # ============================================================================ #
 # Shared primitives                                                            #
 # ============================================================================ #
-
-
-def _resolve_backbone_config_dir(
-    model_name_or_path: str,
-    *,
-    local_files_only: bool = False,
-    revision: str | None = None,
-) -> str:
-    """Return a local directory holding the backbone ``config.json``.
-
-    A local directory is used as-is. Otherwise the path is treated as a
-    HuggingFace repo id and resolved against the local hub cache via
-    ``huggingface_hub`` (no ``transformers`` model machinery). With
-    ``local_files_only`` the cached snapshot is used without any network
-    access.
-    """
-    from pathlib import Path
-
-    candidate = Path(model_name_or_path)
-    if candidate.is_dir():
-        return str(candidate)
-
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(
-        model_name_or_path,
-        revision=revision,
-        allow_patterns=["config.json"],
-        local_files_only=local_files_only,
-    )
 
 
 @dataclass(frozen=True)
@@ -150,14 +118,10 @@ class GR00TN17Backbone(nn.Module):
 
         qwen3vl_config = self.config.qwen3vl
         if qwen3vl_config is None:
-            backbone_dir = _resolve_backbone_config_dir(
-                self.config.model_name,
-                local_files_only=self.transformers_loading_kwargs.get(
-                    "local_files_only", False
-                ),
-                revision=self.config.model_revision,
+            raise ValueError(
+                "GR00TN17Backbone requires config.backbone.qwen3vl to be "
+                "resolved before model construction."
             )
-            qwen3vl_config = load_config(backbone_dir, Qwen3VLConfig)
         dtype = (
             torch.bfloat16
             if self.config.load_bf16
@@ -194,25 +158,11 @@ class GR00TN17Backbone(nn.Module):
         native_model = getattr(qwen3vl_model, "model", None)
         if native_model is None or not hasattr(native_model, "get_rope_index"):
             return None
-        input_ids = vl_input["input_ids"]
-        mm_token_type_ids = vl_input.get("mm_token_type_ids")
-        if mm_token_type_ids is None:
-            image_token_id = qwen3vl_model.config.image_token_id
-            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
-            mm_token_type_ids = mm_token_type_ids.masked_fill(
-                input_ids == image_token_id, 1
-            )
-            video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
-            if video_token_id is not None:
-                mm_token_type_ids = mm_token_type_ids.masked_fill(
-                    input_ids == int(video_token_id), 2
-                )
         position_ids, _ = native_model.get_rope_index(
-            input_ids,
+            vl_input["input_ids"],
             image_grid_thw=vl_input.get("image_grid_thw"),
             video_grid_thw=vl_input.get("video_grid_thw"),
             attention_mask=vl_input["attention_mask"],
-            mm_token_type_ids=mm_token_type_ids,
         )
         return position_ids
 
@@ -222,7 +172,6 @@ class GR00TN17Backbone(nn.Module):
         vl_input = self.prepare_input(inputs)
         required_keys = ("input_ids", "attention_mask")
         optional_keys = (
-            "mm_token_type_ids",
             "position_ids",
             "pixel_values",
             "image_grid_thw",
@@ -262,16 +211,13 @@ class GR00TN17Backbone(nn.Module):
         model_inputs: dict[str, torch.Tensor],
     ) -> GR00TN17BackboneOutput:
         qwen3vl_model = self._load_qwen3vl_model()
-        if "mm_token_type_ids" in model_inputs:
-            visual_mask = model_inputs["mm_token_type_ids"] != 0
-        else:
-            image_token_id = qwen3vl_model.config.image_token_id
-            visual_mask = model_inputs["input_ids"] == image_token_id
-            video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
-            if video_token_id is not None:
-                visual_mask = visual_mask | (
-                    model_inputs["input_ids"] == int(video_token_id)
-                )
+        image_token_id = qwen3vl_model.config.image_token_id
+        visual_mask = model_inputs["input_ids"] == image_token_id
+        video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
+        if video_token_id is not None:
+            visual_mask = visual_mask | (
+                model_inputs["input_ids"] == int(video_token_id)
+            )
         return GR00TN17BackboneOutput(
             backbone_features=backbone_features,
             backbone_attention_mask=model_inputs["attention_mask"] == 1,

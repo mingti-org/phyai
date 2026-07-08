@@ -8,7 +8,6 @@ preprocessing, and GR00T state/action normalization. This package has no
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -303,22 +302,15 @@ def qwen3vl_smart_resize(
     Rounds H/W to multiples of ``factor`` while keeping the pixel count in
     ``[min_pixels, max_pixels]`` and the aspect ratio as close as possible.
     """
-    if max(height, width) / min(height, width) > 200:
-        raise ValueError(
-            "absolute aspect ratio must be smaller than 200, got "
-            f"{max(height, width) / min(height, width)}."
-        )
-    h_bar = round(height / factor) * factor
-    w_bar = round(width / factor) * factor
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = max(factor, math.floor(height / beta / factor) * factor)
-        w_bar = max(factor, math.floor(width / beta / factor) * factor)
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return h_bar, w_bar
+    from qwen_vl_utils import smart_resize
+
+    return smart_resize(
+        height,
+        width,
+        factor=factor,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
 
 
 def qwen3vl_process_image(
@@ -326,8 +318,8 @@ def qwen3vl_process_image(
 ) -> tuple[torch.Tensor, tuple[int, int, int]]:
     """Qwen-VL image preprocessing for one CHW ``uint8`` image.
 
-    For a single frame, resize to a ``smart_resize`` grid, rescale/normalize,
-    then reshape into flattened temporal patches.
+    Uses ``qwen-vl-utils`` for Qwen's resize rule, then rescale/normalize and
+    reshape into flattened temporal patches.
 
     Returns ``(pixel_values, (grid_t, grid_h, grid_w))`` where ``pixel_values``
     is ``(grid_t*grid_h*grid_w, C*temporal*patch*patch)``.
@@ -337,10 +329,9 @@ def qwen3vl_process_image(
     merge = int(params["merge_size"])
     factor = patch_size * merge
 
-    tensor = torch.from_numpy(np.ascontiguousarray(image_chw)).to(torch.float32)
-    if tensor.ndim != 3:
-        raise ValueError(f"expected CHW image, got shape {tuple(tensor.shape)}.")
-    channels, height, width = tensor.shape
+    if image_chw.ndim != 3:
+        raise ValueError(f"expected CHW image, got shape {tuple(image_chw.shape)}.")
+    channels, height, width = image_chw.shape
     resized_h, resized_w = qwen3vl_smart_resize(
         height,
         width,
@@ -348,15 +339,14 @@ def qwen3vl_process_image(
         min_pixels=int(params["min_pixels"]),
         max_pixels=int(params["max_pixels"]),
     )
+    image_hwc = np.transpose(image_chw, (1, 2, 0))
+    image = Image.fromarray(np.ascontiguousarray(image_hwc))
     if (resized_h, resized_w) != (height, width):
-        from torchvision.transforms import functional as tvf
-
-        tensor = tvf.resize(
-            tensor,
-            [resized_h, resized_w],
-            interpolation=tvf.InterpolationMode.BICUBIC,
-            antialias=True,
-        )
+        image = image.resize((resized_w, resized_h))
+    tensor = torch.from_numpy(
+        np.asarray(image, dtype=np.uint8).transpose(2, 0, 1).copy()
+    )
+    tensor = tensor.contiguous().to(torch.float32)
 
     tensor = tensor / 255.0
     mean = torch.tensor(params["image_mean"], dtype=torch.float32).view(channels, 1, 1)

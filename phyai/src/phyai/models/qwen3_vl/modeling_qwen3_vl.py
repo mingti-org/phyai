@@ -742,14 +742,11 @@ class Qwen3VLModel(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute ``(position_ids[3,B,S], mrope_deltas[B,1])``.
 
         Token types are derived directly from ``input_ids`` against the
-        configured image/video token ids (HF derives them from a processor's
-        ``mm_token_type_ids``; for this reference model we recover them so the
-        function is self-contained).
+        configured image/video token ids.
         """
         config = self.config
         spatial_merge_size = self.spatial_merge_size
@@ -776,15 +773,11 @@ class Qwen3VLModel(nn.Module):
 
         for batch_idx, current_input_ids in enumerate(input_ids):
             ids = current_input_ids
-            if mm_token_type_ids is None:
-                token_type = torch.zeros_like(ids)
-                token_type[ids == image_token_id] = 1
-                token_type[ids == video_token_id] = 2
-            else:
-                token_type = mm_token_type_ids[batch_idx]
             if attention_mask is not None:
                 ids = ids[attention_mask[batch_idx].bool()]
-                token_type = token_type[attention_mask[batch_idx].bool()]
+            token_type = torch.zeros_like(ids)
+            token_type[ids == image_token_id] = 1
+            token_type[ids == video_token_id] = 2
 
             groups = []
             for key, group in itertools.groupby(
@@ -934,7 +927,6 @@ class Qwen3VLModel(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
@@ -958,7 +950,6 @@ class Qwen3VLModel(nn.Module):
                     image_grid_thw,
                     video_grid_thw,
                     attention_mask,
-                    mm_token_type_ids,
                 )
             else:
                 seq = torch.arange(input_ids.shape[1], device=input_ids.device)
@@ -1035,7 +1026,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
@@ -1046,7 +1036,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            mm_token_type_ids=mm_token_type_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,

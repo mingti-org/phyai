@@ -28,7 +28,7 @@ class GR00TN17Request:
     ``tensors`` is exactly the dict produced by the out-of-engine processor
     (``GR00TProcessor.process_observation(obs).tensors``): ``state`` /
     ``embodiment_id`` / ``action_mask`` plus the VLM tensors (``pixel_values``,
-    ``input_ids``, ``attention_mask``, ``image_grid_thw``, ``mm_token_type_ids``).
+    ``input_ids``, ``attention_mask``, ``image_grid_thw``).
     ``action_mask`` is optional but, when present, is applied to the normalized
     action chunk before it is returned.
     ``noise`` optionally seeds the flow-matching sampler for deterministic runs.

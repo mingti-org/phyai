@@ -127,7 +127,6 @@ class GR00TN17BackboneRunner(ModelRunner):
                 input_ids,
                 image_grid_thw=image_grid_thw,
                 attention_mask=attention_mask,
-                mm_token_type_ids=model_inputs.get("mm_token_type_ids"),
             )
 
         pad_token_id = int(getattr(qwen3vl_model.config, "pad_token_id", 0) or 0)
@@ -145,13 +144,6 @@ class GR00TN17BackboneRunner(ModelRunner):
         model_inputs["input_ids"] = input_ids
         model_inputs["attention_mask"] = attention_mask
         model_inputs["position_ids"] = position_ids
-        if "mm_token_type_ids" in model_inputs:
-            model_inputs["mm_token_type_ids"] = _right_pad_sequence(
-                model_inputs["mm_token_type_ids"],
-                bucket_seq_len,
-                value=0,
-            )
-
         visual = qwen_model.visual
         bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
             image_grid_thw,

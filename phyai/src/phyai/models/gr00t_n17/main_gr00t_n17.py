@@ -16,6 +16,7 @@ from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import (
     GR00TN17Request,
     GR00TN17WS1Scheduler,
 )
+from phyai.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from phyai.utils import load_config
 from phyai.weights import load_pretrained
 
@@ -69,6 +70,40 @@ def _compose_remap(
     )
 
 
+def _resolve_backbone_config_dir(
+    model_name_or_path: str,
+    *,
+    local_files_only: bool = False,
+    revision: str | None = None,
+) -> str:
+    candidate = Path(model_name_or_path)
+    if candidate.is_dir():
+        return str(candidate)
+
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        model_name_or_path,
+        revision=revision,
+        allow_patterns=["config.json"],
+        local_files_only=local_files_only,
+    )
+
+
+def _load_qwen3vl_config(
+    model_name_or_path: str,
+    *,
+    local_files_only: bool = False,
+    revision: str | None = None,
+) -> Qwen3VLConfig:
+    backbone_dir = _resolve_backbone_config_dir(
+        model_name_or_path,
+        local_files_only=local_files_only,
+        revision=revision,
+    )
+    return load_config(backbone_dir, Qwen3VLConfig)
+
+
 @dataclass
 class GR00TN17Args(EntryArgs):
     """Args bundle for the GR00T-N1.7 plugin.
@@ -118,12 +153,19 @@ class GR00TN17Entry(Entry):
         else:
             config = GR00TN17Config()
         if args.backbone_model_name_or_path is not None:
+            qwen3vl_config = _load_qwen3vl_config(
+                str(args.backbone_model_name_or_path),
+                local_files_only=(args.backbone_transformers_loading_kwargs or {}).get(
+                    "local_files_only", False
+                ),
+                revision=config.backbone.model_revision,
+            )
             config = replace(
                 config,
                 backbone=replace(
                     config.backbone,
                     model_name=str(args.backbone_model_name_or_path),
-                    qwen3vl=None,
+                    qwen3vl=qwen3vl_config,
                 ),
             )
 
