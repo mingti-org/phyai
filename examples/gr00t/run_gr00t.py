@@ -49,7 +49,7 @@ def make_synthetic_observation(
     """Build a random ``GR00TObservation`` matching the checkpoint modality config.
 
     Shapes/dtypes follow what the processor validates (uint8 ``(B,T,H,W,3)`` video,
-    float32 ``(B,T,D)`` state, ``[[task]]`` language).
+    float32 ``(B,T,D)`` state, and ``(B,T)`` language).
     """
     from phyai_utils_tools.models.gr00t import GR00TObservation
 
@@ -70,7 +70,8 @@ def make_synthetic_observation(
             dim = 7
         state[key] = np.random.rand(batch_size, t, dim).astype(np.float32) * 2 - 1
     language_key = cfg["language"].modality_keys[0]
-    language = {language_key: [[task]] * batch_size}
+    t = len(cfg["language"].delta_indices)
+    language = {language_key: [[task for _ in range(t)] for _ in range(batch_size)]}
     return GR00TObservation(video=video, state=state, language=language)
 
 
