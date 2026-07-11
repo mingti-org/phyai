@@ -1,9 +1,24 @@
 [project]
 name = "phyai-model-optimizer"
 dynamic = ["version"]
-description = "phyai — Model optimization library."
+description = "phyai model optimization library."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "torch==2.11",
+    "compressed-tensors>=0.17",
+    "safetensors",
+    "numpy",
+]
+
+# note(chenghua): phyai (calibration) and humming (pack_format="humming") are only
+# needed for those code paths; keep them optional so data-free PTQ + compressed-tensors
+# serialization stay usable standalone and CPU-only.
+[project.optional-dependencies]
+calibration = ["phyai", "accelerate"]
+humming = ["humming-kernels[cu13]==0.1.10"]
+
+[project.scripts]
+phyai-optimize = "phyai_model_optimizer.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

@@ -16,6 +16,12 @@
 #   -f, --fig-dir DIR       figure output dir (default figures/)
 #       --n-warmup N        warmup steps   (default 10)
 #       --n-timed N         timed steps    (default 50)
+#       --bf16-gemm-backend NAME
+#                           FlashInfer BF16 backend (default cudnn)
+#       --flashinfer-autotune
+#                           tune FlashInfer kernels during eager warmup
+#       --flashinfer-autotune-cache FILE
+#                           precomputed FlashInfer tuning cache to load
 #       --no-roofline       skip the peak/bandwidth microbench
 #       --skip-check        don't abort when the target GPU looks busy
 #       --plot-only         re-render figures from an existing JSON (no GPU run)
@@ -40,11 +46,14 @@ OUT=""
 FIG_DIR="${SCRIPT_DIR}/figures"
 N_WARMUP=10
 N_TIMED=50
+BF16_GEMM_BACKEND="cudnn"
+FLASHINFER_AUTOTUNE=0
+FLASHINFER_AUTOTUNE_CACHE=""
 NO_ROOFLINE=0
 SKIP_CHECK=0
 PLOT_ONLY=0
 
-usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # --- Parse flags ---
 while [[ $# -gt 0 ]]; do
@@ -57,6 +66,13 @@ while [[ $# -gt 0 ]]; do
     -f|--fig-dir)    FIG_DIR="$2"; shift 2 ;;
     --n-warmup)      N_WARMUP="$2"; shift 2 ;;
     --n-timed)       N_TIMED="$2"; shift 2 ;;
+    --bf16-gemm-backend) BF16_GEMM_BACKEND="$2"; shift 2 ;;
+    --flashinfer-autotune) FLASHINFER_AUTOTUNE=1; shift ;;
+    --flashinfer-autotune-cache)
+      FLASHINFER_AUTOTUNE=1
+      FLASHINFER_AUTOTUNE_CACHE="$2"
+      shift 2
+      ;;
     --no-roofline)   NO_ROOFLINE=1; shift ;;
     --skip-check)    SKIP_CHECK=1; shift ;;
     --plot-only)     PLOT_ONLY=1; shift ;;
@@ -66,6 +82,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "${REPO_ROOT}"
+
+# CUDA 13 forward-compat package.  The system link must already resolve to a
+# compatible driver bundle; prepend it so libcuda is selected for this run.
+CUDA_COMPAT_LIB="${CUDA_COMPAT_LIB:-/usr/local/cuda-13.1/compat/lib}"
+if [[ -d "${CUDA_COMPAT_LIB}" ]]; then
+  export LD_LIBRARY_PATH="${CUDA_COMPAT_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 # ---------------------------------------------------------------------------
 # Plot-only fast path: re-render figures from an existing JSON, no GPU needed.
@@ -92,7 +115,8 @@ echo "   checkpoint : ${CKPT}"
 echo "   GPU        : ${GPU}   (CUDA_VISIBLE_DEVICES)"
 echo "   batch sizes: ${BATCH_SIZES}"
 echo "   lang_len   : ${LANG_LEN}    warmup=${N_WARMUP} timed=${N_TIMED}"
-echo "   LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+echo "   BF16 GEMM  : ${BF16_GEMM_BACKEND}    autotune=${FLASHINFER_AUTOTUNE}"
+echo "   LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
 echo "============================================================"
 
 # --- GPU busy check. A contended card skews the roofline microbench and the
@@ -139,6 +163,13 @@ echo "[out] profile JSON -> ${OUT}"
 # --- 1. Profile sweep (probes device + measures roofline, then sweeps). ---
 ROOFLINE_FLAG=()
 [[ "${NO_ROOFLINE}" -eq 1 ]] && ROOFLINE_FLAG=(--no-roofline)
+FLASHINFER_FLAGS=(--bf16-gemm-backend "${BF16_GEMM_BACKEND}")
+if [[ "${FLASHINFER_AUTOTUNE}" -eq 1 ]]; then
+  FLASHINFER_FLAGS+=(--flashinfer-autotune)
+  if [[ -n "${FLASHINFER_AUTOTUNE_CACHE}" ]]; then
+    FLASHINFER_FLAGS+=(--flashinfer-autotune-cache "${FLASHINFER_AUTOTUNE_CACHE}")
+  fi
+fi
 
 CUDA_VISIBLE_DEVICES="${GPU}" uv run python benchmark/pi05/profile_pi05.py \
   --checkpoint "${CKPT}" \
@@ -147,6 +178,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" uv run python benchmark/pi05/profile_pi05.py \
   --n-warmup "${N_WARMUP}" \
   --n-timed "${N_TIMED}" \
   --out "${OUT}" \
+  "${FLASHINFER_FLAGS[@]}" \
   "${ROOFLINE_FLAG[@]}"
 
 # --- 2. Render figures (matplotlib pulled in only for the render). ---

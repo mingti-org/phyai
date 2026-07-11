@@ -112,6 +112,11 @@ class FlashInferAttentionBackend(AttentionBackend):
                 "cu_seqlens_q on AttnMetadata for batch_size > 1."
             )
         cu_q = meta.cu_seqlens_q
+        if cu_q.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer batched no-cache attention must be planned before "
+                "CUDA Graph capture; pass a pre-planned AttnCtx to forward()."
+            )
         cu_kv = meta.cu_seqlens_kv if meta.cu_seqlens_kv is not None else cu_q
         layer_proto = meta.extras.get("layer_proto")
         if layer_proto is None:

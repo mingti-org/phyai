@@ -224,6 +224,23 @@ def main() -> None:
         help="flashinfer workspace (apply-only-raises; 4 GiB clears "
         "FA2 split-tmp at bs>=8).",
     )
+    ap.add_argument(
+        "--bf16-gemm-backend",
+        choices=("auto", "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm"),
+        default="cudnn",
+        help="FlashInfer mm_bf16 backend. 'auto' enables per-shape runner selection.",
+    )
+    ap.add_argument(
+        "--flashinfer-autotune",
+        action="store_true",
+        help="Enable FlashInfer autotuning during capture-safe eager warmup.",
+    )
+    ap.add_argument(
+        "--flashinfer-autotune-cache",
+        type=Path,
+        default=None,
+        help="Precomputed FlashInfer autotuner cache loaded during engine initialization.",
+    )
     ap.add_argument("--n-warmup", type=int, default=10)
     ap.add_argument("--n-timed", type=int, default=50)
     ap.add_argument("--n-prof-steps", type=int, default=5)
@@ -248,6 +265,7 @@ def main() -> None:
         help="Where to drop per-batch chrome traces (gitignored scratch).",
     )
     args = ap.parse_args()
+    flashinfer_tune_cache = args.flashinfer_autotune_cache
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for this benchmark.")
@@ -303,6 +321,13 @@ def main() -> None:
                     runtime=RuntimeConfig(
                         use_cuda_graph=True,
                         flashinfer_workspace_bytes=args.workspace_bytes,
+                        flashinfer_bf16_backend=args.bf16_gemm_backend,
+                        flashinfer_autotune=args.flashinfer_autotune,
+                        flashinfer_autotune_cache=(
+                            str(flashinfer_tune_cache)
+                            if flashinfer_tune_cache is not None
+                            else None
+                        ),
                     ),
                 ),
             )
@@ -390,6 +415,13 @@ def main() -> None:
             "n_timed": args.n_timed,
             "n_prof_steps": args.n_prof_steps,
             "flashinfer_workspace_mib": args.workspace_bytes // 2**20,
+            "flashinfer_bf16_backend": args.bf16_gemm_backend,
+            "flashinfer_autotune": args.flashinfer_autotune,
+            "flashinfer_autotune_cache": (
+                flashinfer_tune_cache.name
+                if flashinfer_tune_cache is not None
+                else None
+            ),
         },
         "hardware": hardware,
         "stages_flop": {

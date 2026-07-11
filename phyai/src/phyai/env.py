@@ -145,7 +145,6 @@ class envs:
     # ---------- backend / kernel selection ---------- #
     PHYAI_ATTN_BACKEND = EnvField("PHYAI_ATTN_BACKEND", None, str)
     PHYAI_NORM_BACKEND = EnvField("PHYAI_NORM_BACKEND", None, str)
-    PHYAI_LINEAR_BACKEND = EnvField("PHYAI_LINEAR_BACKEND", None, str)
     PHYAI_VGPU_BACKEND = EnvField("PHYAI_VGPU_BACKEND", None, str)
 
     # ---------- device / dtype ---------- #
@@ -170,6 +169,11 @@ class envs:
     )
     PHYAI_FLASHINFER_PREFILL_BACKEND = EnvField(
         "PHYAI_FLASHINFER_PREFILL_BACKEND", None, str
+    )
+    PHYAI_FLASHINFER_BF16_BACKEND = EnvField("PHYAI_FLASHINFER_BF16_BACKEND", None, str)
+    PHYAI_FLASHINFER_AUTOTUNE = EnvField("PHYAI_FLASHINFER_AUTOTUNE", None, _parse_bool)
+    PHYAI_FLASHINFER_AUTOTUNE_CACHE = EnvField(
+        "PHYAI_FLASHINFER_AUTOTUNE_CACHE", None, str
     )
     PHYAI_FORCE_LINEAR_KERNEL = EnvField("PHYAI_FORCE_LINEAR_KERNEL", None, str)
     # Backend preference for quantized dense Linear: "auto" | "humming" |

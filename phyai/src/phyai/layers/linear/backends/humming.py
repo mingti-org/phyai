@@ -6,6 +6,7 @@ import torch
 
 from phyai.layers.linear.backend import KernelProbe
 from phyai.layers.linear.registry import register_linear_kernel
+from phyai.utils.humming import humming_supports_sm
 
 try:  # pragma: no cover - depends on optional install + CUDA toolchain
     import humming  # noqa: F401
@@ -62,6 +63,11 @@ class HummingKernel:
         if not _HAS_HUMMING:
             return False
         if not probe.spec_id.startswith("humming_"):
+            return False
+        # note(chenghua): humming KeyErrors on SMs absent from its heuristics_map
+        # (e.g. Thor sm_110), so decline — a pre-packed humming checkpoint then
+        # fails with a clean "no kernel" error instead of a KeyError mid-forward.
+        if not humming_supports_sm(probe.sm):
             return False
         _w_dtype, a_dtype = _parse_dtypes(probe.spec_id)
         # Gate on the activation dtype only (see _ACT_SM_GATE). Unknown/unsupported

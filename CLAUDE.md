@@ -52,6 +52,12 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 - C/C++: clang-format from `.clang-format` (column 128, 2-space indent, `PointerAlignment: Left`). clang-tidy from `.clang-tidy` (google + modernize + performance, `WarningsAsErrors: '*'`, identifier naming enforced: classes `CamelCase`, variables `lower_case`, globals `UPPER_CASE`). C++20 (`add_compile_options(-std=c++20)` in `phyai-ext/CMakeLists.txt`).
 - Python: `ruff-format` via pre-commit. Public-by-default — `_` prefix only for genuine implementation details. Singletons exposed via `get_*()` getters, not module-level instances.
 
+## Code Comment conventions
+
+All comments should be self-contained. Do not explain how you did something or explain what this code block did; just explain whywe did this. And, also adds your name for all of the comments, like # note(foo). If you don't know user's name, just ask them.
+
+Comments should be concise. If not explain why, ust delete it. In this sense, most of the AI comments should be removed.
+
 ## More MUST FOLLOW Conventions provided by human
 
 - all log function in phyai package should use phyai.utils' logging api. U judge using `this_rank_log` or `all_rank_log`

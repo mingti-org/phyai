@@ -30,7 +30,7 @@ batching, preemption, and tensor parallel are out of scope here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -188,6 +188,51 @@ class PI05Request:
     input_ids: torch.Tensor
     lang_lens: torch.Tensor
     noise: torch.Tensor | None = None
+    _lang_lens_source: torch.Tensor = field(init=False, repr=False, compare=False)
+    _lang_lens_version: int | None = field(init=False, repr=False, compare=False)
+    _lang_lens_host: tuple[int, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._refresh_lang_lens_host()
+
+    def _refresh_lang_lens_host(self) -> None:
+        self._lang_lens_source = self.lang_lens
+        self._lang_lens_version = _tensor_version(self.lang_lens)
+        self._lang_lens_host = tuple(int(x) for x in self.lang_lens.tolist())
+
+    def host_lang_lens(self) -> tuple[int, ...]:
+        """Return host lengths, refreshing only after tensor replacement or mutation."""
+        current_version = _tensor_version(self.lang_lens)
+        if (
+            self._lang_lens_source is not self.lang_lens
+            or current_version is None
+            or self._lang_lens_version != current_version
+        ):
+            self._refresh_lang_lens_host()
+        return self._lang_lens_host
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return int(tensor._version)
+    except RuntimeError:
+        return None
+
+
+class _VersionedTensorRef:
+    """Identity and mutation version for one cached tensor-derived value."""
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+        self.version = _tensor_version(tensor)
+
+    def matches(self, tensor: torch.Tensor) -> bool:
+        current_version = _tensor_version(tensor)
+        return (
+            self.tensor is tensor
+            and self.version is not None
+            and self.version == current_version
+        )
 
 
 @dataclass
@@ -348,6 +393,31 @@ class PI05WS1Scheduler(Scheduler):
         self._layout_cache: dict[tuple, _PI05Layout] = {}
         self._last_layout_key: tuple | None = None
 
+        self._prefix_staging_buf = torch.empty(
+            self.max_batch_size * self.n_per_sample,
+            cfg.text.hidden_size,
+            dtype=self.params_dtype,
+            device=self.device,
+        )
+        self._input_ids_staging_buf = torch.empty(
+            self.max_batch_size,
+            cfg.tokenizer_max_length,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._noise_staging_buf = torch.empty(
+            self.max_batch_size,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+            dtype=self.params_dtype,
+            device=self.device,
+        )
+        self._lang_input_ref: _VersionedTensorRef | None = None
+        self._lang_input_batch_size = 0
+        self._lang_embs_cache: torch.Tensor | None = None
+        self._lang_cache_generation = 0
+        self._prefix_lang_stage_state: dict[int, tuple] = {}
+
     # ------------------------------------------------------------------ #
     # Setup                                                              #
     # ------------------------------------------------------------------ #
@@ -425,10 +495,8 @@ class PI05WS1Scheduler(Scheduler):
         # Resolve the attention layout for this request shape. It depends
         # only on (actual_B, per-sample real lengths) — not on the image /
         # text values — so a fixed request shape hits the cache on every
-        # step and across all 10 Euler steps. Reading ``lang_lens`` to the
-        # host (one tiny sync for the key) replaces the several large syncs
-        # the per-step rebuild used to incur; a cache hit rebuilds nothing.
-        lang_lens_cpu = tuple(int(x) for x in request.lang_lens.tolist())
+        # step and across all 10 Euler steps.
+        lang_lens_cpu = request.host_lang_lens()
         n_per_sample = self._bucket_n_per_sample(max(lang_lens_cpu, default=0))
         key = (actual_B, lang_lens_cpu)
         layout = self._layout_cache.get(key)
@@ -437,52 +505,35 @@ class PI05WS1Scheduler(Scheduler):
             self._layout_cache[key] = layout
         plan_changed = key != self._last_layout_key
 
+        graph_prefix_buf = self.llm_runner.prefix_input_buffer(layout.n_per_sample)
+        if graph_prefix_buf is None:
+            n_prefix = max_B * layout.n_per_sample
+            prefix_buf = self._prefix_staging_buf[:n_prefix]
+        else:
+            prefix_buf = graph_prefix_buf
+        prefix_view = prefix_buf.view(
+            max_B, layout.n_per_sample, self.cfg.text.hidden_size
+        )
+
         # 1. Vision pass — replay the captured (num_images, C, H, W) graph
-        # once per real robot. The runner's output aliases its static buffer,
-        # so we eagerly copy each replay into a pre-allocated
-        # ``(max_B, image_token_count, D)`` slot before the next replay
-        # overwrites it. Padded rows stay zero (their image embeddings
-        # are written into the packed prefix at sentinel-routed rows,
-        # so the values don't propagate anywhere). ``pixel_values`` is the
-        # caller's canonical, already-resized tensor; we only move it to the
-        # model device/dtype here (no resize — phyai is strict).
+        # once per real robot. Each output is copied directly into the LLM
+        # graph input buffer before the next replay overwrites it.
         with event_scope("pi05.vision_loop"):
             pixel_values = request.pixel_values.to(device=device, dtype=dtype)
-            image_embs: torch.Tensor | None = None
             for b in range(actual_B):
                 vision_out = self.vision_runner.forward(
                     VisionForwardBatch(pixel_values=pixel_values[b])
                 )
                 flat = vision_out.flatten(0, 1)  # (image_token_count, D)
-                if image_embs is None:
-                    image_embs = torch.zeros(
-                        max_B, *flat.shape, dtype=flat.dtype, device=flat.device
-                    )
-                image_embs[b] = flat
-            assert image_embs is not None  # actual_B >= 1 enforced by _validate
-
-        # 2. Lang embed (eager) + vectorized per-sample padded packing.
-        # The pack is a fixed-stride scatter (image block then a
-        # mask-zeroed lang block) driven by the cached ``lang_mask`` — no
-        # host sync, no Python per-sample loop, bit-identical to the old
-        # per-sample gather.
-        with event_scope("pi05.lang_pack"):
+                prefix_view[b, : self.image_token_count].copy_(flat)
             if actual_B < max_B:
-                input_ids_padded = torch.zeros(
-                    max_B, cfg.tokenizer_max_length, dtype=torch.int64, device=device
-                )
-                input_ids_padded[:actual_B] = request.input_ids.to(
-                    device=device, dtype=torch.int64
-                )
-            else:
-                input_ids_padded = request.input_ids.to(
-                    device=device, dtype=torch.int64
-                )
+                prefix_view[actual_B:, : self.image_token_count].zero_()
 
-            lang_embs = self.model.paligemma_lm.embed_lang(input_ids_padded)
-            if lang_embs.dtype != dtype:
-                lang_embs = lang_embs.to(dtype)
-            packed = self._pack_prefix(image_embs, lang_embs, layout)
+        # 2. Embed and stage the language block only when its source tensor
+        # or layout changed. The image block above changes every inference.
+        with event_scope("pi05.lang_pack"):
+            lang_embs = self._cached_lang_embeddings(request.input_ids, actual_B)
+            self._stage_lang_prefix(prefix_view, lang_embs, layout, key)
 
         # 3. Plan the prefix layout — only when the layout changed. The
         # flashinfer wrapper keeps its planned buffers across steps
@@ -495,20 +546,24 @@ class PI05WS1Scheduler(Scheduler):
                 _ = self.prefix_static.allocate(layout.n_real_total)
                 _ = self.suffix_static.allocate(max_B * cfg.chunk_size)
                 self.llm_runner.plan_inference(layout.prefix_meta)
+                self.llm_runner.stage_graph_layout(
+                    layout.position_ids,
+                    layout.write_indices,
+                    n_per_sample=layout.n_per_sample,
+                )
 
-        # 4. Prefix forward — populates the cache pool. ``packed`` is a
-        # fresh contiguous tensor; the runner's ``replay`` will copy it
-        # into the captured input buffer, so no scheduler-side staging.
-        # Attention metadata was already staged on the runner via
-        # ``plan_inference`` above; the batch carries only the per-call
-        # variable inputs.
+        # 4. Prefix forward — populates the cache pool. Graph mode replays
+        # the already-staged static buffers without another device copy.
         with event_scope("pi05.llm_prefix_fwd"):
-            llm_batch = LLMForwardBatch(
-                hidden_states=packed,
-                position_ids=layout.position_ids,
-                write_indices=layout.write_indices,
-            )
-            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
+            if graph_prefix_buf is not None:
+                self.llm_runner.replay_staged(n_per_sample=layout.n_per_sample)
+            else:
+                llm_batch = LLMForwardBatch(
+                    hidden_states=prefix_buf,
+                    position_ids=layout.position_ids,
+                    write_indices=layout.write_indices,
+                )
+                self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
 
         # 5. Plan the expert joint-attention metadata — same gating as the
         # prefix: only re-plan when the layout changed.
@@ -528,24 +583,21 @@ class PI05WS1Scheduler(Scheduler):
                     "PI05WS1Scheduler.step() called before setup(); "
                     "the time-embedding lookup table has not been built."
                 )
+            graph_noise_buf = self.expert_runner.noise_input_buffer()
+            noise = (
+                graph_noise_buf
+                if graph_noise_buf is not None
+                else self._noise_staging_buf
+            )
             if request.noise is None:
-                noise = torch.randn(
-                    max_B,
-                    cfg.chunk_size,
-                    cfg.max_action_dim,
-                    dtype=dtype,
-                    device=device,
-                )
+                noise.normal_()
             else:
-                noise = torch.zeros(
-                    max_B,
-                    cfg.chunk_size,
-                    cfg.max_action_dim,
-                    dtype=dtype,
-                    device=device,
-                )
-                noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
-            x_t = self.expert_runner.forward(noise)
+                noise.zero_()
+                noise[:actual_B].copy_(request.noise)
+            if graph_noise_buf is not None:
+                x_t = self.expert_runner.replay_staged()
+            else:
+                x_t = self.expert_runner.forward(noise)
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
         return x_t[:actual_B].clone()
@@ -683,36 +735,55 @@ class PI05WS1Scheduler(Scheduler):
             joint_meta=joint_meta,
         )
 
-    def _pack_prefix(
+    def _cached_lang_embeddings(
+        self, input_ids: torch.Tensor, actual_B: int
+    ) -> torch.Tensor:
+        """Reuse language embeddings while the source tensor is unchanged."""
+        cache_hit = (
+            self._lang_embs_cache is not None
+            and self._lang_input_ref is not None
+            and self._lang_input_ref.matches(input_ids)
+            and self._lang_input_batch_size == actual_B
+        )
+        if cache_hit:
+            assert self._lang_embs_cache is not None
+            return self._lang_embs_cache
+
+        self._input_ids_staging_buf.zero_()
+        self._input_ids_staging_buf[:actual_B].copy_(input_ids)
+        lang_embs = self.model.paligemma_lm.embed_lang(self._input_ids_staging_buf)
+        if lang_embs.dtype != self.params_dtype:
+            lang_embs = lang_embs.to(self.params_dtype)
+
+        self._lang_input_ref = _VersionedTensorRef(input_ids)
+        self._lang_input_batch_size = actual_B
+        self._lang_embs_cache = lang_embs
+        self._lang_cache_generation += 1
+        return lang_embs
+
+    def _stage_lang_prefix(
         self,
-        image_embs: torch.Tensor,
+        prefix_view: torch.Tensor,
         lang_embs: torch.Tensor,
         layout: _PI05Layout,
-    ) -> torch.Tensor:
-        """Vectorized per-sample-padded prefix pack at the layout's bucket.
-
-        Per sample the layout is ``[image (n_img), lang[:L_lang], pad]``
-        over ``layout.n_per_sample`` rows. The image block is a
-        fixed-stride copy; the lang block is ``lang_embs`` truncated to the
-        bucket's lang budget and zeroed past each sample's real length via
-        ``layout.lang_mask`` (multiply by a {0,1} mask — exact in IEEE, so
-        real-token rows are bit-identical to the old per-sample gather).
-        """
-        max_B = self.max_batch_size
-        n_ps = layout.n_per_sample
-        n_img = self.image_token_count
-        lang_bucket = n_ps - n_img
-        D = image_embs.shape[-1]
-        packed = torch.zeros(
-            max_B * n_ps, D, dtype=image_embs.dtype, device=image_embs.device
+        layout_key: tuple,
+    ) -> None:
+        """Fill a prefix buffer's language block once per prompt and layout."""
+        buffer_key = int(prefix_view.data_ptr())
+        stage_key = (
+            layout.n_per_sample,
+            self._lang_cache_generation,
+            layout_key,
         )
-        pv = packed.view(max_B, n_ps, D)
-        pv[:, :n_img] = image_embs
-        mask = layout.lang_mask.to(lang_embs.dtype)[
-            ..., None
-        ]  # (max_B, lang_bucket, 1)
-        pv[:, n_img:] = lang_embs[:, :lang_bucket] * mask
-        return packed
+        if self._prefix_lang_stage_state.get(buffer_key) == stage_key:
+            return
+
+        n_img = self.image_token_count
+        lang_bucket = layout.n_per_sample - n_img
+        dst = prefix_view[:, n_img:]
+        dst.copy_(lang_embs[:, :lang_bucket])
+        dst.masked_fill_(~layout.lang_mask[..., None], 0)
+        self._prefix_lang_stage_state[buffer_key] = stage_key
 
     # ------------------------------------------------------------------ #
     # Validation                                                         #

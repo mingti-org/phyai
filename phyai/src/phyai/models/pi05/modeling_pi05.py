@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,7 @@ from phyai.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    get_linear_dispatcher,
 )
 from phyai.layers.mlp.dense_mlp import DenseMLP
 from phyai.layers.rotary_embedding import RotaryEmbedding
@@ -559,6 +561,50 @@ class PaliGemmaDecoderLayer(nn.Module):
         v = v.reshape(*leading, self.kv_heads_local, self.head_dim)
         return q, k, v
 
+    def _project_kv(
+        self,
+        n: torch.Tensor,
+        leading: torch.Size,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_dim = self.q_heads_local * self.head_dim
+        kv_dim = self.kv_heads_local * self.head_dim
+        if self.qkv_proj.spec.spec_id == "bf16" and self.qkv_proj.tp_size == 1:
+            bias = None if self.qkv_proj.bias is None else self.qkv_proj.bias[q_dim:]
+            projection = SimpleNamespace(
+                spec=self.qkv_proj.spec,
+                weight=self.qkv_proj.weight[q_dim:],
+            )
+            kernel = get_linear_dispatcher().select(
+                spec_id=self.qkv_proj.spec.spec_id,
+                M=n.numel() // n.shape[-1],
+                N=2 * kv_dim,
+                K=n.shape[-1],
+                in_dtype=n.dtype,
+                out_dtype=self.qkv_proj.params_dtype,
+            )
+            fused = kernel.apply(projection, n, bias)
+        else:
+            fused, _ = self.qkv_proj(n)
+            fused = fused[..., q_dim:]
+        k, v = fused.split([kv_dim, kv_dim], dim=-1)
+        k = k.reshape(*leading, self.kv_heads_local, self.head_dim)
+        v = v.reshape(*leading, self.kv_heads_local, self.head_dim)
+        return k, v
+
+    def write_kv(
+        self,
+        h: torch.Tensor,
+        position_ids: torch.Tensor,
+        rope: RotaryEmbedding,
+        attn_ctx: ARAttnCtx,
+    ) -> None:
+        """Write this layer's prefix K/V without producing a hidden state."""
+        n = self.input_layernorm(h)
+        k, v = self._project_kv(n, h.shape[:-1])
+        empty_q = k.new_empty((*k.shape[:-2], 0, self.head_dim))
+        _, k = rope(position_ids, empty_q, k)
+        attn_ctx.kv_pool.write_kv(self.layer_idx, attn_ctx.write_indices, k, v)
+
     def forward(
         self,
         h: torch.Tensor,
@@ -651,6 +697,21 @@ class PaliGemmaLanguageModel(nn.Module):
         for layer in self.layers:
             h = layer(h, position_ids, rope, attn_ctx)
         return self.norm(h)
+
+    def write_prefix_kv(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        rope: RotaryEmbedding,
+        attn_ctx: ARAttnCtx,
+    ) -> None:
+        """Populate every prefix KV layer needed by the action expert."""
+        if not self.layers:
+            return
+        h = inputs_embeds
+        for layer in self.layers[:-1]:
+            h = layer(h, position_ids, rope, attn_ctx)
+        self.layers[-1].write_kv(h, position_ids, rope, attn_ctx)
 
 
 @dataclass(frozen=True)

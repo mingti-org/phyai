@@ -9,7 +9,6 @@ rank 0 writes the action JSON / mp4.
 
 Launch under torchrun with ``--nproc_per_node`` equal to ``cfg * tp``::
 
-    LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat/lib \\
     torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_policy_wn.py --tp 4 \\
         --checkpoint /path/to/Cosmos3-Nano-Policy-DROID --image observation.png \\
         --prompt "robot picks up the cup" --domain-name droid_lerobot \\

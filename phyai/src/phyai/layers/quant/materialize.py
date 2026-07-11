@@ -8,6 +8,11 @@ from phyai.layers.quant.granularity import Granularity
 from phyai.layers.quant.humming import HummingWeightSpec
 from phyai.layers.quant.nvfp4 import Nvfp4Spec
 from phyai.layers.quant.scheme import QDType, QuantScheme
+from phyai.utils.humming import (
+    has_humming,
+    humming_supports_sm,
+    require_humming_supports_sm,
+)
 
 _NVFP4_128X4_MIN_SM = 100
 
@@ -131,10 +136,20 @@ def materialize(scheme: QuantScheme, sm: int) -> object:
         # Both humming and flashinfer/torch serve fp8; pick per preference.
         # flashinfer/torch -> the standard Fp8Spec layout (dispatcher then routes
         # block->flashinfer, per-tensor/channel->torch). auto/humming -> humming.
-        if _quant_backend() in ("flashinfer", "torch"):
+        backend = _quant_backend()
+        if backend in ("flashinfer", "torch"):
+            return Fp8Spec(granularity=w.granularity, block_shape=w.block_shape)
+        if backend == "humming":
+            require_humming_supports_sm(sm)
+        elif has_humming() and not humming_supports_sm(sm):
+            # note(chenghua): humming installed but has no kernels for this SM (e.g.
+            # Thor sm_110); auto falls back to the flashinfer/torch fp8 layout.
             return Fp8Spec(granularity=w.granularity, block_shape=w.block_shape)
         return _humming_spec(scheme)
     if w.dtype in _HUMMING_ONLY:
+        # note(chenghua): no flashinfer/torch path for these dtypes, so an SM humming
+        # can't serve has no fallback — fail loudly instead of KeyError'ing in humming.
+        require_humming_supports_sm(sm)
         return _humming_spec(scheme)
     raise NotImplementedError(f"materialize: unsupported weight dtype {w.dtype!r}")
 

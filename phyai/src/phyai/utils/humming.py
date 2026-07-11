@@ -36,9 +36,44 @@ def require_humming() -> None:
         )
 
 
+def humming_supports_sm(sm: int) -> bool:
+    """True when the installed humming has tile heuristics for compute capability
+    ``sm`` (``major*10 + minor``, e.g. 90, 100, 120).
+
+    humming selects heuristics via a hardcoded ``heuristics_map`` with no fallback,
+    so any SM it does not list (e.g. Jetson Thor ``sm_110``, or ``sm_88``) would
+    raise ``KeyError`` deep inside its tuning. Probing that table directly makes this
+    auto-adapt when humming adds an arch — no version pin needed. Touches no CUDA.
+    """
+    if not _HAS_HUMMING:
+        return False
+    try:
+        from humming.tune import heuristics_map
+    except Exception:
+        return False
+    return sm in heuristics_map
+
+
+def require_humming_supports_sm(sm: int) -> None:
+    """Raise if humming is installed but has no kernels for compute capability ``sm``.
+
+    No-op when humming is absent — that case is reported by :func:`require_humming`
+    at schema-build time.
+    """
+    if _HAS_HUMMING and not humming_supports_sm(sm):
+        raise RuntimeError(
+            f"the installed humming-kernels build has no kernels for sm_{sm} "
+            f"(e.g. Jetson Thor sm_110 is unsupported) and would KeyError inside "
+            f"humming's tuning. Set PHYAI_LINEAR_QUANT_BACKEND=flashinfer or torch "
+            f"where the format allows, or install a humming build supporting sm_{sm}."
+        )
+
+
 __all__ = [
     "has_humming",
     "require_humming",
+    "humming_supports_sm",
+    "require_humming_supports_sm",
     "humming_dtypes",
     "HummingMethod",
     "BaseInputSchema",

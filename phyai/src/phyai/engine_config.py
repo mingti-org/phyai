@@ -18,7 +18,7 @@ sub-configs by concern:
   often carve into TP rather than multiplying with it).
 * :class:`RuntimeConfig` — runtime mode switches and tunables
   (``use_cuda_graph``, ``flashinfer_workspace_bytes``,
-  ``force_linear_kernel``).
+  ``flashinfer_autotune``, ``force_linear_kernel``).
 
 Construction
 ------------
@@ -68,6 +68,9 @@ def _canonical_backend_name(name: str) -> str:
 _VALID_FLASHINFER_PREFILL_BACKENDS: frozenset[str] = frozenset(
     {"auto", "fa2", "fa3", "cudnn", "trtllm-gen"}
 )
+_VALID_FLASHINFER_BF16_BACKENDS: frozenset[str] = frozenset(
+    {"auto", "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm"}
+)
 
 
 # ---------------------------------------------------------------------- #
@@ -101,10 +104,6 @@ class BackendConfig:
     norm:
         :class:`~phyai.layers.layer_norm.RMSNorm` / ``LayerNorm``
         backend (``"flashinfer"`` / ``"phyai-kernel"``).
-    linear:
-        Optional :class:`~phyai.layers.linear.LinearKernel` name to
-        prefer above all others; ``None`` defers to the registry's
-        ``prefer_for`` ordering (FlashInfer-then-Torch).
     vgpu:
         Optional :mod:`phyai.vgpu` backend name (``"flashinfer"`` /
         ``"torch"``); ``None`` defers to vgpu auto-resolve.
@@ -112,13 +111,11 @@ class BackendConfig:
 
     attn: str = "flashinfer"
     norm: str = "flashinfer"
-    linear: str | None = None
     vgpu: str | None = None
 
     def __post_init__(self) -> None:
         self._validate_attn()
         self._validate_norm()
-        self._validate_linear()
         self._validate_vgpu()
 
     def _validate_attn(self) -> None:
@@ -163,18 +160,6 @@ class BackendConfig:
                 f"norm backend. Available: {available}"
             )
         object.__setattr__(self, "norm", canonical)
-
-    def _validate_linear(self) -> None:
-        if self.linear is None:
-            return
-        from phyai.layers.linear.registry import list_registered_linear_kernels
-
-        names = [cls.name for cls, _ in list_registered_linear_kernels()]
-        if self.linear not in names:
-            raise ValueError(
-                f"BackendConfig.linear={self.linear!r} is not a registered "
-                f"LinearKernel. Available: {names}"
-            )
 
     def _validate_vgpu(self) -> None:
         if self.vgpu is None:
@@ -327,6 +312,19 @@ class RuntimeConfig:
         recommendation (see ``PI05RecommendedEngineConfig``) instead of forcing
         it here. Consumed by
         :func:`phyai.layers.attention.utils.resolve_prefill_backend`.
+    flashinfer_bf16_backend:
+        Backend passed to :func:`flashinfer.gemm.mm_bf16`. ``"cudnn"``
+        preserves the default FlashInfer path; ``"auto"`` exposes all
+        runners supported by the installed FlashInfer build for M <= 8 and
+        tunes cuDNN alone for larger M, avoiding pathological large-M
+        TinyGEMM profiling.
+    flashinfer_autotune:
+        Enable FlashInfer autotuning for supported kernels. Each integration
+        controls a capture-safe tuning scope around its eager warmup.
+    flashinfer_autotune_cache:
+        Optional process-wide FlashInfer autotuner JSON file. The engine loads
+        it before constructing FlashInfer backends. FlashInfer validates the
+        GPU, CUDA, cuBLAS, cuDNN, and package versions before reusing it.
     force_linear_kernel:
         Hard override for :class:`~phyai.layers.linear.KernelDispatcher`
         — when set, every :meth:`select` returns the kernel registered
@@ -362,6 +360,9 @@ class RuntimeConfig:
     use_cuda_graph: bool = True
     flashinfer_workspace_bytes: int = 128 * 1024 * 1024
     flashinfer_prefill_backend: str | None = None
+    flashinfer_bf16_backend: str = "cudnn"
+    flashinfer_autotune: bool = False
+    flashinfer_autotune_cache: str | None = None
     force_linear_kernel: str | None = None
     debug_tensor_dump_dir: str | None = None
     debug_tensor_dump_filter: tuple[str, ...] | None = None
@@ -381,6 +382,26 @@ class RuntimeConfig:
                 f"None or one of {sorted(_VALID_FLASHINFER_PREFILL_BACKENDS)} "
                 f"(the names BatchPrefillWithPagedKVCacheWrapper accepts; "
                 f"'cute-dsl' is paged-incompatible)."
+            )
+        gemm_be = self.flashinfer_bf16_backend.lower()
+        if gemm_be not in _VALID_FLASHINFER_BF16_BACKENDS:
+            raise ValueError(
+                f"RuntimeConfig.flashinfer_bf16_backend={gemm_be!r} must be "
+                f"one of {sorted(_VALID_FLASHINFER_BF16_BACKENDS)}."
+            )
+        object.__setattr__(self, "flashinfer_bf16_backend", gemm_be)
+        if not isinstance(self.flashinfer_autotune, bool):
+            raise ValueError(
+                "RuntimeConfig.flashinfer_autotune must be a bool, got "
+                f"{self.flashinfer_autotune!r}."
+            )
+        tune_cache = self.flashinfer_autotune_cache
+        if tune_cache is not None and (
+            not isinstance(tune_cache, str) or not tune_cache
+        ):
+            raise ValueError(
+                "RuntimeConfig.flashinfer_autotune_cache must be None or "
+                f"a non-empty path string, got {tune_cache!r}."
             )
         flt = self.debug_tensor_dump_filter
         if flt is not None:
@@ -448,7 +469,6 @@ class EngineConfig:
             backends=BackendConfig(
                 attn="flashinfer" if cuda else "sdpa",
                 norm="flashinfer" if cuda else "phyai-kernel",
-                linear=None,
                 vgpu=None,
             ),
             device=DeviceConfig(
@@ -474,8 +494,6 @@ class EngineConfig:
             backends_kw["attn"] = v
         if (v := envs.PHYAI_NORM_BACKEND.get()) is not None:
             backends_kw["norm"] = v
-        if (v := envs.PHYAI_LINEAR_BACKEND.get()) is not None:
-            backends_kw["linear"] = v
         if (v := envs.PHYAI_VGPU_BACKEND.get()) is not None:
             backends_kw["vgpu"] = v
 
@@ -508,6 +526,12 @@ class EngineConfig:
             runtime_kw["flashinfer_workspace_bytes"] = v
         if (v := envs.PHYAI_FLASHINFER_PREFILL_BACKEND.get()) is not None:
             runtime_kw["flashinfer_prefill_backend"] = v
+        if (v := envs.PHYAI_FLASHINFER_BF16_BACKEND.get()) is not None:
+            runtime_kw["flashinfer_bf16_backend"] = v
+        if (v := envs.PHYAI_FLASHINFER_AUTOTUNE.get()) is not None:
+            runtime_kw["flashinfer_autotune"] = v
+        if (v := envs.PHYAI_FLASHINFER_AUTOTUNE_CACHE.get()) is not None:
+            runtime_kw["flashinfer_autotune_cache"] = v
         if (v := envs.PHYAI_FORCE_LINEAR_KERNEL.get()) is not None:
             runtime_kw["force_linear_kernel"] = v
         if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_DIR.get()) is not None:

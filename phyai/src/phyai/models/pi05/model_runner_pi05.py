@@ -178,8 +178,11 @@ class PI05VisionRunner(ModelRunner):
 
 
 class PI05LLMRunner(ModelRunner):
-    """PaliGemma backbone runner — runs paligemma's 18 layers over the
-    per-sample-padded prefix and writes K/V to ``kv_pool``.
+    """PaliGemma backbone runner — populates all 18 layers of prefix K/V.
+
+    The final layer stops after its cache write because the action expert is
+    the only consumer; earlier layers still produce the hidden state needed by
+    the following layer.
 
     Captured at fixed shape ``(B * n_per_sample, hidden_size)``. Owns
     a single :class:`ARAttentionBackend` instance built via
@@ -362,8 +365,8 @@ class PI05LLMRunner(ModelRunner):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         write_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run paligemma's 18 layers, writing K/V into ``self.kv_pool``."""
+    ) -> None:
+        """Populate the prefix K/V cache consumed by the action expert."""
         ctx = ARAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
@@ -372,7 +375,7 @@ class PI05LLMRunner(ModelRunner):
             kv_pool=self.kv_pool,
             write_indices=write_indices,
         )
-        return self.paligemma_lm(hidden_states, position_ids, self.rope, ctx)
+        self.paligemma_lm.write_prefix_kv(hidden_states, position_ids, self.rope, ctx)
 
     def plan_inference(self, meta: ARAttnMetadata) -> None:
         """Stage attention metadata for the next ``forward`` call.
@@ -385,6 +388,37 @@ class PI05LLMRunner(ModelRunner):
             self.attn_backend.replay_metadata(self._capture_plan, meta)
         else:
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
+
+    def prefix_input_buffer(self, n_per_sample: int) -> torch.Tensor | None:
+        """Return the captured graph's prefix input buffer when available."""
+        graph = self.graphs.get(n_per_sample)
+        if graph is None:
+            return None
+        return graph.input_buffer("hidden_states")
+
+    def stage_graph_layout(
+        self,
+        position_ids: torch.Tensor,
+        write_indices: torch.Tensor,
+        *,
+        n_per_sample: int,
+    ) -> None:
+        """Update graph inputs that change only with the attention layout."""
+        graph = self.graphs.get(n_per_sample)
+        if graph is None:
+            return
+        graph.input_buffer("position_ids").copy_(position_ids)
+        graph.input_buffer("write_indices").copy_(write_indices)
+
+    def replay_staged(self, *, n_per_sample: int) -> None:
+        """Replay a prefix graph after its static inputs were staged in place."""
+        graph = self.graphs.get(n_per_sample)
+        if graph is None:
+            raise ValueError(
+                f"no captured LLM graph for n_per_sample={n_per_sample}; "
+                f"captured buckets: {sorted(self.graphs)}."
+            )
+        graph.replay()
 
     def forward(
         self, batch: LLMForwardBatch, *, n_per_sample: int | None = None
@@ -753,6 +787,18 @@ class PI05ExpertRunner(ModelRunner):
             self.attn_backend.replay_metadata(self._capture_plan, meta)
         else:
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
+
+    def noise_input_buffer(self) -> torch.Tensor | None:
+        """Return the captured graph's noise buffer when available."""
+        if self.graph is None:
+            return None
+        return self.graph.input_buffer("noise")
+
+    def replay_staged(self) -> torch.Tensor:
+        """Replay the expert graph after its noise input was staged in place."""
+        if self.graph is None:
+            raise RuntimeError("PI05ExpertRunner has no captured CUDA graph.")
+        return self.graph.replay()
 
     def forward(self, noise: torch.Tensor) -> torch.Tensor:
         """Run the whole Euler loop from ``noise``; return final ``x_t``.

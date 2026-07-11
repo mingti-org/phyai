@@ -25,6 +25,7 @@ Three concepts:
   :func:`~phyai.utils.cuda.init_cuda`,
   :func:`~phyai.utils.cuda.init_cublas`,
   :func:`~phyai.parallel.dist.init_dist`,
+  :func:`init_flashinfer`,
   :func:`phyai.parallel.init`,
   :func:`phyai.layers.linear.init`) in :meth:`__init__`. Each ``init_*``
   is independently callable so tests / advanced users can opt into
@@ -49,7 +50,7 @@ from torch import nn
 
 import phyai.layers.linear as L
 import phyai.parallel as P
-from phyai.engine_config import EngineConfig, init_engine_config
+from phyai.engine_config import EngineConfig, get_engine_config, init_engine_config
 from phyai.parallel.dist import init_dist
 from phyai.runtime.tensor_dump import (
     TensorDumper,
@@ -61,6 +62,29 @@ from phyai.utils.cuda import init_cublas, init_cuda
 
 
 logger = logging.getLogger(__name__)
+
+
+def init_flashinfer() -> None:
+    """Load the process-wide FlashInfer autotuner cache, when configured."""
+    cache = get_engine_config().runtime.flashinfer_autotune_cache
+    if cache is None:
+        return
+
+    try:
+        import flashinfer
+    except ImportError as e:
+        raise RuntimeError(
+            "flashinfer_autotune_cache requires FlashInfer to be installed."
+        ) from e
+
+    autotune = getattr(flashinfer, "autotune", None)
+    if autotune is None:
+        raise RuntimeError(
+            "flashinfer_autotune_cache requires a FlashInfer release that "
+            "exports flashinfer.autotune."
+        )
+    with autotune(tune_mode=False, cache=cache):
+        pass
 
 
 def _force_eager_for_dump(cfg: EngineConfig) -> EngineConfig:
@@ -254,6 +278,7 @@ class Engine:
         self._owns_pg: bool = init_dist(
             world_size=parallel.world_size, device_type=device_type
         )
+        init_flashinfer()
 
         # phyai mesh + linear dispatcher. Both are process-level
         # singletons; building them here means model constructors
@@ -374,6 +399,7 @@ __all__ = [
     "Engine",
     "Entry",
     "EntryArgs",
+    "init_flashinfer",
 ]
 
 
