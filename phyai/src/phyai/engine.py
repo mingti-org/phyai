@@ -389,6 +389,9 @@ __all__ = [
 
 from phyai.models.pi0 import main_pi0 as _main_pi0  # noqa: E402, F401
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
+from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
+    main_minicpm_gr00t as _main_minicpm_gr00t,
+)
 from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
 from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
