@@ -11,6 +11,7 @@ from phyai.layers.rotary_embedding import (
     compute_qwen3vl_mrope_cos_sin_from_inv_freq,
 )
 from phyai.models.minicpm_gr00t.modeling_minicpm_gr00t import MiniCPMGR00TModel
+from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphRegistry
 from phyai.runtime.model_runner import ModelRunner
 
 
@@ -186,20 +187,30 @@ def build_dit_time_sinusoid(
 
 
 class MiniCPMGR00TModelRunner(ModelRunner):
-    """Eager reference runner; all dynamic tensor construction lives here."""
+    """Run MiniCPM-GR00T eagerly or with shape-bucketed CUDA graphs."""
 
     def __init__(
         self,
         model: MiniCPMGR00TModel,
         *,
         device: torch.device | str,
+        use_cuda_graph: bool = True,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.config = model.config
+        self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
+        self._vlm_graphs = CudaGraphRegistry()
+        self._action_graphs = CudaGraphRegistry()
+        self._vlm_layouts: dict[object, MiniCPMGR00TVisionLayout] = {}
 
     def setup(self) -> None:
         self.model.eval()
+
+    def close(self) -> None:
+        self._vlm_graphs = CudaGraphRegistry()
+        self._action_graphs = CudaGraphRegistry()
+        self._vlm_layouts.clear()
 
     def _encode_vision_segments(
         self,
@@ -228,33 +239,16 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             )
         return torch.cat(parts, dim=1)
 
-    @torch.inference_mode()
-    def encode_vlm(
+    def _encode_vlm_core(
         self,
         *,
         input_ids: torch.Tensor,
         pixel_values: torch.Tensor,
-        target_sizes: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        layout: MiniCPMGR00TVisionLayout,
     ) -> torch.Tensor:
-        """Run NaViT, scatter image features, then Qwen3.5 prefill."""
+        """Run the fixed-shape VLM path without host reads or validation."""
 
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError(
-                f"input_ids must have shape (1, S), got {tuple(input_ids.shape)}."
-            )
-        target_sizes = target_sizes.to(device=self.device, dtype=torch.int32)
-        position_grid_size = (
-            self.config.vision.image_size // self.config.vision.patch_size
-        )
-        layout = build_vision_layout(
-            target_sizes,
-            position_grid_size=position_grid_size,
-            device=self.device,
-        )
-
-        pixels = pixel_values.to(device=self.device, dtype=torch.bfloat16)
-        vision = self.model.embed_vision(pixels, layout.position_ids)
+        vision = self.model.embed_vision(pixel_values, layout.position_ids)
         vision = self._encode_vision_segments(
             vision,
             layout.source_sizes,
@@ -281,15 +275,8 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         grouped, _ = group_spatial_2x2(vision, layout.merged_sizes)
         image_features = self.model.downsample_vision(grouped)
 
-        input_ids = input_ids.to(device=self.device, dtype=torch.int64)
         text = self.model.embed_text(input_ids)
         image_mask = input_ids == self.config.image_token_id
-        image_token_count = int(image_mask.sum().item())
-        if image_token_count != image_features.shape[0]:
-            raise ValueError(
-                f"input_ids contain {image_token_count} image tokens but vision "
-                f"produced {image_features.shape[0]} features."
-            )
         expanded_mask = image_mask.unsqueeze(-1).expand_as(text)
         text = text.masked_scatter(
             expanded_mask,
@@ -309,19 +296,101 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             text_model.rotary_emb.inv_freq,
             self.config.text.mrope_section,
         )
-        mask = None
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device=self.device)
-            if not bool(torch.all(attention_mask == 1)):
-                raise NotImplementedError(
-                    "MiniCPM-GR00T currently supports unpadded batch-one prefill only."
-                )
         return self.model.encode_text(
             text,
             cos=cos.to(text.dtype),
             sin=sin.to(text.dtype),
-            attention_mask=mask,
+            attention_mask=None,
         )
+
+    @torch.inference_mode()
+    def encode_vlm(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        target_sizes: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run NaViT, scatter image features, then Qwen3.5 prefill."""
+
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                f"input_ids must have shape (1, S), got {tuple(input_ids.shape)}."
+            )
+        if attention_mask is not None:
+            if not bool(torch.all(attention_mask == 1)):
+                raise NotImplementedError(
+                    "MiniCPM-GR00T currently supports unpadded batch-one prefill only."
+                )
+
+        target_sizes_cpu = target_sizes.detach().to(device="cpu", dtype=torch.int32)
+        source_sizes = tuple(
+            (int(height), int(width)) for height, width in target_sizes_cpu.tolist()
+        )
+        if not source_sizes:
+            raise ValueError("target_sizes must contain at least one image.")
+        if any(
+            height <= 0 or width <= 0 or height % 4 or width % 4
+            for height, width in source_sizes
+        ):
+            raise ValueError(
+                "Every target grid must be positive and divisible by four, "
+                f"got {source_sizes}."
+            )
+        expected_image_tokens = sum(
+            (height // 4) * (width // 4) for height, width in source_sizes
+        )
+        image_token_count = int((input_ids == self.config.image_token_id).sum().item())
+        if image_token_count != expected_image_tokens:
+            raise ValueError(
+                f"input_ids contain {image_token_count} image tokens but vision "
+                f"layout produces {expected_image_tokens} features."
+            )
+
+        graph_inputs = {
+            "input_ids": input_ids.to(device=self.device, dtype=torch.int64),
+            "pixel_values": pixel_values.to(
+                device=self.device,
+                dtype=torch.bfloat16,
+            ),
+        }
+        graph_key = (
+            tuple(graph_inputs["input_ids"].shape),
+            tuple(graph_inputs["pixel_values"].shape),
+            source_sizes,
+        )
+        if self.use_cuda_graph:
+            graph = self._vlm_graphs.get(graph_key)
+            if graph is not None:
+                return graph.replay(graph_inputs)
+
+        position_grid_size = (
+            self.config.vision.image_size // self.config.vision.patch_size
+        )
+        layout = build_vision_layout(
+            target_sizes_cpu,
+            position_grid_size=position_grid_size,
+            device=self.device,
+        )
+        if not self.use_cuda_graph:
+            return self._encode_vlm_core(**graph_inputs, layout=layout)
+
+        graph = CudaGraph()
+
+        def _forward(
+            *, input_ids: torch.Tensor, pixel_values: torch.Tensor
+        ) -> torch.Tensor:
+            return self._encode_vlm_core(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                layout=layout,
+            )
+
+        graph.capture(_forward, graph_inputs)
+        self._vlm_graphs.register(graph_key, graph)
+        self._vlm_layouts[graph_key] = layout
+        return graph.replay(graph_inputs)
 
     @torch.inference_mode()
     def predict_clean_action(
@@ -397,9 +466,88 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         decoded = self.model.decode_action(dit_output)
         return decoded[:, -cfg.action_horizon :]
 
+    def _predict_actions_loop(
+        self,
+        *,
+        vlm_hidden_states: torch.Tensor,
+        state: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the complete fixed-step clean-action schedule."""
+
+        cfg = self.config.action
+        batch_size = noise.shape[0]
+        actions = torch.zeros_like(noise)
+        for step in range(cfg.num_inference_steps, 0, -1):
+            time_continuous = step / float(cfg.num_inference_steps)
+            timestep_value = min(
+                int(time_continuous * cfg.dit.num_timestep_buckets),
+                cfg.dit.num_timestep_buckets - 1,
+            )
+            timestep = torch.full(
+                (batch_size,),
+                timestep_value,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            noisy_actions = time_continuous * noise + (1.0 - time_continuous) * actions
+            actions = self.predict_clean_action(
+                vlm_hidden_states=vlm_hidden_states,
+                state=state,
+                noisy_actions=noisy_actions,
+                timestep=timestep,
+            )
+        return actions
+
+    @torch.inference_mode()
+    def predict_actions(
+        self,
+        *,
+        vlm_hidden_states: torch.Tensor,
+        state: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run all action denoising steps eagerly or as one graph replay."""
+
+        cfg = self.config.action
+        batch_size = noise.shape[0]
+        expected_noise_shape = (batch_size, cfg.action_horizon, cfg.action_dim)
+        if tuple(noise.shape) != expected_noise_shape:
+            raise ValueError(
+                f"noise has shape {tuple(noise.shape)}; expected "
+                f"{expected_noise_shape}."
+            )
+        if state.ndim == 2:
+            state = state.unsqueeze(1)
+        expected_state_shape = (batch_size, 1, cfg.proprio_dim)
+        if tuple(state.shape) != expected_state_shape:
+            raise ValueError(
+                f"state has shape {tuple(state.shape)}; expected "
+                f"{expected_state_shape}."
+            )
+
+        graph_inputs = {
+            "vlm_hidden_states": vlm_hidden_states.to(device=self.device),
+            "state": state.to(device=self.device, dtype=torch.float32),
+            "noise": noise.to(device=self.device, dtype=torch.float32),
+        }
+        if not self.use_cuda_graph:
+            return self._predict_actions_loop(**graph_inputs)
+
+        graph_key = tuple(
+            (name, tuple(tensor.shape), tensor.dtype)
+            for name, tensor in graph_inputs.items()
+        )
+        graph = self._action_graphs.get(graph_key)
+        if graph is None:
+            graph = CudaGraph()
+            graph.capture(self._predict_actions_loop, graph_inputs)
+            self._action_graphs.register(graph_key, graph)
+        return graph.replay(graph_inputs).clone()
+
     def forward(self, batch) -> torch.Tensor:
         raise NotImplementedError(
-            "Use encode_vlm() and predict_clean_action(); the scheduler owns orchestration."
+            "Use encode_vlm() and predict_actions(); the scheduler owns orchestration."
         )
 
 

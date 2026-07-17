@@ -69,28 +69,11 @@ class MiniCPMGR00TWS1Scheduler(Scheduler):
                 )
             noise = request.noise.to(device=self.device, dtype=torch.float32)
 
-        actions = torch.zeros_like(noise)
-        num_steps = cfg.num_inference_steps
-        for step in range(num_steps, 0, -1):
-            time_continuous = step / float(num_steps)
-            timestep_value = min(
-                int(time_continuous * cfg.dit.num_timestep_buckets),
-                cfg.dit.num_timestep_buckets - 1,
-            )
-            timestep = torch.full(
-                (batch_size,),
-                timestep_value,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            noisy_actions = time_continuous * noise + (1.0 - time_continuous) * actions
-            actions = self.runner.predict_clean_action(
-                vlm_hidden_states=vlm_hidden_states,
-                state=request.state,
-                noisy_actions=noisy_actions,
-                timestep=timestep,
-            )
-        return actions
+        return self.runner.predict_actions(
+            vlm_hidden_states=vlm_hidden_states,
+            state=request.state,
+            noise=noise,
+        )
 
     def close(self) -> None:
         self.runner.close()

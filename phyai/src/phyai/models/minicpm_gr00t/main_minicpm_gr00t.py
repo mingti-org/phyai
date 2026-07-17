@@ -102,6 +102,7 @@ class MiniCPMGR00TEntry(Entry):
         runner = MiniCPMGR00TModelRunner(
             self.model,
             device=engine.device.target,
+            use_cuda_graph=engine.runtime.use_cuda_graph,
         )
         self.scheduler = MiniCPMGR00TWS1Scheduler(
             runner,

@@ -15,6 +15,8 @@ from phyai.layers.conv import Conv1d, Conv2d
 from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -86,6 +88,15 @@ class MiniCPMGR00TQwenRMSNormGated(nn.Module):
         self.weight.weight_loader = replicated()
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if hidden_states.is_cuda:
+            from phyai_kernel import rmsnorm_silu_mul
+
+            return rmsnorm_silu_mul(
+                hidden_states.contiguous(),
+                gate.contiguous(),
+                self.weight,
+                self.eps,
+            )
         input_dtype = hidden_states.dtype
         normalized = hidden_states.float()
         variance = normalized.square().mean(dim=-1, keepdim=True)
@@ -115,37 +126,19 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
         self.value_dim = self.num_value_heads * self.value_head_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        self.in_proj_qkv = ReplicatedLinear(
+        self.in_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            self.conv_dim,
+            [
+                self.conv_dim,
+                self.value_dim,
+                self.num_value_heads,
+                self.num_value_heads,
+            ],
             bias=False,
             params_dtype=params_dtype,
             device=device,
-            prefix=f"{prefix}.in_proj_qkv",
-        )
-        self.in_proj_z = ReplicatedLinear(
-            config.hidden_size,
-            self.value_dim,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.in_proj_z",
-        )
-        self.in_proj_b = ReplicatedLinear(
-            config.hidden_size,
-            self.num_value_heads,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.in_proj_b",
-        )
-        self.in_proj_a = ReplicatedLinear(
-            config.hidden_size,
-            self.num_value_heads,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.in_proj_a",
+            hf_legs=("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"),
+            prefix=f"{prefix}.in_proj",
         )
         self.conv1d = Conv1d(
             self.conv_dim,
@@ -202,14 +195,32 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
         if attention_mask is not None and hidden_states.shape[0] > 1:
             hidden_states = hidden_states * attention_mask[..., None]
         batch_size, seq_len, _ = hidden_states.shape
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        mixed_qkv = self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :seq_len]
-        mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
-            (self.key_dim, self.key_dim, self.value_dim),
+        projected, _ = self.in_proj(hidden_states)
+        mixed_qkv, z, a, b = projected.split(
+            (
+                self.conv_dim,
+                self.value_dim,
+                self.num_value_heads,
+                self.num_value_heads,
+            ),
             dim=-1,
         )
+        if mixed_qkv.is_cuda:
+            from phyai_kernel import causal_conv1d_silu_split_qkv
+
+            query, key, value = causal_conv1d_silu_split_qkv(
+                mixed_qkv,
+                self.conv1d.weight,
+                (self.key_dim, self.key_dim, self.value_dim),
+            )
+        else:
+            mixed_qkv = self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :seq_len]
+            mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
+            query, key, value = torch.split(
+                mixed_qkv,
+                (self.key_dim, self.key_dim, self.value_dim),
+                dim=-1,
+            )
         query = query.reshape(
             batch_size, seq_len, self.num_key_heads, self.key_head_dim
         )
@@ -221,22 +232,19 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
             repeats = self.num_value_heads // self.num_key_heads
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
-        a, _ = self.in_proj_a(hidden_states)
-        b, _ = self.in_proj_b(hidden_states)
         output = self.gdn(
             query,
             key,
             value,
-            a,
-            b,
+            a.contiguous(),
+            b.contiguous(),
             self.A_log,
             self.dt_bias,
             ctx=gdn_ctx,
         )
-        z, _ = self.in_proj_z(hidden_states)
         output = self.norm(
             output.reshape(-1, self.value_head_dim),
-            z.reshape(-1, self.value_head_dim),
+            z.contiguous().reshape(-1, self.value_head_dim),
         ).reshape(batch_size, seq_len, self.value_dim)
         output, _ = self.out_proj(output)
         return output
@@ -261,29 +269,16 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.rotary_emb = rotary_emb
-        self.q_proj = ReplicatedLinear(
+        query_gate_size = self.num_heads * self.head_dim * 2
+        key_value_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            self.num_heads * self.head_dim * 2,
+            [query_gate_size, key_value_size, key_value_size],
             bias=config.attention_bias,
             params_dtype=params_dtype,
             device=device,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ReplicatedLinear(
-            config.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ReplicatedLinear(
-            config.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.v_proj",
+            hf_legs=("q_proj", "k_proj", "v_proj"),
+            prefix=f"{prefix}.qkv_proj",
         )
         self.q_norm = GemmaRMSNorm(
             self.head_dim,
@@ -326,15 +321,21 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         attn_ctx: ARAttnCtx | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        query_gate, _ = self.q_proj(hidden_states)
+        projected, _ = self.qkv_proj(hidden_states)
+        query_gate, key, value = projected.split(
+            (
+                self.num_heads * self.head_dim * 2,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+            ),
+            dim=-1,
+        )
         query, gate = query_gate.view(
             batch_size,
             seq_len,
             self.num_heads,
             self.head_dim * 2,
         ).chunk(2, dim=-1)
-        key, _ = self.k_proj(hidden_states)
-        value, _ = self.v_proj(hidden_states)
         query = self.q_norm(query)
         key = self.k_norm(
             key.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -345,48 +346,6 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         output = output.reshape(batch_size, seq_len, -1)
         output = output * torch.sigmoid(gate.reshape(batch_size, seq_len, -1))
         output, _ = self.o_proj(output)
-        return output
-
-
-class MiniCPMGR00TQwenMLP(nn.Module):
-    def __init__(
-        self,
-        config: MiniCPMGR00TTextConfig,
-        *,
-        params_dtype: torch.dtype,
-        device: torch.device | str,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.gate_proj = ReplicatedLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = ReplicatedLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.up_proj",
-        )
-        self.down_proj = ReplicatedLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.down_proj",
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.gate_proj(hidden_states)
-        up, _ = self.up_proj(hidden_states)
-        output, _ = self.down_proj(F.silu(gate) * up)
         return output
 
 
@@ -424,10 +383,13 @@ class MiniCPMGR00TQwenDecoderLayer(nn.Module):
                 device=device,
                 prefix=f"{prefix}.self_attn",
             )
-        self.mlp = MiniCPMGR00TQwenMLP(
-            config,
+        self.mlp = DenseMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            activation="silu",
+            gated=True,
+            bias=False,
             params_dtype=params_dtype,
-            device=device,
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = GemmaRMSNorm(
@@ -451,14 +413,18 @@ class MiniCPMGR00TQwenDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
+        residual: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attn_ctx: ARAttnCtx | None = None,
         gdn_ctx: GatedDeltaNetCtx | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        normalized = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            normalized = self.input_layernorm(hidden_states)
+        else:
+            normalized, residual = self.input_layernorm(hidden_states, residual)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 normalized,
@@ -472,10 +438,11 @@ class MiniCPMGR00TQwenDecoderLayer(nn.Module):
                 sin=sin,
                 attn_ctx=attn_ctx,
             )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
-        return residual + hidden_states
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual,
+        )
+        return self.mlp(hidden_states), residual
 
 
 class MiniCPMGR00TTextModel(nn.Module):
@@ -559,17 +526,22 @@ class MiniCPMGR00TTextModel(nn.Module):
                 f"gdn_ctxs has {len(gdn_ctxs)} entries; expected {len(self.layers)}."
             )
         hidden_states = inputs_embeds
+        residual = None
         for layer_idx, layer in enumerate(self.layers):
             gdn_ctx = None if gdn_ctxs is None else gdn_ctxs[layer_idx]
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
+                residual=residual,
                 cos=cos,
                 sin=sin,
                 attention_mask=attention_mask,
                 attn_ctx=attn_ctx,
                 gdn_ctx=gdn_ctx,
             )
-        return self.norm(hidden_states)
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class MiniCPMGR00TVisionAttention(nn.Module):
@@ -588,29 +560,14 @@ class MiniCPMGR00TVisionAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        self.q_proj = ReplicatedLinear(
+        self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
-            self.hidden_size,
+            self.head_dim,
+            self.num_heads,
             bias=True,
             params_dtype=params_dtype,
             device=device,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.v_proj",
+            prefix=f"{prefix}.qkv_proj",
         )
         self.attn = Attention(
             self.num_heads,
@@ -634,9 +591,8 @@ class MiniCPMGR00TVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        query, _ = self.q_proj(hidden_states)
-        key, _ = self.k_proj(hidden_states)
-        value, _ = self.v_proj(hidden_states)
+        projected, _ = self.qkv_proj(hidden_states)
+        query, key, value = projected.split(self.hidden_size, dim=-1)
         query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
         key = key.view(batch_size, seq_len, self.num_heads, self.head_dim)
         value = value.view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -1103,30 +1059,36 @@ class MiniCPMGR00TDiTAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.attention_head_dim
         self.hidden_size = config.hidden_size
-        self.to_q = ReplicatedLinear(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.to_q",
-        )
-        self.to_k = ReplicatedLinear(
-            context_dim,
-            self.hidden_size,
-            bias=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.to_k",
-        )
-        self.to_v = ReplicatedLinear(
-            context_dim,
-            self.hidden_size,
-            bias=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.to_v",
-        )
+        self.self_attention = context_dim == self.hidden_size
+        if self.self_attention:
+            self.to_qkv = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.num_heads,
+                bias=True,
+                params_dtype=params_dtype,
+                device=device,
+                hf_legs={"q": "to_q", "k": "to_k", "v": "to_v"},
+                prefix=f"{prefix}.to_qkv",
+            )
+        else:
+            self.to_q = ReplicatedLinear(
+                self.hidden_size,
+                self.hidden_size,
+                bias=True,
+                params_dtype=params_dtype,
+                device=device,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_kv = MergedColumnParallelLinear(
+                context_dim,
+                [self.hidden_size, self.hidden_size],
+                bias=True,
+                params_dtype=params_dtype,
+                device=device,
+                hf_legs=("to_k", "to_v"),
+                prefix=f"{prefix}.to_kv",
+            )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -1149,9 +1111,13 @@ class MiniCPMGR00TDiTAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size, query_len, _ = hidden_states.shape
         key_len = context.shape[1]
-        query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(context)
-        value, _ = self.to_v(context)
+        if self.self_attention:
+            projected, _ = self.to_qkv(hidden_states)
+            query, key, value = projected.split(self.hidden_size, dim=-1)
+        else:
+            query, _ = self.to_q(hidden_states)
+            projected, _ = self.to_kv(context)
+            key, value = projected.split(self.hidden_size, dim=-1)
         query = query.view(batch_size, query_len, self.num_heads, self.head_dim)
         key = key.view(batch_size, key_len, self.num_heads, self.head_dim)
         value = value.view(batch_size, key_len, self.num_heads, self.head_dim)
