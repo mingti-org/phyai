@@ -649,11 +649,7 @@ class GR00TN17AdaLayerNorm(nn.Module):
 class GR00TN17Attention(nn.Module):
     """Small backend-selectable attention module for DiT self/cross attention.
 
-    The default backend is ``"sdpa"`` (phyai's recommended path, CUDA-graph
-    captureable).
-    Masked cross-attention compacts K/V by the key mask before calling the
-    shared PhyAI attention layer, so the local module does not own a separate
-    SDPA implementation.
+    The default backend is ``"sdpa"`` (phyai's recommended CUDA-graph path).
     """
 
     _SUPPORTED_BACKENDS = frozenset({"sdpa", "flashinfer"})
@@ -714,6 +710,16 @@ class GR00TN17Attention(nn.Module):
                 f"match K/V batch/source shape {(batch, k.shape[1])}."
             )
         mask = attention_mask.to(device=q.device, dtype=torch.bool)
+        if self.attention_backend == "sdpa" and batch > 1:
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=mask[:, None, None, :],
+                scale=self.attn.scale,
+            )
+            return out.transpose(1, 2).contiguous()
+
         outputs: list[torch.Tensor] = []
         for batch_idx in range(batch):
             valid = mask[batch_idx]

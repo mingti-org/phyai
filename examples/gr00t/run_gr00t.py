@@ -1,25 +1,16 @@
-"""Run GR00T-N1.7 inference end-to-end through the phyai engine plugin path.
+"""Run GR00T-N1.7 inference end-to-end through the PhyAI engine.
 
-The ``phyai_utils_tools.models.gr00t.GR00TProcessor`` turns raw video, state,
-and language inputs into ``GR00TN17Request`` tensors; the engine runs the
-Qwen3-VL backbone plus the flow-matching action head; the processor decodes
-the normalized action chunk back to physical units. ``phyai`` owns model
-execution, while preprocessing and decoding stay in ``phyai-utils-tools``.
+``GR00TProcessor`` converts a checkpoint-shaped synthetic observation into a
+prepared request. The engine runs the Qwen3-VL backbone and flow-matching
+action head, then the processor decodes the normalized action chunk. Inputs
+are random, so this example verifies the execution path rather than policy
+quality.
 
 Run::
 
-    PYTHONPATH=phyai/src:phyai-utils-tools/src \\
-    python examples/gr00t/run_gr00t.py \\
+    uv run python examples/gr00t/run_gr00t.py \\
         --checkpoint <gr00t-checkpoint-dir> \\
         --embodiment-tag LIBERO_PANDA
-
-Inputs are synthetic, so action values are not meaningful. This script checks
-the processor -> engine -> scheduler -> decoder wiring and reports engine-step
-latency. Common options include ``--batch-size``, ``--image-size``,
-``--task``, ``--params-dtype``, ``--no-cuda-graph``, ``--online``, and
-``--backbone-model-name-or-path``. Pass ``--dump-dir`` to capture debug tensor
-dumps; dumping disables CUDA graphs because forward hooks do not run inside
-captured graphs.
 """
 
 from __future__ import annotations
@@ -170,9 +161,7 @@ def main() -> None:
         help=(
             "Enable debug tensor dumping to this directory: every leaf operator's "
             "output is written to <dir>/rank{R}_pid{P}/pass{N}.pt, one file per "
-            "engine.step(). Forces use_cuda_graph=False because forward hooks do "
-            "not run under a captured graph. Load a pass with "
-            "phyai.runtime.tensor_dump.load_pass."
+            "engine.step(). Load a pass with phyai.runtime.tensor_dump.load_pass."
         ),
     )
     parser.add_argument(
@@ -212,6 +201,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.params_dtype]
+    device = torch.device("cuda")
     loading_kwargs = {"trust_remote_code": True, "local_files_only": not args.online}
     use_cuda_graph = args.dump_dir is None and not args.no_cuda_graph
 
@@ -259,7 +249,18 @@ def main() -> None:
             task=args.task,
         )
         prepared = processor.process_observation(observation)
-        request = GR00TN17Request(tensors=prepared.tensors)
+        tensors = {
+            key: value.to(device=device) if isinstance(value, torch.Tensor) else value
+            for key, value in prepared.tensors.items()
+        }
+        noise = torch.randn(
+            args.batch_size,
+            cfg.action_head.action_horizon,
+            cfg.action_head.max_action_dim,
+            dtype=dtype,
+            device=device,
+        )
+        request = GR00TN17Request(tensors=tensors, noise=noise)
 
         normalized_action, stats = benchmark(
             engine,

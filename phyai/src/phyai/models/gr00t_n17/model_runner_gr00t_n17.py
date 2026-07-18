@@ -609,14 +609,13 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         )
 
     @staticmethod
-    def _require_shared_mask(mask: torch.Tensor, name: str) -> None:
+    def _mask_rows_are_shared(mask: torch.Tensor, name: str) -> bool:
         if mask.ndim != 2:
             raise ValueError(f"{name} must be 2-D, got {tuple(mask.shape)}.")
-        if mask.shape[0] > 1 and not torch.equal(mask, mask[:1].expand_as(mask)):
-            raise ValueError(
-                "GR00T-N1.7 CUDA graph compacted mask path requires identical "
-                f"{name} rows across the batch."
-            )
+        return mask.shape[0] <= 1 or torch.equal(
+            mask,
+            mask[:1].expand_as(mask),
+        )
 
     def _graph_inputs(
         self,
@@ -630,40 +629,65 @@ class GR00TN17ActionHeadRunner(ModelRunner):
                 raise ValueError("CUDA graph path requires a backbone attention mask.")
             backbone_mask = backbone_output.backbone_attention_mask.bool()
             image_mask = image_mask.bool()
-            self._require_shared_mask(backbone_mask, "backbone_attention_mask")
-            self._require_shared_mask(image_mask, "image_mask")
-            valid_indices = backbone_mask[0].nonzero(as_tuple=True)[0]
-            if valid_indices.numel() == 0:
-                raise ValueError("backbone_attention_mask has no valid tokens.")
-            backbone_features = backbone_output.backbone_features.index_select(
-                1, valid_indices
+            shared_backbone_mask = self._mask_rows_are_shared(
+                backbone_mask,
+                "backbone_attention_mask",
             )
-            compact_image_mask = image_mask.index_select(1, valid_indices)
-            compact_backbone_mask = backbone_mask.new_empty((backbone_mask.shape[0], 0))
-            compact_valid_mask = torch.ones_like(compact_image_mask, dtype=torch.bool)
-            image_attention_mask, non_image_attention_mask = (
-                self._alternate_vl_attention_masks(
-                    compact_valid_mask,
-                    compact_image_mask,
+            shared_image_mask = self._mask_rows_are_shared(image_mask, "image_mask")
+            if shared_backbone_mask and shared_image_mask:
+                valid_indices = backbone_mask[0].nonzero(as_tuple=True)[0]
+                if valid_indices.numel() == 0:
+                    raise ValueError("backbone_attention_mask has no valid tokens.")
+                backbone_features = backbone_output.backbone_features.index_select(
+                    1, valid_indices
                 )
+                compact_image_mask = image_mask.index_select(1, valid_indices)
+                compact_backbone_mask = backbone_mask.new_empty(
+                    (backbone_mask.shape[0], 0)
+                )
+                compact_valid_mask = torch.ones_like(
+                    compact_image_mask, dtype=torch.bool
+                )
+                image_attention_mask, non_image_attention_mask = (
+                    self._alternate_vl_attention_masks(
+                        compact_valid_mask,
+                        compact_image_mask,
+                    )
+                )
+                inputs = {
+                    "backbone_features": backbone_features,
+                    "backbone_attention_mask": compact_backbone_mask,
+                    "image_mask": compact_image_mask,
+                    "image_attention_mask": image_attention_mask,
+                    "non_image_attention_mask": non_image_attention_mask,
+                    "state": action_input.state,
+                    "embodiment_id": action_input.embodiment_id,
+                    "noise": noise,
+                }
+                if self.model.action_head.config.use_alternate_vl_dit:
+                    inputs["image_token_indices"] = compact_image_mask[0].nonzero(
+                        as_tuple=True
+                    )[0]
+                    inputs["non_image_token_indices"] = (
+                        ~compact_image_mask[0]
+                    ).nonzero(as_tuple=True)[0]
+                if action_input.action_mask is not None:
+                    inputs["action_mask"] = action_input.action_mask
+                return inputs
+
+            image_attention_mask, non_image_attention_mask = (
+                self._alternate_vl_attention_masks(backbone_mask, image_mask)
             )
             inputs = {
-                "backbone_features": backbone_features,
-                "backbone_attention_mask": compact_backbone_mask,
-                "image_mask": compact_image_mask,
+                "backbone_features": backbone_output.backbone_features,
+                "backbone_attention_mask": backbone_mask,
+                "image_mask": image_mask,
                 "image_attention_mask": image_attention_mask,
                 "non_image_attention_mask": non_image_attention_mask,
                 "state": action_input.state,
                 "embodiment_id": action_input.embodiment_id,
                 "noise": noise,
             }
-            if self.model.action_head.config.use_alternate_vl_dit:
-                inputs["image_token_indices"] = compact_image_mask[0].nonzero(
-                    as_tuple=True
-                )[0]
-                inputs["non_image_token_indices"] = (~compact_image_mask[0]).nonzero(
-                    as_tuple=True
-                )[0]
             if action_input.action_mask is not None:
                 inputs["action_mask"] = action_input.action_mask
             return inputs

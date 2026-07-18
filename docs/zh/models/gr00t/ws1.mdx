@@ -1,0 +1,308 @@
+---
+title: "GR00T-N1.7 单卡推理"
+description: "PhyAI 如何在单张 GPU 上运行 GR00T-N1.7 推理"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="GR00T-N1.7"
+  subtitle="Vision-Language-Action · 单卡推理"
+  icon="G"
+  rows={{
+    "模型类型": "VLA",
+    "权重": <a href="https://huggingface.co/collections/nvidia/gr00t-n17" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">NVIDIA GR00T-N1.7 collection</a>,
+    "标签": ["VLA", "Cosmos-Reason2-2B", "Qwen3-VL", "flow-matching", "single-GPU"],
+    "输入": "RGB 相机 · 机器人状态 · 语言指令",
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17WS1Scheduler</code>,
+    "插件": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">gr00t_n17</code>,
+    "参数精度": "bf16",
+    "论文": <a href="https://arxiv.org/abs/2503.14734" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2503.14734</a>,
+  }}
+/>
+
+# 概述
+
+[GR00T-N1.7](https://github.com/NVIDIA/Isaac-GR00T) 是一个视觉-语言-动作（VLA）模型。它使用基于 Qwen3-VL 架构的 [Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B) 作为 backbone，对相机图像和语言指令进行编码；随后，flow-matching action head 结合这些特征与机器人状态，对 action chunk 进行去噪。
+
+embodiment ID（具身 ID）是一个显式路由输入，而不是传入 action transformer 的序列 token。PhyAI 根据它选择对应具身的状态编码器、动作编码器和动作解码器。action transformer 接收这些模块生成的编码特征，因此具身 ID 会间接影响其输入，但原始 ID 不会被追加到 token 序列中。
+
+PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎接收模型所需的 tensor，并返回归一化 action chunk。图像变换、tokenization、状态归一化、具身信息处理和动作解码由引擎外部的 `GR00TProcessor` 完成。
+
+<Note>
+  本页示例使用官方 `nvidia/GR00T-N1.7-LIBERO` 权重及其 `libero_10` checkpoint 目录完成验证。模型文件和 processor 文件应来自同一套兼容 checkpoint，以确保模型结构、模态定义、归一化统计和具身路由保持一致。
+</Note>
+
+# 架构
+
+`gr00t_n17` 插件遵循 PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine 根据插件名找到 Entry。Entry 负责构建模型、加载权重、创建调度器，并将每个请求转交给 scheduler.step()。">引擎 + 插件契约</Tooltip>：
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/gr00t_n17" defaultOpen>
+    <Tree.File name="main_gr00t_n17.py" />
+    <Tree.File name="scheduler_ws1_gr00t_n17.py" />
+    <Tree.File name="model_runner_gr00t_n17.py" />
+    <Tree.File name="modeling_gr00t_n17.py" />
+    <Tree.File name="qwen3_vl_adapter.py" />
+    <Tree.File name="configuration_gr00t_n17.py" />
+  </Tree.Folder>
+  <Tree.Folder name="phyai-utils-tools/src/phyai_utils_tools/models/gr00t" defaultOpen>
+    <Tree.File name="processor_gr00t.py" />
+    <Tree.File name="ops_gr00t.py" />
+  </Tree.Folder>
+</Tree>
+
+| 组件 | 职责 |
+| --- | --- |
+| `GR00TN17Entry` | 注册 `"gr00t_n17"` 插件、加载 checkpoint，并创建单卡调度器 |
+| `GR00TN17BackboneRunner` | 运行 Cosmos-Reason2/Qwen3-VL 视觉和语言 backbone，并管理按 shape 区分的 CUDA Graph |
+| `GR00TN17ActionHeadRunner` | 选择具身对应的状态/动作编码器与动作解码器投影，采样或接收 action noise，并运行 flow-matching 去噪循环 |
+| `GR00TN17WS1Scheduler` | 准备请求 tensor，将其分发给 backbone 和 action-head runner，并返回归一化 action chunk |
+| `GR00TProcessor` | 将原始 observation 转换为模型 tensor，并把归一化 action chunk 解码为所选具身对应、以物理量表示的动作字段 |
+
+请求路径如下：
+
+```text
+原始相机图像 + 状态 + 指令
+  -> GR00TProcessor.process_observation(...)
+  -> Qwen3-VL 图像/文本 tensor + 归一化并填充后的状态 + embodiment ID
+  -> GR00TN17BackboneRunner
+  -> 视觉-语言 token 特征
+  -> action head:
+       embodiment ID -> 状态编码器
+       noise + timestep + embodiment ID -> 动作编码器
+       状态/动作特征在 AlternateVLDiT 中关注视觉-语言特征
+       embodiment ID -> 动作解码器 -> velocity update（重复执行）
+  -> 带 mask 的归一化 action chunk
+  -> GR00TProcessor.decode_action(..., raw_state=...)
+  -> 所选具身对应、以物理量表示的动作字段
+```
+
+# 运行 GR00T-N1.7
+
+<Steps>
+  <Step title="准备 checkpoint">
+    从 NVIDIA 的 [GR00T-N1.7 collection](https://huggingface.co/collections/nvidia/gr00t-n17) 中选择兼容的 checkpoint。GR00T-N1.7 使用受限访问的 `nvidia/Cosmos-Reason2-2B` backbone 元数据完成 tokenization 和图像预处理，因此首次运行前需要先申请访问权限并登录：
+
+    ```bash
+    uv run hf auth login
+    ```
+
+    LIBERO checkpoint 的模型文件位于 `libero_10` 下。下载 PhyAI 所需的文件：
+
+    ```bash
+    uv run hf download nvidia/GR00T-N1.7-LIBERO \
+      --include "libero_10/config.json" \
+        "libero_10/embodiment_id.json" \
+        "libero_10/model-*.safetensors" \
+        "libero_10/model.safetensors.index.json" \
+        "libero_10/processor_config.json" \
+        "libero_10/statistics.json" \
+      --local-dir checkpoints/GR00T-N1.7-LIBERO
+    ```
+  </Step>
+
+  <Step title="构造 processor 和 engine">
+    processor 和 engine 应使用同一个 checkpoint 目录。内置示例的 `--online` 参数允许首次运行时下载本地尚未缓存的 Cosmos-Reason2 tokenizer 和 preprocessor 文件。
+
+    ```python
+    import torch
+    from pathlib import Path
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
+    from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
+    from phyai.utils import load_config
+    from phyai_utils_tools.models.gr00t import GR00TProcessor
+
+    checkpoint_dir = Path("checkpoints/GR00T-N1.7-LIBERO/libero_10")
+    loading_kwargs = {"trust_remote_code": True, "local_files_only": False}
+    cfg = load_config(checkpoint_dir, GR00TN17Config)
+
+    processor = GR00TProcessor.from_pretrained(
+        checkpoint_dir,
+        embodiment_tag="LIBERO_PANDA",
+        model_name=cfg.backbone.model_name,
+        transformers_loading_kwargs=loading_kwargs,
+    )
+
+    engine = Engine(
+        EngineArgs(
+            plugin="gr00t_n17",
+            plugin_args=GR00TN17Args(
+                checkpoint_dir=checkpoint_dir,
+                max_batch_size=1,
+                backbone_transformers_loading_kwargs=loading_kwargs,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(
+                    target="cuda",
+                    params_dtype=torch.bfloat16,
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=True),
+            ),
+        )
+    )
+    ```
+
+    `max_batch_size` 是调度器允许的 batch 上限。如果后续请求需要更大的 batch，需要重新构建 engine。
+
+    Cosmos-Reason2 的 tokenizer 和 preprocessor 文件进入本地 Hugging Face 缓存后，可将 `local_files_only` 设为 `True`。
+
+    CUDA Graph 按需捕获，并根据输入 shape 复用。新的序列长度 bucket、相机布局、batch shape 或具身组合可能在第一次请求时触发新的捕获。
+  </Step>
+
+  <Step title="处理并运行请求">
+    按照 checkpoint 模态配置中列出的相机、状态和语言字段构造 `GR00TObservation`。processor 会在推理前检查这些字段及其历史长度。
+
+    | 字段 | 值的 shape | Dtype |
+    | --- | --- | --- |
+    | `video[view]` | `(B, T, H, W, 3)` | `np.uint8` |
+    | `state[name]` | `(B, T, D)` | `np.float32` |
+    | `language[name]` | 嵌套的 `(B, T)` | `str` |
+
+    ```python
+    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+
+    prepared = processor.process_observation(observation)
+    normalized_action = engine.step(
+        GR00TN17Request(tensors=prepared.tensors)
+    )
+    action = processor.decode_action(
+        normalized_action,
+        raw_state=prepared.raw_state,
+    )
+    ```
+
+    processor 会从所选 checkpoint 中读取必需的相机视角、状态字段、语言字段和历史长度。对于使用相对动作的 checkpoint，需要保留 `prepared.raw_state`；decoder 会用它在机器人参考系中还原动作。
+
+    `GR00TN17Request.noise` 是可选项。不传时会采样高斯噪声；需要进行确定性回归检查时，可以传入固定 tensor。
+  </Step>
+
+  <Step title="关闭 engine">
+    ```python
+    engine.close()
+    ```
+
+    这会释放 runner 持有的 CUDA Graph 注册表和模型引用。
+  </Step>
+</Steps>
+
+# 端到端示例
+
+`examples/gr00t/run_gr00t.py` 会根据 checkpoint 定义构造一份合成 observation，依次经过 processor、engine 和动作解码。运行命令如下：
+
+```bash
+uv run python examples/gr00t/run_gr00t.py \
+  --checkpoint checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --embodiment-tag LIBERO_PANDA
+```
+
+脚本会输出 `engine.step()` 的延迟统计：3 次预热和 30 次计时的 mean / median / std / min / max。observation 预处理、输入搬运到 GPU 以及动作解码不在计时循环内。
+
+合成输入只用于验证执行链路，其预测动作不具有任务层面的实际意义。上述命令假设 Cosmos-Reason2 tokenizer 和 preprocessor 已在本地缓存。如果首次运行时缺少这些文件，请加上 `--online`；后续运行再去掉该参数。
+
+# 当前限制
+
+- 调度器仅支持单张 GPU。Tensor parallel、continuous batching、preemption 和网络 policy server 不在这条执行路径的支持范围内。
+- `max_batch_size` 在 engine 构建时固定。
+- engine 返回归一化且经过 padding 的动作。需要使用匹配的 processor 和 `raw_state`，才能还原 checkpoint 对应的物理动作字段。
+
+# 完整示例
+
+```python
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
+from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
+from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+from phyai.utils import load_config
+from phyai_utils_tools.models.gr00t import GR00TObservation, GR00TProcessor
+
+CHECKPOINT_DIR = Path(
+    "/path/to/GR00T-N1.7-LIBERO/libero_10"
+)  # change to your local checkpoint folder
+BATCH_SIZE = 1
+IMAGE_SIZE = 256
+EMBODIMENT_TAG = "LIBERO_PANDA"
+
+cfg = load_config(CHECKPOINT_DIR, GR00TN17Config)
+loading_kwargs = {"trust_remote_code": True, "local_files_only": True}
+
+processor = GR00TProcessor.from_pretrained(
+    CHECKPOINT_DIR,
+    embodiment_tag=EMBODIMENT_TAG,
+    model_name=cfg.backbone.model_name,
+    transformers_loading_kwargs=loading_kwargs,
+)
+embodiment_tag = processor.embodiment_tag
+
+engine = Engine(
+    EngineArgs(
+        plugin="gr00t_n17",
+        plugin_args=GR00TN17Args(
+            checkpoint_dir=CHECKPOINT_DIR,
+            max_batch_size=BATCH_SIZE,
+            backbone_transformers_loading_kwargs=loading_kwargs,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+
+try:
+    # Build a synthetic observation from the checkpoint's modality contract.
+    modality_cfg = processor.modality_config
+    video = {}
+    for key in modality_cfg["video"].modality_keys:
+        history = len(modality_cfg["video"].delta_indices)
+        video[key] = np.random.randint(
+            0,
+            256,
+            size=(BATCH_SIZE, history, IMAGE_SIZE, IMAGE_SIZE, 3),
+            dtype=np.uint8,
+        )
+
+    state = {}
+    for key in modality_cfg["state"].modality_keys:
+        history = len(modality_cfg["state"].delta_indices)
+        state_dim = int(processor.norm_params[embodiment_tag]["state"][key]["dim"])
+        state[key] = (
+            np.random.rand(BATCH_SIZE, history, state_dim).astype(np.float32) * 2 - 1
+        )
+
+    language_key = modality_cfg["language"].modality_keys[0]
+    language_history = len(modality_cfg["language"].delta_indices)
+    observation = GR00TObservation(
+        video=video,
+        state=state,
+        language={
+            language_key: [
+                ["pick up the object" for _ in range(language_history)]
+                for _ in range(BATCH_SIZE)
+            ]
+        },
+    )
+
+    # Process raw inputs, run one model step, and decode the physical action fields.
+    prepared = processor.process_observation(observation)
+    normalized_action = engine.step(GR00TN17Request(tensors=prepared.tensors))
+    action = processor.decode_action(
+        normalized_action,
+        raw_state=prepared.raw_state,
+    )
+
+    print(f"normalized action shape={tuple(normalized_action.shape)}")
+    print(f"decoded action keys={sorted(action)}")
+finally:
+    engine.close()
+```

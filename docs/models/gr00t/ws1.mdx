@@ -1,0 +1,308 @@
+---
+title: "Single-GPU inference for GR00T-N1.7"
+description: "How PhyAI runs GR00T-N1.7 inference on a single GPU"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="GR00T-N1.7"
+  subtitle="Vision-Language-Action · Single-GPU Inference"
+  icon="G"
+  rows={{
+    "Model Type": "VLA",
+    "Weights": <a href="https://huggingface.co/collections/nvidia/gr00t-n17" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">NVIDIA GR00T-N1.7 collection</a>,
+    "Tags": ["VLA", "Cosmos-Reason2-2B", "Qwen3-VL", "flow-matching", "single-GPU"],
+    "Inputs": "RGB cameras · robot state · language",
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17WS1Scheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">gr00t_n17</code>,
+    "Param Precision": "bf16",
+    "Paper": <a href="https://arxiv.org/abs/2503.14734" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2503.14734</a>,
+  }}
+/>
+
+# Overview
+
+[GR00T-N1.7](https://github.com/NVIDIA/Isaac-GR00T) is a vision-language-action (VLA) model. Its [Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B) backbone, based on the Qwen3-VL architecture, encodes camera images and the language instruction. A flow-matching action head then denoises an action chunk using those features and the robot state.
+
+The embodiment ID is an explicit routing input rather than a sequence token passed to the action transformer. PhyAI uses it to select embodiment-specific state and action encoders and the action decoder. The action transformer receives the resulting encoded features, so the embodiment affects its inputs indirectly, but the raw ID is not appended to the token sequence.
+
+PhyAI's `ws1` path runs the backbone and action head on one GPU. The engine receives model-ready tensors and returns a normalized action chunk. `GR00TProcessor` handles image transforms, tokenization, state normalization, embodiment metadata, and action decoding outside the engine.
+
+<Note>
+  The examples on this page were validated with the official `nvidia/GR00T-N1.7-LIBERO` weights and its `libero_10` checkpoint directory. Use model and processor files from the same compatible checkpoint bundle so the model geometry, modality definitions, normalization statistics, and embodiment routing stay aligned.
+</Note>
+
+# Architecture
+
+The `gr00t_n17` plugin follows PhyAI's <Tooltip headline="Engine + plugin" tip="Engine resolves an Entry by plugin name. The Entry builds the model, loads weights, creates the scheduler, and forwards each request to scheduler.step().">engine + plugin contract</Tooltip>:
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/gr00t_n17" defaultOpen>
+    <Tree.File name="main_gr00t_n17.py" />
+    <Tree.File name="scheduler_ws1_gr00t_n17.py" />
+    <Tree.File name="model_runner_gr00t_n17.py" />
+    <Tree.File name="modeling_gr00t_n17.py" />
+    <Tree.File name="qwen3_vl_adapter.py" />
+    <Tree.File name="configuration_gr00t_n17.py" />
+  </Tree.Folder>
+  <Tree.Folder name="phyai-utils-tools/src/phyai_utils_tools/models/gr00t" defaultOpen>
+    <Tree.File name="processor_gr00t.py" />
+    <Tree.File name="ops_gr00t.py" />
+  </Tree.Folder>
+</Tree>
+
+| Component | Responsibility |
+| --- | --- |
+| `GR00TN17Entry` | Registers the `"gr00t_n17"` plugin, loads the checkpoint, and creates the single-GPU scheduler |
+| `GR00TN17BackboneRunner` | Runs the Cosmos-Reason2/Qwen3-VL vision and language backbone; owns shape-keyed CUDA graphs |
+| `GR00TN17ActionHeadRunner` | Selects embodiment-specific state/action encoder and action-decoder projections, samples or accepts action noise, and runs the flow-matching denoising loop |
+| `GR00TN17WS1Scheduler` | Prepares and dispatches request tensors to the backbone and action-head runners, then returns the normalized action chunk |
+| `GR00TProcessor` | Converts raw observations to model tensors and decodes normalized chunks into the selected embodiment's action fields in physical units |
+
+The request path is:
+
+```text
+raw cameras + state + instruction
+  -> GR00TProcessor.process_observation(...)
+  -> Qwen3-VL image/text tensors + normalized padded state + embodiment ID
+  -> GR00TN17BackboneRunner
+  -> vision-language token features
+  -> action head:
+       embodiment ID -> state encoder
+       noise + timestep + embodiment ID -> action encoder
+       state/action features attend to vision-language features in AlternateVLDiT
+       embodiment ID -> action decoder -> velocity update (repeated)
+  -> masked normalized action chunk
+  -> GR00TProcessor.decode_action(..., raw_state=...)
+  -> selected embodiment's action fields in physical units
+```
+
+# Running GR00T-N1.7
+
+<Steps>
+  <Step title="Prepare the checkpoint">
+    Choose a compatible checkpoint from NVIDIA's [GR00T-N1.7 collection](https://huggingface.co/collections/nvidia/gr00t-n17). GR00T-N1.7 uses the gated `nvidia/Cosmos-Reason2-2B` backbone metadata for tokenization and image preprocessing, so request access and authenticate before the first run:
+
+    ```bash
+    uv run hf auth login
+    ```
+
+    The LIBERO checkpoint stores model files under `libero_10`. Download the files consumed by PhyAI:
+
+    ```bash
+    uv run hf download nvidia/GR00T-N1.7-LIBERO \
+      --include "libero_10/config.json" \
+        "libero_10/embodiment_id.json" \
+        "libero_10/model-*.safetensors" \
+        "libero_10/model.safetensors.index.json" \
+        "libero_10/processor_config.json" \
+        "libero_10/statistics.json" \
+      --local-dir checkpoints/GR00T-N1.7-LIBERO
+    ```
+  </Step>
+
+  <Step title="Construct the processor and engine">
+    Use the same checkpoint directory for both. `--online` in the bundled example allows the first run to fetch uncached Cosmos-Reason2 tokenizer and preprocessor files.
+
+    ```python
+    import torch
+    from pathlib import Path
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
+    from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
+    from phyai.utils import load_config
+    from phyai_utils_tools.models.gr00t import GR00TProcessor
+
+    checkpoint_dir = Path("checkpoints/GR00T-N1.7-LIBERO/libero_10")
+    loading_kwargs = {"trust_remote_code": True, "local_files_only": False}
+    cfg = load_config(checkpoint_dir, GR00TN17Config)
+
+    processor = GR00TProcessor.from_pretrained(
+        checkpoint_dir,
+        embodiment_tag="LIBERO_PANDA",
+        model_name=cfg.backbone.model_name,
+        transformers_loading_kwargs=loading_kwargs,
+    )
+
+    engine = Engine(
+        EngineArgs(
+            plugin="gr00t_n17",
+            plugin_args=GR00TN17Args(
+                checkpoint_dir=checkpoint_dir,
+                max_batch_size=1,
+                backbone_transformers_loading_kwargs=loading_kwargs,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(
+                    target="cuda",
+                    params_dtype=torch.bfloat16,
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=True),
+            ),
+        )
+    )
+    ```
+
+    `max_batch_size` is the scheduler's upper bound. Rebuild the engine if a later request needs a larger batch.
+
+    Set `local_files_only=True` after the Cosmos-Reason2 tokenizer and preprocessor files are present in the local Hugging Face cache.
+
+    CUDA graphs are captured lazily and reused by input shape. A new sequence-length bucket, camera layout, batch shape, or embodiment combination may trigger capture on its first request.
+  </Step>
+
+  <Step title="Process and run a request">
+    Build `GR00TObservation` with the camera, state, and language keys listed in the checkpoint's modality config. The processor validates these keys and their history lengths before inference.
+
+    | Field | Value shape | Dtype |
+    | --- | --- | --- |
+    | `video[view]` | `(B, T, H, W, 3)` | `np.uint8` |
+    | `state[name]` | `(B, T, D)` | `np.float32` |
+    | `language[name]` | nested `(B, T)` | `str` |
+
+    ```python
+    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+
+    prepared = processor.process_observation(observation)
+    normalized_action = engine.step(
+        GR00TN17Request(tensors=prepared.tensors)
+    )
+    action = processor.decode_action(
+        normalized_action,
+        raw_state=prepared.raw_state,
+    )
+    ```
+
+    The processor reads the required camera views, state fields, language key, and history lengths from the selected checkpoint. Keep `prepared.raw_state` for checkpoints that use relative actions; the decoder needs it to reconstruct actions in the robot's reference frame.
+
+    `GR00TN17Request.noise` is optional. Leave it unset to sample Gaussian noise, or provide a fixed tensor for deterministic regression checks.
+  </Step>
+
+  <Step title="Close the engine">
+    ```python
+    engine.close()
+    ```
+
+    This releases the runner-owned CUDA graph registries and model references.
+  </Step>
+</Steps>
+
+# End-to-end example
+
+`examples/gr00t/run_gr00t.py` builds a checkpoint-shaped synthetic observation, runs it through the processor and engine, and decodes the result. To run it:
+
+```bash
+uv run python examples/gr00t/run_gr00t.py \
+  --checkpoint checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --embodiment-tag LIBERO_PANDA
+```
+
+The script prints `engine.step()` latency statistics (mean / median / std / min / max over 3 warmups + 30 timed runs). Observation preprocessing, input transfer to the GPU, and action decoding are outside the timed loop.
+
+The synthetic inputs only test the execution path; their predicted actions have no task-level meaning. The command assumes the Cosmos-Reason2 tokenizer and preprocessor are already cached. Add `--online` to the first run only if those files are missing, then omit it for later runs.
+
+# Current limitations
+
+- The scheduler supports one GPU. Tensor parallelism, continuous batching, preemption, and a network policy server are outside this path.
+- `max_batch_size` is fixed when the engine is built.
+- The engine returns normalized, padded actions. Use the matching processor and `raw_state` to recover the checkpoint's physical action fields.
+
+# Full example
+
+```python
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
+from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
+from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+from phyai.utils import load_config
+from phyai_utils_tools.models.gr00t import GR00TObservation, GR00TProcessor
+
+CHECKPOINT_DIR = Path(
+    "/path/to/GR00T-N1.7-LIBERO/libero_10"
+)  # change to your local checkpoint folder
+BATCH_SIZE = 1
+IMAGE_SIZE = 256
+EMBODIMENT_TAG = "LIBERO_PANDA"
+
+cfg = load_config(CHECKPOINT_DIR, GR00TN17Config)
+loading_kwargs = {"trust_remote_code": True, "local_files_only": True}
+
+processor = GR00TProcessor.from_pretrained(
+    CHECKPOINT_DIR,
+    embodiment_tag=EMBODIMENT_TAG,
+    model_name=cfg.backbone.model_name,
+    transformers_loading_kwargs=loading_kwargs,
+)
+embodiment_tag = processor.embodiment_tag
+
+engine = Engine(
+    EngineArgs(
+        plugin="gr00t_n17",
+        plugin_args=GR00TN17Args(
+            checkpoint_dir=CHECKPOINT_DIR,
+            max_batch_size=BATCH_SIZE,
+            backbone_transformers_loading_kwargs=loading_kwargs,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+
+try:
+    # Build a synthetic observation from the checkpoint's modality contract.
+    modality_cfg = processor.modality_config
+    video = {}
+    for key in modality_cfg["video"].modality_keys:
+        history = len(modality_cfg["video"].delta_indices)
+        video[key] = np.random.randint(
+            0,
+            256,
+            size=(BATCH_SIZE, history, IMAGE_SIZE, IMAGE_SIZE, 3),
+            dtype=np.uint8,
+        )
+
+    state = {}
+    for key in modality_cfg["state"].modality_keys:
+        history = len(modality_cfg["state"].delta_indices)
+        state_dim = int(processor.norm_params[embodiment_tag]["state"][key]["dim"])
+        state[key] = (
+            np.random.rand(BATCH_SIZE, history, state_dim).astype(np.float32) * 2 - 1
+        )
+
+    language_key = modality_cfg["language"].modality_keys[0]
+    language_history = len(modality_cfg["language"].delta_indices)
+    observation = GR00TObservation(
+        video=video,
+        state=state,
+        language={
+            language_key: [
+                ["pick up the object" for _ in range(language_history)]
+                for _ in range(BATCH_SIZE)
+            ]
+        },
+    )
+
+    # Process raw inputs, run one model step, and decode the physical action fields.
+    prepared = processor.process_observation(observation)
+    normalized_action = engine.step(GR00TN17Request(tensors=prepared.tensors))
+    action = processor.decode_action(
+        normalized_action,
+        raw_state=prepared.raw_state,
+    )
+
+    print(f"normalized action shape={tuple(normalized_action.shape)}")
+    print(f"decoded action keys={sorted(action)}")
+finally:
+    engine.close()
+```
