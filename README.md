@@ -78,3 +78,13 @@ including [SGLang](https://github.com/sgl-project/sglang) and
 [LeRobot](https://github.com/huggingface/lerobot). When using, modifying, or
 redistributing PhyAI, keep the relevant attribution and comply with applicable
 upstream license and notice requirements.
+
+## Demos
+
+### Cosmos3-Nano-Policy-DROID, 260718 nightly version
+
+https://github.com/user-attachments/assets/12a833ce-3b47-4f08-875c-b30cc2567bef
+
+https://github.com/user-attachments/assets/8e7d433c-e3b1-4388-8488-196836a1ba51
+
+https://github.com/user-attachments/assets/29067c88-f51a-4ca6-ab8c-b45f4d778923
