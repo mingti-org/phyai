@@ -1,8 +1,14 @@
-# PhyAI pi0.5 跑 LIBERO 四组件完整复现文档
+---
+title: PhyAI pi0.5 LIBERO four-suite reproduction
+description: Run the pi0.5 LIBERO policy with PhyAI on all four LIBERO benchmark suites.
+---
 
-本文档说明如何在一台新机器上使用 PhyAI 推理 pi0.5，并通过 vla-evaluation-harness 跑完整 LIBERO 四组件 benchmark。文档不依赖当前机器的本地路径，所有路径都用环境变量表示。
+# PhyAI pi0.5 LIBERO four-suite reproduction
 
-四组件指：
+This guide shows how to run the pi0.5 LIBERO policy with PhyAI and evaluate it with `vla-evaluation-harness` on all four LIBERO suites.
+It is written for a fresh machine and avoids local machine-specific paths by using environment variables.
+
+The four suites are:
 
 ```text
 libero_spatial -> configs/benchmarks/libero/spatial.yaml
@@ -11,42 +17,41 @@ libero_goal    -> configs/benchmarks/libero/goal.yaml
 libero_10      -> configs/benchmarks/libero/10.yaml
 ```
 
-完整口径：
+The benchmark setup in this guide uses:
 
 ```text
-模式：sync
-chunk_size：10
-每个组件：10 tasks x 50 episodes = 500 episodes
-总量：4 suites x 500 episodes = 2000 episodes
-模型：PhyAI pi0.5 LIBERO converted checkpoint
-仿真：vla-evaluation-harness LIBERO Docker 容器
-结果：每个 suite 一个 JSON，记录 success、steps、timing、chunk size
+Mode: sync
+Chunk size: 10
+Episodes per suite: 10 tasks x 50 episodes = 500 episodes
+Total episodes: 4 suites x 500 episodes = 2000 episodes
+Model: PhyAI pi0.5 LIBERO converted checkpoint
+Simulator: vla-evaluation-harness LIBERO Docker container
+Output: one JSON result file per suite with success, steps, timing, and chunk-size fields
 ```
 
-## 1. 机器与资源要求
+## 1. Prerequisites
 
-建议机器：
+Use a Linux machine with:
 
 ```text
-GPU：至少 1 张 CUDA GPU，显存建议 >= 48GB
-系统：Linux
-容器：Docker + NVIDIA Container Toolkit
-Python 环境管理：uv
-辅助工具：tmux, nvidia-smi, ss
+GPU: at least 1 CUDA GPU, 48 GB or more GPU memory recommended
+Container runtime: Docker and NVIDIA Container Toolkit
+Python environment manager: uv
+Utility tools: tmux, nvidia-smi, ss
 ```
 
-必须准备的模型资源：
+Prepare these model resources before you start:
 
 ```text
-PhyAI converted checkpoint：pi05_libero_phyai_converted
-PaLI-Gemma tokenizer / processor：paligemma-3b-pt-224
+PhyAI converted checkpoint: pi05_libero_phyai_converted
+PaLI-Gemma tokenizer / processor: paligemma-3b-pt-224
 ```
 
-`paligemma-3b-pt-224` 是 gated 资源，推荐从已有机器同步，不建议在复现时现场下载。
+`paligemma-3b-pt-224` is a gated resource. Prefer syncing it from a machine that already has access instead of downloading it during reproduction.
 
-## 2. 推荐环境变量
+## 2. Set environment variables
 
-根据目标机器实际路径设置：
+Set paths for the target machine:
 
 ```bash
 export PHYAI_ROOT=$HOME/phyai
@@ -63,14 +68,14 @@ export TOKENIZER_IN_CONTAINER=/data/share/paligemma-3b-pt-224
 export LIBERO_IMAGE=ghcr.io/allenai/vla-evaluation-harness/libero:latest
 ```
 
-确认资源存在：
+Check that the model directories exist:
 
 ```bash
 test -d "$PHYAI_CKPT_HOST"
 test -d "$TOKENIZER_HOST"
 ```
 
-如果模型在另一台机器上，示例同步命令如下：
+If the models are on another machine, sync them to the target machine:
 
 ```bash
 rsync -azP \
@@ -79,9 +84,9 @@ rsync -azP \
   user@target-host:$MODEL_ROOT/
 ```
 
-## 3. 获取代码并创建环境
+## 3. Clone source code and create environments
 
-clone PhyAI：
+Clone PhyAI:
 
 ```bash
 git clone https://github.com/MEmbodied/phyai.git "$PHYAI_ROOT"
@@ -89,7 +94,7 @@ cd "$PHYAI_ROOT"
 uv sync
 ```
 
-clone vla-evaluation-harness：
+Clone `vla-evaluation-harness`:
 
 ```bash
 git clone https://github.com/allenai/vla-evaluation-harness.git "$VLA_ROOT"
@@ -98,17 +103,19 @@ uv sync
 ./.venv/bin/vla-eval --help >/tmp/vla_eval_help.log
 ```
 
-如果目标机器不能联网，可以在能联网机器上 clone 后用 `rsync` 同步两个仓库；同步后仍建议在目标机器上执行 `uv sync`，让本机 Python、CUDA、依赖和 editable path 正确。
+If the target machine has no network access, clone both repositories on a networked machine and sync them with `rsync`.
+After syncing, still run `uv sync` on the target machine so editable paths, Python versions, CUDA libraries, and local dependencies are resolved correctly.
 
-## 4. 准备 LIBERO Docker 镜像
+## 4. Prepare the LIBERO Docker image
 
-vla-harness 跑 LIBERO 时会启动 LIBERO benchmark 容器。x86_64 机器可以直接使用官方镜像：
+`vla-evaluation-harness` runs LIBERO inside a benchmark container.
+On an `x86_64` machine, pull the official image:
 
 ```bash
 docker pull "$LIBERO_IMAGE"
 ```
 
-如果目标机器是 ARM64，例如 Thor，而官方镜像只有 amd64，需要在目标机器本地构建 ARM64 镜像：
+If the target machine is ARM64 and the official image is only available for `amd64`, build an ARM64 LIBERO image locally:
 
 ```bash
 cd "$VLA_ROOT"
@@ -119,21 +126,22 @@ docker image inspect "$LIBERO_IMAGE" \
   --format '{{.Architecture}} {{.Os}}'
 ```
 
-期望输出：
+Expected output on ARM64:
 
 ```text
 arm64 linux
 ```
 
-如果是 x86_64，期望输出一般是：
+Expected output on `x86_64`:
 
 ```text
 amd64 linux
 ```
 
-## 5. 创建 PhyAI Docker 容器
+## 5. Create the PhyAI Docker container
 
-建议在 Docker 中运行 PhyAI server，容器挂载 PhyAI 代码、vla-harness 代码和模型目录：
+Run the PhyAI server inside a Docker container.
+Mount the PhyAI source tree, the `vla-evaluation-harness` source tree, and the model directory:
 
 ```bash
 docker run -dit --gpus all \
@@ -151,7 +159,7 @@ docker run -dit --gpus all \
   nvcr.io/nvidia/pytorch:25.12-py3 bash
 ```
 
-容器内同步 PhyAI 环境：
+Install the PhyAI environment inside the container:
 
 ```bash
 docker exec "$PHYAI_CONTAINER" bash -lc '
@@ -161,7 +169,8 @@ uv sync
 '
 ```
 
-如果 `uv sync` 生成的 editable path 与容器路径不一致，可加兼容 symlink。只有在 import 报错指向旧宿主路径时才需要执行；`HOST_USER` 填目标机器上的用户名：
+If `uv sync` produces editable paths that point to the host path instead of the container path, create a compatibility symlink.
+Only run this if imports fail because a stale host path is referenced:
 
 ```bash
 export HOST_USER=$(id -un)
@@ -173,7 +182,7 @@ ln -sfn /phyai_workspace $COMPAT_PARENT/$HOST_USER/phyai
 "
 ```
 
-确认容器内 import：
+Verify imports inside the container:
 
 ```bash
 docker exec "$PHYAI_CONTAINER" bash -lc '
@@ -188,9 +197,9 @@ PY
 '
 ```
 
-## 6. 运行前检查
+## 6. Check the machine before running
 
-检查 GPU、端口和 Docker：
+Check GPU usage, ports, and containers before starting the benchmark:
 
 ```bash
 nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader
@@ -198,11 +207,12 @@ ss -ltnp | grep -E ':8000|:8001' || true
 docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
 ```
 
-如 GPU 上已有重负载，完整 benchmark 的耗时会不稳定，建议换空闲 GPU 或等待资源释放。
+If the GPU is under heavy load, benchmark timing can become unstable.
+Use an idle GPU or wait for other jobs to finish.
 
-## 7. 启动 PhyAI pi0.5 server
+## 7. Start the PhyAI pi0.5 server
 
-取 PhyAI 容器 IP：
+Get the PhyAI container IP and construct the WebSocket URL:
 
 ```bash
 export PHYAI_CONTAINER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PHYAI_CONTAINER")
@@ -210,7 +220,7 @@ export PHYAI_SERVER_URL=ws://$PHYAI_CONTAINER_IP:8000
 echo "$PHYAI_SERVER_URL"
 ```
 
-启动 server：
+Start the server in `tmux`:
 
 ```bash
 mkdir -p "$VLA_ROOT/results"
@@ -236,28 +246,28 @@ export PHYAI_CAMERA_MODE=two_camera
 "
 ```
 
-关键配置含义：
+Key settings:
 
-| 配置 | 值 | 说明 |
+| Setting | Value | Purpose |
 | --- | --- | --- |
-| `--checkpoint_path` | `/data/share/pi05_libero_phyai_converted` | PhyAI converted pi0.5 LIBERO 权重 |
-| `PHYAI_TOKENIZER_PATH` | `/data/share/paligemma-3b-pt-224` | tokenizer / processor 文件 |
-| `PHYAI_CAMERA_MODE` | `two_camera` | LIBERO 发送 agentview 与 wrist 两路图像 |
-| `--params_dtype` | `bfloat16` | 参数 dtype |
-| `--attn_backend` | `flashinfer` | attention 后端 |
-| `--norm_backend` | `phyai-kernel` | norm 后端 |
-| `--linear_backend` | `flashinfer` | linear 后端 |
-| `--flashinfer_workspace_bytes` | `536870912` | 512MiB workspace |
-| `--chunk_size` | `10` | 每次推理产出 10 个 action |
-| CUDA graph | 默认开启 | 不要传 `--no-use_cuda_graph` |
+| `--checkpoint_path` | `/data/share/pi05_libero_phyai_converted` | PhyAI converted pi0.5 LIBERO checkpoint |
+| `PHYAI_TOKENIZER_PATH` | `/data/share/paligemma-3b-pt-224` | Tokenizer and processor directory |
+| `PHYAI_CAMERA_MODE` | `two_camera` | LIBERO sends both agent-view and wrist-camera images |
+| `--params_dtype` | `bfloat16` | Parameter dtype |
+| `--attn_backend` | `flashinfer` | Attention backend |
+| `--norm_backend` | `phyai-kernel` | Normalization backend |
+| `--linear_backend` | `flashinfer` | Linear backend |
+| `--flashinfer_workspace_bytes` | `536870912` | 512 MiB FlashInfer workspace |
+| `--chunk_size` | `10` | The policy returns 10 actions per inference call |
+| CUDA graph | Enabled by default | Do not pass `--no-use_cuda_graph` |
 
-等待 ready：
+Follow the server log:
 
 ```bash
 tail -f "$VLA_ROOT/results/phyai_pi05_libero_server.log"
 ```
 
-必须看到：
+Wait until the log contains:
 
 ```text
 capturing vision-tower CUDA graph
@@ -266,9 +276,10 @@ capturing the full 10-step Euler loop as one CUDA graph
 Starting server on ws://0.0.0.0:8000
 ```
 
-## 8. 创建 smoke 配置并验证
+## 8. Run a smoke test
 
-先跑一个最小 smoke，确认模型、LIBERO Docker、WebSocket、timing 字段都可用。
+Run a minimal smoke test before launching the full benchmark.
+This checks the model, LIBERO Docker image, WebSocket connection, timing fields, and chunk-size fields.
 
 ```bash
 cat > "$VLA_ROOT/configs/benchmarks/libero/smoke_test_phyai_local.yaml" <<YAML
@@ -300,7 +311,7 @@ env NO_PROXY='*' no_proxy='*' ./.venv/bin/vla-eval run \
   --yes
 ```
 
-检查 smoke 结果：
+Summarize the smoke-test timing:
 
 ```bash
 cd "$VLA_ROOT"
@@ -308,17 +319,19 @@ json=$(ls -t results/phyai_pi05_libero_smoke/*.json | head -1)
 ./.venv/bin/python scripts/summarize_timing.py "$json"
 ```
 
-必须看到：
+The output must include:
 
 ```text
 raw_chunk_size_max=10 served_chunk_size_max=10
 ```
 
-如果没有 timing 或 chunk 字段，通常是 `vla-eval run` 没有加 `--dev`，导致容器没有挂载宿主的 vla-harness `src`。
+If timing or chunk fields are missing, the usual cause is running `vla-eval run` without `--dev`.
+The `--dev` flag mounts the host `src` tree into the LIBERO container so the benchmark uses the local runner implementation.
 
-## 9. 顺序跑 LIBERO 四组件
+## 9. Run all four LIBERO suites
 
-创建长跑脚本。脚本会为每个 suite 生成一个运行时 YAML，显式写入本次 `RUN_ID` 的 `output_dir`，避免结果散落在全局 `results/` 目录里。
+Create a script that runs the four suites sequentially.
+The script creates one runtime YAML file per suite and writes all outputs under a single run directory.
 
 ```bash
 cat > "$VLA_ROOT/run_phyai_pi05_libero_four_suites.sh" <<'SH'
@@ -420,7 +433,7 @@ SH
 chmod +x "$VLA_ROOT/run_phyai_pi05_libero_four_suites.sh"
 ```
 
-启动长跑：
+Start the full run:
 
 ```bash
 cd "$VLA_ROOT"
@@ -428,7 +441,7 @@ tmux new-session -d -s phyai_pi05_libero_four \
   "PHYAI_SERVER_URL=$PHYAI_SERVER_URL PHYAI_CKPT_IN_CONTAINER=$PHYAI_CKPT_IN_CONTAINER LIBERO_IMAGE=$LIBERO_IMAGE ./run_phyai_pi05_libero_four_suites.sh"
 ```
 
-查看进度：
+Check progress:
 
 ```bash
 tmux ls
@@ -438,9 +451,9 @@ sed -n '1,220p' "$latest/run_summary.log"
 tail -80 "$latest"/phyai_spatial.log
 ```
 
-## 10. 解析成功率与 timing
+## 10. Summarize success rate and timing
 
-长跑完成后：
+After the run finishes, print the run summary:
 
 ```bash
 cd "$VLA_ROOT"
@@ -448,7 +461,7 @@ latest=$(ls -td results/phyai_pi05_libero_four_* | head -1)
 cat "$latest/run_summary.log"
 ```
 
-用 `summarize_timing.py` 重新汇总全部 JSON：
+Summarize timing from all result JSON files:
 
 ```bash
 cd "$VLA_ROOT"
@@ -456,7 +469,7 @@ latest=$(ls -td results/phyai_pi05_libero_four_* | head -1)
 ./.venv/bin/python scripts/summarize_timing.py "$latest"/*.json
 ```
 
-统计成功率：
+Summarize success rate:
 
 ```bash
 cd "$VLA_ROOT"
@@ -478,17 +491,17 @@ for arg in sys.argv[1:]:
 PY
 ```
 
-必须记录的字段：
+Record these fields for each suite:
 
 ```text
 RUN_ID
-结果目录
-checkpoint
-server_url
-suite
-success / total
-success rate
-steps
+Result directory
+Checkpoint
+Server URL
+Suite
+Success / total
+Success rate
+Steps
 /usr/bin/time -p real
 model_wait_sec
 model_inference_sec
@@ -501,33 +514,36 @@ raw_chunk_size_max
 served_chunk_size_max
 ```
 
-`raw_chunk_size_max=10` 且 `served_chunk_size_max=10` 是四组件复现的关键校验项。
+`raw_chunk_size_max=10` and `served_chunk_size_max=10` are key checks for this four-suite reproduction.
 
-## 11. 预期参考结果
+## 11. Reference results
 
-不同机器、GPU、驱动、负载会影响耗时；成功率也可能有少量随机波动。此前同口径参考结果如下：
+Timing depends on the GPU, driver, machine load, and container environment.
+Success rate can also vary slightly across runs.
+The following results are from a previous run with the same evaluation setup:
 
-| 组件 | 成功率 | 成功数 | steps | 总耗时 | 模型纯推理时间 | env step 时间 | benchmark 等待 action 时间 | 平均单次模型推理 | 推理调用次数 | buffer hit | chunk 验证 |
+| Suite | Success rate | Success | Steps | Wall time | Model inference time | Env step time | Benchmark action-wait time | Average model inference | Inference calls | Buffer hits | Chunk check |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | `libero_spatial` | 97.8% | 489/500 | 52,926 | 4,198.73s | 200.56s | 1,239.61s | 2,269.16s | 36.33ms | 5,520 | 47,406 | raw=10, served=10 |
 | `libero_object` | 99.8% | 499/500 | 68,712 | 5,199.23s | 256.92s | 1,169.84s | 3,453.50s | 36.18ms | 7,102 | 61,610 | raw=10, served=10 |
 | `libero_goal` | 98.0% | 490/500 | 56,292 | 3,981.09s | 210.86s | 1,045.35s | 2,365.71s | 36.10ms | 5,841 | 50,451 | raw=10, served=10 |
 | `libero_10` | 94.2% | 471/500 | 134,962 | 9,150.13s | 496.56s | 2,227.75s | 6,237.24s | 36.21ms | 13,713 | 121,249 | raw=10, served=10 |
 
-参考值不是验收硬阈值。复现时优先确认：
+Use these numbers as references, not strict pass/fail thresholds.
+For reproduction, first confirm:
 
 ```text
-四组件都完成 500 episodes
-chunk 验证 raw=10 served=10
-server 日志确认 CUDA graph capture
-结果 JSON 包含 timing 字段
+All four suites finish 500 episodes each
+Chunk check is raw=10 served=10
+The server log confirms CUDA graph capture
+The result JSON files contain timing fields
 ```
 
-## 12. 常见问题
+## 12. Troubleshooting
 
-### 12.1 LIBERO Docker 镜像架构不匹配
+### 12.1 LIBERO Docker image architecture mismatch
 
-如果目标机器是 ARM64，而官方镜像只有 amd64，需要本地构建：
+If the target machine is ARM64 and the official image is only available for `amd64`, build the image locally:
 
 ```bash
 cd "$VLA_ROOT"
@@ -535,26 +551,29 @@ export DOCKER_DEFAULT_PLATFORM=linux/arm64
 docker/build.sh libero
 ```
 
-### 12.2 容器连不上 PhyAI server
+### 12.2 The benchmark cannot connect to the PhyAI server
 
-PhyAI server 如果跑在 bridge Docker 容器里，宿主侧 `vla-eval` 需要连容器 IP：
+If the PhyAI server runs in a bridge Docker container, the host-side `vla-eval` process should connect to the container IP:
 
 ```bash
 export PHYAI_CONTAINER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PHYAI_CONTAINER")
 export PHYAI_SERVER_URL=ws://$PHYAI_CONTAINER_IP:8000
 ```
 
-### 12.3 JSON 没有 timing 字段
+### 12.3 The result JSON has no timing fields
 
-运行 benchmark 必须加 `--dev`。这会把宿主 `$VLA_ROOT/src` 挂载进 LIBERO 容器，确保使用带 timing 的 runner。
+Run the benchmark with `--dev`.
+This mounts the host `$VLA_ROOT/src` tree into the LIBERO container and ensures the benchmark uses the runner that records timing fields.
 
-### 12.4 Paligemma tokenizer 缺失
+### 12.4 The PaLI-Gemma tokenizer is missing
 
-`paligemma-3b-pt-224` 是 gated 资源。建议从已有机器同步到 `$MODEL_ROOT/paligemma-3b-pt-224`，不要依赖复现机器现场下载。
+`paligemma-3b-pt-224` is a gated resource.
+Sync it from an existing machine to `$MODEL_ROOT/paligemma-3b-pt-224` instead of relying on an on-the-fly download.
 
-### 12.5 PhyAI server 没有 CUDA graph capture 日志
+### 12.5 The PhyAI server log has no CUDA graph capture messages
 
-检查启动命令是否误传了 `--no-use_cuda_graph`，或是否走了错误 server adapter。正确日志必须包含：
+Check whether the server command accidentally passed `--no-use_cuda_graph` or whether it started the wrong server adapter.
+The expected log must include:
 
 ```text
 capturing vision-tower CUDA graph
@@ -562,7 +581,7 @@ capturing 4 prefix-forward CUDA graph(s)
 capturing the full 10-step Euler loop as one CUDA graph
 ```
 
-### 12.6 释放资源
+### 12.6 Release resources
 
 ```bash
 tmux kill-session -t phyai_pi05_libero_four || true
@@ -571,4 +590,3 @@ docker stop "$PHYAI_CONTAINER" || true
 ss -ltnp | grep ':8000' || true
 nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
 ```
-
