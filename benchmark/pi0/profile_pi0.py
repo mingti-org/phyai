@@ -365,6 +365,8 @@ def main() -> None:
                 engine, request, args.trace_dir / f"bs{bs}", args.n_prof_steps
             )
         except Exception as exc:  # noqa: BLE001
+            if "engine" in locals() and engine is not None:
+                engine.close()
             if is_oom(exc):
                 print(f"[bs={bs}] OOM -- stopping sweep here.")
                 torch.cuda.empty_cache()
