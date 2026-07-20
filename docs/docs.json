@@ -28,7 +28,8 @@
               {
                 "group": "PI0",
                 "pages": [
-                  "models/pi0/ws1"
+                  "models/pi0/ws1",
+                  "models/pi0/alignment-benchmark"
                 ]
               },
               {
@@ -89,7 +90,8 @@
               {
                 "group": "PI0",
                 "pages": [
-                  "zh/models/pi0/ws1"
+                  "zh/models/pi0/ws1",
+                  "zh/models/pi0/alignment-benchmark"
                 ]
               },
               {

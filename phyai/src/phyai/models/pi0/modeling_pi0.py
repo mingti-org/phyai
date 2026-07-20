@@ -146,6 +146,31 @@ def _vision_norm_backend(norm_backend: str, vision_dtype: torch.dtype) -> str:
     return norm_backend
 
 
+def _apply_lerobot_rope_precision(
+    rope: RotaryEmbedding,
+    params_dtype: torch.dtype,
+) -> None:
+    """Match LeRobot's BF16 RoPE frequency and coefficient rounding."""
+
+    if params_dtype != torch.bfloat16:
+        return
+
+    inv_freq = rope.inv_freq.to(torch.bfloat16)
+    positions = torch.arange(
+        rope.max_position_embeddings,
+        dtype=torch.float32,
+        device=inv_freq.device,
+    )
+    freqs = torch.outer(positions, inv_freq.float())
+    cos = (freqs.cos() * rope.attention_scaling).to(torch.bfloat16).float()
+    sin = (freqs.sin() * rope.attention_scaling).to(torch.bfloat16).float()
+
+    # FlashInfer requires an FP32 cache even when the coefficient values
+    # reproduce LeRobot's BF16 rounding.
+    rope.inv_freq = inv_freq
+    rope.cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+
+
 SIGLIP_NORM_HF_NAMES: dict[str, str] = {
     "input_layernorm": "layer_norm1",
     "post_attention_layernorm": "layer_norm2",
@@ -1059,6 +1084,7 @@ class PI0Model(nn.Module):
             backend=rope_backend,
             device=device,
         )
+        _apply_lerobot_rope_precision(self.rope, params_dtype)
         self.heads = ActionTimeHeads(
             config,
             params_dtype=params_dtype,

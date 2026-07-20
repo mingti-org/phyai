@@ -1,0 +1,198 @@
+---
+title: "PI0 alignment and benchmark protocol"
+description: "Reproduce PI0 numerical alignment, latency, and LIBERO evaluations for PhyAI and LeRobot"
+icon: "gauge"
+---
+
+# Scope
+
+This protocol separates three measurements that answer different questions:
+
+| Measurement | Entry point | Reported result |
+| --- | --- | --- |
+| Action alignment | `benchmark/pi0/compare_pi0_lerobot_live.py` | Error between action chunks under matched inputs and noise |
+| Layer alignment | `benchmark/pi0/dump_compare_pi0_lerobot.py` | First divergent model stage |
+| Runtime evaluation | Engine benchmark or LIBERO evaluation | Model latency or environment success rate |
+
+<Warning>
+  Action alignment and LIBERO success rate are not interchangeable. The former uses a deterministic payload; the latter also depends on simulator resets, preprocessing, environment steps, and action execution.
+</Warning>
+
+# Experimental setup
+
+Run the commands from `/phyai_workspace`. Prepare the local checkpoints and tokenizer:
+
+```bash
+ls /data/share/pi0_base
+ls /data/share/pi0_libero_finetuned_v044
+ls /data/share/paligemma-3b-pt-224
+```
+
+Check GPU occupancy before latency measurements and use the same visible device for all compared runs:
+
+```bash
+nvidia-smi
+export CUDA_VISIBLE_DEVICES=0
+```
+
+# Action alignment
+
+The live comparison imports LeRobot from the active environment or `--lerobot-root`, constructs equivalent runtime inputs, and uses the same prompt tokens and denoising noise for both implementations.
+
+```bash
+cd /phyai_workspace
+mkdir -p pt outputs
+
+uv run python benchmark/pi0/compare_pi0_lerobot_live.py \
+  --checkpoint /data/share/pi0_base \
+  --lerobot-root /phyai_workspace/lerobot-main \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --language-inputs tokenizer \
+  --dtype bfloat16 \
+  --vision-dtype float32 \
+  --phyai-attn-backend flashinfer \
+  --num-steps 10 \
+  --batch-size 1 \
+  --n-warmup 3 \
+  --n-timed 10 \
+  --save-output pt/pi0_bf16_payload.pt
+```
+
+Omit `--lerobot-root` when LeRobot is already importable. Use `--language-inputs fixed` to remove tokenization from the comparison. The standard alignment configuration is `bfloat16` with FlashInfer; `--vision-dtype float32` applies only to PhyAI through `PI0Args.vision_params_dtype`.
+
+Report the following JSON fields:
+
+| Field | Definition |
+| --- | --- |
+| `metrics.allclose` | Pass or fail under the selected `rtol` and `atol` |
+| `metrics.max_abs` | Maximum absolute action error |
+| `metrics.mean_abs` | Mean absolute action error |
+| `metrics.rmse` | Root mean squared action error |
+| `metrics.cosine` | Cosine similarity of the flattened action chunk |
+| `timing_ms.lerobot_predict_action_chunk.mean` | Mean LeRobot model-path latency |
+| `timing_ms.phyai_engine_step.mean` | Mean PhyAI `Engine.step` latency |
+
+The LeRobot timer covers `predict_action_chunk`, not `select_action`. This avoids action-queue hits, which do not generate a new action chunk. Tokenization occurs before the timed model call and is therefore excluded from this latency.
+
+# Layer-level diagnosis
+
+`--save-output` stores the fixed inputs, processed batch, prompt tensors, shared noise, reference actions, runtime outputs, and their difference in one `.pt` payload. Use that payload to compare both runtimes in a single process:
+
+```bash
+cd /phyai_workspace
+
+uv run python benchmark/pi0/dump_compare_pi0_lerobot.py \
+  --checkpoint /data/share/pi0_base \
+  --pt pt/pi0_bf16_payload.pt \
+  --lerobot-root /phyai_workspace/lerobot-main \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --device cuda \
+  --dtype bfloat16 \
+  --vision-dtype float32 \
+  --phyai-attn-backend flashinfer \
+  --num-steps 10 \
+  --include-layers \
+  --out pt/pi0_bf16_combined_dump.pt
+```
+
+The comparison covers the following stages:
+
+| Key | Model stage |
+| --- | --- |
+| `img_emb`, `lang_emb`, `prefix_embs` | Image, language, and packed prefix embeddings |
+| `prefix_hidden` | Prefix output after the final norm |
+| `x_t_step0`, `state_emb`, `action_time_emb` | Expert inputs |
+| `v_t_stepN`, `x_t_after_stepN` | Denoising velocity and Euler-updated state |
+| `actions` | Final action chunk |
+| `prefix_layer{i}`, `expert_step{s}_layer{i}` | Per-layer outputs when `--include-layers` is enabled |
+
+The table reports cosine similarity, absolute error, RMSE, and tensor norms. The first cosine value below `--threshold` is marked `FIRST DIVERGENCE`.
+
+<Note>
+  `[shape-clipped]` indicates that tensors with equal rank but different lengths were cropped to their common minimum shape. This often occurs because LeRobot retains the padded language length while the PhyAI dump stores the effective prefix. Final action and denoising-step tensors should retain matching shapes.
+</Note>
+
+# Engine latency
+
+Measure the PhyAI scheduler independently with CUDA graph replay:
+
+```bash
+cd /phyai_workspace
+
+uv run python benchmark/bench_n_batch_ws1_pi0.py \
+  --checkpoint /data/share/pi0_base \
+  --batch-sizes 1 2 4 \
+  --dtype bf16 \
+  --vision-dtype float32 \
+  --fixed-noise \
+  --n-warmup 5 \
+  --n-timed 30 \
+  --result-file outputs/pi0_ws1_latency.jsonl
+```
+
+This benchmark measures `Engine.step`, including the vision runner, language prefix runner, expert denoising loop, and CUDA graph replay. It excludes tokenization and environment stepping.
+
+# LIBERO evaluation
+
+Use the LIBERO-finetuned checkpoint for task success rate. The base checkpoint is used for numerical alignment, not environment evaluation.
+
+LeRobot:
+
+```bash
+cd /phyai_workspace/lerobot-main
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+LEROBOT_PALIGEMMA_TOKENIZER_PATH=/data/share/paligemma-3b-pt-224 \
+uv run lerobot-eval \
+  --policy.path=/data/share/pi0_libero_finetuned_v044 \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --eval.max_episodes_rendered=0 \
+  --env.max_parallel_tasks=1 \
+  --policy.device=cuda
+```
+
+PhyAI:
+
+```bash
+cd /phyai_workspace
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+uv run python examples/pi0/run_libero_pi0.py \
+  --checkpoint /data/share/pi0_libero_finetuned_v044 \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --task libero_object \
+  --n-episodes 10 \
+  --no-video \
+  --output-dir outputs/eval/pi0_phyai_libero_object
+```
+
+Ten episodes per task produce 100 episodes for `libero_object`. One episode per task is a smoke test.
+
+# Reporting requirements
+
+For numerical and latency results, record the GPU, visible device, checkpoint, input mode, dtype, batch size, CUDA graph state, `num_steps`, warmup count, timed count, and PhyAI vision dtype. State whether preprocessing or tokenization is included.
+
+For LIBERO results, also report the suite, episode count, and video setting.
+
+# Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| LeRobot attempts to download `google/paligemma-3b-pt-224` | Set `--tokenizer-name /data/share/paligemma-3b-pt-224` or `LEROBOT_PALIGEMMA_TOKENIZER_PATH` |
+| Float32 comparison fails with FlashInfer | Use the `bfloat16` and FlashInfer baseline, or register and verify a debug AR backend |
+| Prefix rows show `[shape-clipped]` | Inspect `actions` and denoising-step rows for the final alignment decision |
+| Divergence starts at `img_emb` | Check image normalization, camera count, and camera order |
+| Divergence starts after `v_t_step0` | Check timestep, noise, action padding, and attention backend |
+| LIBERO reports a missing XML asset | Verify that `~/.libero/config.yaml` points to `/data/share/libero-assets` |
+| Latency varies across runs | Check `nvidia-smi` for competing GPU workloads |

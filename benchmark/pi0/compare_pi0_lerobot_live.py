@@ -5,7 +5,8 @@ dependency. Point ``--lerobot-root`` at a LeRobot checkout, or install LeRobot
 in the active environment, then the script will:
 
 1. Build one deterministic random observation batch.
-2. Run LeRobot ``PI0Policy.predict_action_chunk`` on that batch.
+2. Run LeRobot ``PI0Policy.predict_action_chunk`` and model-only
+   ``sample_actions`` on that batch.
 3. Run PhyAI ``Engine.step`` on equivalent tensors and the same sampling noise.
 4. Report action error metrics and latency for both implementations.
 
@@ -668,9 +669,32 @@ def main() -> None:
             ).detach()
             phyai_actions = phyai_engine.step(phyai_request).detach()
 
+            lerobot_model_images, lerobot_model_img_masks = (
+                lerobot_policy._preprocess_images(  # noqa: SLF001
+                    lerobot_batch
+                )
+            )
+            lerobot_model_lang_tokens = lerobot_batch[OBS_LANGUAGE_TOKENS]
+            lerobot_model_lang_masks = lerobot_batch[OBS_LANGUAGE_ATTENTION_MASK]
+            lerobot_model_state = lerobot_policy.prepare_state(lerobot_batch)
+
             lerobot_timing = time_callable(
                 lambda: lerobot_policy.predict_action_chunk(
                     lerobot_batch,
+                    noise=sample_noise,
+                    num_steps=args.num_steps,
+                ),
+                device=device,
+                n_warmup=args.n_warmup,
+                n_timed=args.n_timed,
+            )
+            lerobot_model_timing = time_callable(
+                lambda: lerobot_policy.model.sample_actions(
+                    lerobot_model_images,
+                    lerobot_model_img_masks,
+                    lerobot_model_lang_tokens,
+                    lerobot_model_lang_masks,
+                    lerobot_model_state,
                     noise=sample_noise,
                     num_steps=args.num_steps,
                 ),
@@ -717,6 +741,7 @@ def main() -> None:
         "metrics": metrics,
         "timing_ms": {
             "lerobot_predict_action_chunk": lerobot_timing,
+            "lerobot_model_sample_actions": lerobot_model_timing,
             "phyai_engine_step": phyai_timing,
         },
         "summary": {

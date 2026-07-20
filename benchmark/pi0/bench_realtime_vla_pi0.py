@@ -30,6 +30,8 @@ import sys
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _BENCHMARK_DIR = _SCRIPT_DIR.parent
@@ -46,11 +48,6 @@ from phyai.utils.profile import (  # noqa: E402
 )
 
 
-def patch_realtime_vla_pi0_kernels(realtime_vla_pi0) -> None:
-    """Patch a realtime-vla PI0 attention GEMM kernel with safe edge masks."""
-    namespace = {"triton": realtime_vla_pi0.triton, "tl": realtime_vla_pi0.tl}
-    exec(
-        """
 @triton.jit
 def safe_matmul_abt_scale(
     q_ptr,
@@ -95,10 +92,11 @@ def safe_matmul_abt_scale(
             mask=(offs_i[:, None] < M) & (offs_j[None, :] < N),
         )
         pid += psize
-""",
-        namespace,
-    )
-    realtime_vla_pi0.matmul_abT_scale = namespace["safe_matmul_abt_scale"]
+
+
+def patch_realtime_vla_pi0_kernels(realtime_vla_pi0) -> None:
+    """Patch a realtime-vla PI0 attention GEMM kernel with safe edge masks."""
+    realtime_vla_pi0.matmul_abT_scale = safe_matmul_abt_scale
 
 
 DIRECT_PI0_KEYS = (
