@@ -71,6 +71,9 @@ class Cosmos3Config(PretrainedConfig):
     action_gen: bool = False
     action_dim: int = 64
     num_embodiment_domains: int = 32
+    # note(chenghua): Reference mode preserves the official policy model's
+    # separate BF16 projections and FP32 timestep path; fused mode favors speed.
+    policy_modeling_mode: str = "reference"
     sound_gen: bool = False
     sound_dim: int = 64
     sound_latent_fps: float = 25.0
@@ -99,6 +102,11 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError(
                 f"patch_latent_dim={self.patch_latent_dim} must equal "
                 f"latent_patch_size**2 * latent_channel={expected_patch}."
+            )
+        if self.policy_modeling_mode not in ("reference", "fused"):
+            raise ValueError(
+                "policy_modeling_mode must be 'reference' or 'fused', got "
+                f"{self.policy_modeling_mode!r}."
             )
 
     @property

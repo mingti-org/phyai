@@ -187,7 +187,13 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--flow-shift", type=float, default=10.0)
+    parser.add_argument("--flow-shift", type=float, default=5.0)
+    parser.add_argument(
+        "--policy-modeling-mode",
+        choices=("reference", "fused"),
+        default="reference",
+        help="Reference matches official policy arithmetic; fused favors speed.",
+    )
     parser.add_argument(
         "--use-karras-sigmas",
         choices=("auto", "true", "false"),
@@ -259,6 +265,7 @@ def main() -> None:
                 checkpoint_dir=args.checkpoint,
                 flow_shift=args.flow_shift,
                 use_karras_sigmas=use_karras,
+                policy_modeling_mode=args.policy_modeling_mode,
                 decode_video=True,
             ),
             config=EngineConfig(
@@ -306,7 +313,7 @@ def main() -> None:
         processed = processor.preprocess(raw_input)
 
         video_shape = pixel_to_latent_shape(
-            processed.action_chunk + 1,
+            processed.video_num_frames,
             processed.content_size[0],
             processed.content_size[1],
         )
@@ -327,6 +334,8 @@ def main() -> None:
                 else None
             ),
             cond_frame_indexes=processed.cond_frame_indexes,
+            cond_action_indexes=processed.cond_action_indexes,
+            action_start_frame_offset=processed.action_start_frame_offset,
             fps=args.fps,
             num_inference_steps=args.steps,
             guidance_scale=args.guidance_scale,

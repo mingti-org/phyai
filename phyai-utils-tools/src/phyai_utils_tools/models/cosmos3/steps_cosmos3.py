@@ -26,6 +26,9 @@ TEXT_MASK = "text_mask"
 NEG_TEXT_IDS = "neg_text_ids"
 NEG_TEXT_MASK = "neg_text_mask"
 COND_ACTION = "cond_action"
+COND_ACTION_INDEXES = "cond_action_indexes"
+ACTION_START_FRAME_OFFSET = "action_start_frame_offset"
+CAPTION = "caption"
 DOMAIN_ID = "domain_id"
 MODE = "mode"
 ACTION_CHUNK = "action_chunk"
@@ -265,6 +268,7 @@ def cosmos3_action_json_caption(
     prompt: str,
     *,
     view_point: str,
+    additional_view_description: str | None = None,
     num_frames: int,
     fps: float,
     height: int,
@@ -286,6 +290,12 @@ def cosmos3_action_json_caption(
         desc = f"{desc}."
     out: dict[str, Any] = {}
     framing = DEFAULT_VIEWPOINT_TEMPLATES.get(view_point)
+    if additional_view_description:
+        if framing:
+            separator = " " if framing.endswith(".") else ". "
+            framing = framing + separator + additional_view_description.rstrip()
+        else:
+            framing = additional_view_description.rstrip()
     if framing:
         out["cinematography"] = {"framing": framing}
     out["actions"] = [{"time": f"0:00-{minutes}:{seconds:02d}", "description": desc}]
@@ -542,9 +552,8 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
     * ``"json"`` — the structured JSON action caption
       (:func:`cosmos3_action_json_caption`). Reads the padded target ``(H, W)`` from
       ``video_shape`` and uses ``view_point``/``num_frames``/``fps``.
-    * ``"plain"`` — append the duration/FPS + resolution sentences, gated by
-      ``append_metadata``. Resolution uses the scaled pre-pad ``(H, W)``
-      (``meta_height``/``meta_width``).
+    * ``"plain"`` — append the viewpoint and optional camera-layout description,
+      then duration/FPS + padded resolution when ``append_metadata`` is enabled.
 
     The negative prompt is left un-augmented (the unconditional branch is the bare
     empty/negative string).
@@ -563,6 +572,7 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
         append_metadata: bool = True,
         prompt_format: str = "plain",
         view_point: str = "ego_view",
+        additional_view_description: str | None = None,
         fps: float = 24.0,
         num_frames: int = 17,
     ) -> None:
@@ -573,6 +583,7 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
         self._append_metadata = append_metadata
         self._prompt_format = prompt_format
         self._view_point = view_point
+        self._additional_view_description = additional_view_description
         self._fps = float(fps)
         self._num_frames = int(num_frames)
 
@@ -583,6 +594,7 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
         return cosmos3_action_json_caption(
             prompt,
             view_point=self._view_point,
+            additional_view_description=self._additional_view_description,
             num_frames=self._num_frames,
             fps=self._fps,
             height=height,
@@ -590,14 +602,25 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
         )
 
     def _augment(self, prompt: str, transition: Transition) -> str:
-        """Append duration/FPS + resolution sentences."""
-        height = transition.get(META_HEIGHT)
-        width = transition.get(META_WIDTH)
-        if height is None or width is None:
-            shape = transition.get(VIDEO_SHAPE)
-            if shape is not None:
-                _, height, width = shape
-        duration = self._num_frames / self._fps
+        """Append native action viewpoint, duration, and resolution text."""
+        viewpoint = DEFAULT_VIEWPOINT_TEMPLATES.get(self._view_point)
+        if self._additional_view_description:
+            if viewpoint:
+                separator = " " if viewpoint.endswith(".") else ". "
+                viewpoint = (
+                    viewpoint + separator + self._additional_view_description.rstrip()
+                )
+            else:
+                viewpoint = self._additional_view_description.rstrip()
+        if viewpoint:
+            sep = " " if prompt.rstrip().endswith(".") else ". "
+            prompt = prompt + sep + viewpoint
+        if not self._append_metadata:
+            return prompt
+
+        shape = transition.get(VIDEO_SHAPE)
+        height, width = (shape[1], shape[2]) if shape is not None else (None, None)
+        duration = int(self._num_frames / self._fps) if self._fps > 0 else 0
         sep = " " if prompt.rstrip().endswith(".") else ". "
         prompt = (
             prompt
@@ -621,13 +644,18 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
             prompt = prompt[0]
         if self._prompt_format == "json":
             prompt = self._json_caption(prompt, transition)
-        elif self._append_metadata:
+        elif self._prompt_format == "plain":
             prompt = self._augment(prompt, transition)
+        else:
+            raise ValueError(
+                f"prompt_format must be 'plain' or 'json', got {self._prompt_format!r}."
+            )
 
         cond, uncond = self._proc.tokenize_pair(
             prompt, self._negative_prompt, device="cpu"
         )
         out = transition.copy()
+        out[CAPTION] = prompt
         out[TEXT_IDS] = cond.text_ids
         out[TEXT_MASK] = cond.text_mask
         out[NEG_TEXT_IDS] = uncond.text_ids
@@ -640,6 +668,7 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
             "append_metadata": self._append_metadata,
             "prompt_format": self._prompt_format,
             "view_point": self._view_point,
+            "additional_view_description": self._additional_view_description,
             "fps": self._fps,
             "num_frames": self._num_frames,
         }
@@ -647,7 +676,7 @@ class Cosmos3TextTokenizeStep(ProcessorStep):
 
 @ProcessorStepRegistry.register("cosmos3_action_pad_step")
 class Cosmos3ActionPadStep(ProcessorStep):
-    """Pad/truncate action tensor for forward_dynamics, or set None for other modes."""
+    """Build the padded model action stream and its clean prefix."""
 
     def __init__(
         self,
@@ -656,45 +685,68 @@ class Cosmos3ActionPadStep(ProcessorStep):
         raw_action_dim: int,
         action_dim: int = 64,
         mode: str = "policy",
+        action_history_length: int = 0,
     ) -> None:
         self.action_chunk_size = int(action_chunk_size)
         self.raw_action_dim = int(raw_action_dim)
         self.action_dim = int(action_dim)
         self.mode = mode
+        self.action_history_length = int(action_history_length)
+        if self.action_chunk_size <= 0:
+            raise ValueError("action_chunk_size must be positive.")
+        if self.action_history_length < 0:
+            raise ValueError("action_history_length must be non-negative.")
 
     def __call__(self, transition: Transition) -> Transition:
         out = transition.copy()
-        out[ACTION_CHUNK] = self.action_chunk_size
+        total_action_length = self.action_chunk_size + self.action_history_length
+        out[ACTION_CHUNK] = total_action_length
         out[RAW_ACTION_DIM] = self.raw_action_dim
+        out[ACTION_START_FRAME_OFFSET] = 1 - self.action_history_length
 
-        if self.mode != "forward_dynamics":
+        if self.mode == "forward_dynamics":
+            clean_length = total_action_length
+        else:
+            clean_length = self.action_history_length
+        out[COND_ACTION_INDEXES] = tuple(range(clean_length))
+
+        if clean_length == 0:
             out[COND_ACTION] = None
             return out
 
         raw_action = transition.get(COND_ACTION)
         if raw_action is None:
             raise ValueError(
-                "forward_dynamics mode requires a 'cond_action' entry with the "
-                "conditioning action tensor."
+                f"{self.mode} mode with {clean_length} conditioned action rows "
+                "requires a 'cond_action' entry."
             )
         if isinstance(raw_action, (list, np.ndarray)):
             raw_action = torch.as_tensor(raw_action, dtype=torch.float32)
-        if raw_action.ndim == 3:
-            raw_action = raw_action.squeeze(0)
-
-        if raw_action.shape[0] < self.action_chunk_size:
-            pad = raw_action[-1:].repeat(
-                self.action_chunk_size - raw_action.shape[0], 1
+        if not isinstance(raw_action, torch.Tensor):
+            raise TypeError(
+                "cond_action must be a torch tensor, numpy array, or nested list."
             )
-            raw_action = torch.cat([raw_action, pad], dim=0)
-        elif raw_action.shape[0] > self.action_chunk_size:
-            raw_action = raw_action[: self.action_chunk_size]
+        if raw_action.ndim == 3 and raw_action.shape[0] == 1:
+            raw_action = raw_action.squeeze(0)
+        if raw_action.ndim != 2:
+            raise ValueError(
+                f"cond_action must have shape [T,D] or [1,T,D], got {tuple(raw_action.shape)}."
+            )
 
-        padded = torch.zeros(
-            self.action_chunk_size, self.action_dim, dtype=torch.float32
-        )
+        if raw_action.shape[0] < clean_length:
+            if self.mode != "forward_dynamics":
+                raise ValueError(
+                    f"cond_action has {raw_action.shape[0]} rows, but "
+                    f"action_history_length={clean_length}."
+                )
+            pad = raw_action[-1:].repeat(clean_length - raw_action.shape[0], 1)
+            raw_action = torch.cat([raw_action, pad], dim=0)
+        elif raw_action.shape[0] > clean_length:
+            raw_action = raw_action[:clean_length]
+
+        padded = torch.zeros(total_action_length, self.action_dim, dtype=torch.float32)
         dim = min(raw_action.shape[-1], self.action_dim)
-        padded[:, :dim] = raw_action[:, :dim]
+        padded[:clean_length, :dim] = raw_action[:clean_length, :dim]
 
         out[COND_ACTION] = padded.unsqueeze(0)
         return out
@@ -705,6 +757,7 @@ class Cosmos3ActionPadStep(ProcessorStep):
             "raw_action_dim": self.raw_action_dim,
             "action_dim": self.action_dim,
             "mode": self.mode,
+            "action_history_length": self.action_history_length,
         }
 
 
@@ -723,7 +776,10 @@ class Cosmos3DomainResolveStep(ProcessorStep):
 
 __all__ = [
     "ACTION_CHUNK",
+    "ACTION_START_FRAME_OFFSET",
+    "CAPTION",
     "COND_ACTION",
+    "COND_ACTION_INDEXES",
     "Cosmos3ActionPadStep",
     "Cosmos3DomainResolveStep",
     "Cosmos3ImagePreprocessStep",

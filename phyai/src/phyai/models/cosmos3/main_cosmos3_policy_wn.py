@@ -12,7 +12,7 @@ the identical denoise loop; only rank 0 should persist the returned action / vid
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -46,8 +46,9 @@ class Cosmos3PolicyWNArgs(EntryArgs):
 
     checkpoint_dir: str | Path | None = None
     config: Cosmos3Config | None = None
-    flow_shift: float = 10.0
+    flow_shift: float = 5.0
     use_karras_sigmas: bool | None = False
+    policy_modeling_mode: str | None = None
     decode_video: bool = False
     weight_strict: bool = False
 
@@ -83,6 +84,8 @@ class Cosmos3PolicyWNEntry(Entry):
             if args.config is not None
             else load_config(ckpt / "transformer", Cosmos3Config)
         )
+        if args.policy_modeling_mode is not None:
+            config = replace(config, policy_modeling_mode=args.policy_modeling_mode)
         with use_quant_plan(load_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
@@ -119,11 +122,12 @@ class Cosmos3PolicyWNEntry(Entry):
             logger,
             logging.INFO,
             "Cosmos3 tensor-parallel policy plugin ready (tp=%d, decode_video=%s, "
-            "flow_shift=%s, use_karras_sigmas=%s).",
+            "flow_shift=%s, use_karras_sigmas=%s, modeling_mode=%s).",
             self.scheduler.tp_size,
             self.decode_video,
             args.flow_shift,
             use_karras,
+            config.policy_modeling_mode,
         )
 
     def step(

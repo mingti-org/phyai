@@ -85,6 +85,7 @@ class Cosmos3T2VRunner(ModelRunner):
         fps: float | None = None,
         *,
         action_len: int = 0,
+        action_start_frame_offset: int = 1,
         sound_len: int = 0,
         sound_fps: float | None = None,
     ) -> Cosmos3Condition:
@@ -101,6 +102,7 @@ class Cosmos3T2VRunner(ModelRunner):
                 video_shape,
                 fps,
                 action_len=action_len,
+                action_start_frame_offset=action_start_frame_offset,
                 sound_len=sound_len,
                 sound_fps=sound_fps,
             )
@@ -122,6 +124,7 @@ class Cosmos3T2VRunner(ModelRunner):
         action_latents: torch.Tensor | None = None,
         action_domain_id: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
         sound_latents: torch.Tensor | None = None,
         sound_noisy_mask: torch.Tensor | None = None,
         sound_fps: float | None = None,
@@ -142,6 +145,7 @@ class Cosmos3T2VRunner(ModelRunner):
             video_shape,
             fps,
             action_len=action_len,
+            action_start_frame_offset=action_start_frame_offset,
             sound_len=sound_len,
             sound_fps=sound_fps,
         )

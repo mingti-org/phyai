@@ -7,6 +7,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from phyai_utils_tools.processing.base_processor import BaseModelProcessor
@@ -16,7 +17,10 @@ from phyai_utils_tools.tokenizer import get_tokenizer
 
 from phyai_utils_tools.models.cosmos3.steps_cosmos3 import (
     ACTION_CHUNK,
+    ACTION_START_FRAME_OFFSET,
+    CAPTION,
     COND_ACTION,
+    COND_ACTION_INDEXES,
     DOMAIN_ID,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
@@ -42,6 +46,11 @@ from phyai_utils_tools.processing.transition import PIXEL_VALUES
 
 
 COSMOS3_VISION_START_TOKEN = "<|vision_start|>"
+COSMOS3_ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
+    "The top row is from the wrist-mounted camera. "
+    "The bottom row contains two horizontally concatenated third-person "
+    "perspective views of the scene from opposite sides, with the robot visible."
+)
 
 
 def _flatten_chat_ids(out) -> list[int]:
@@ -312,6 +321,7 @@ class Cosmos3PolicyProcessedInputs:
     """Preprocessed inputs for the Cosmos3 action/policy path."""
 
     pixel_values: torch.Tensor
+    caption: str
     text_ids: torch.Tensor
     text_mask: torch.Tensor
     neg_text_ids: torch.Tensor
@@ -322,8 +332,11 @@ class Cosmos3PolicyProcessedInputs:
     action_chunk: int
     raw_action_dim: int
     video_shape: tuple[int, int, int]
+    video_num_frames: int
     content_size: tuple[int, int]
     cond_frame_indexes: tuple[int, ...] | None = None
+    cond_action_indexes: tuple[int, ...] = ()
+    action_start_frame_offset: int = 1
 
 
 class Cosmos3PolicyProcessor(BaseModelProcessor):
@@ -351,7 +364,10 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         append_metadata: bool = True,
         prompt_format: str = "plain",
         view_point: str = "ego_view",
+        additional_view_description: str | None = None,
         cond_frame_indexes: tuple[int, ...] | None = None,
+        action_history_length: int = 0,
+        flip_gripper: bool = False,
         action_stats_path: str | None = None,
         action_normalization: str = "minmax",
         device: torch.device | str = "cpu",
@@ -364,9 +380,8 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         self.mode = mode
         self.domain_name = domain_name
         self.action_chunk_size = int(action_chunk_size)
-        # Resolve the embodiment's raw action width: explicit value wins (and is
-        # cross-checked against the embodiment table when both are known);
-        # otherwise it is looked up from the domain name.
+        # note(chenghua): An explicit width is authoritative because one domain ID
+        # can serve checkpoints trained with different physical action schemas.
         self.raw_action_dim = self._resolve_raw_action_dim(raw_action_dim, domain_name)
         self.action_dim = int(action_dim)
         self.negative_prompt = negative_prompt
@@ -375,9 +390,14 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         self.append_metadata = bool(append_metadata)
         self.prompt_format = prompt_format
         self.view_point = view_point
+        self.additional_view_description = additional_view_description
         self.cond_frame_indexes = (
             tuple(cond_frame_indexes) if cond_frame_indexes is not None else None
         )
+        self.action_history_length = int(action_history_length)
+        if self.action_history_length < 0:
+            raise ValueError("action_history_length must be non-negative.")
+        self.flip_gripper = bool(flip_gripper)
         self.action_normalization = action_normalization
         self.device = device
         self.params_dtype = params_dtype
@@ -394,23 +414,22 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
     def _resolve_raw_action_dim(
         self, raw_action_dim: int | None, domain_name: str | int
     ) -> int:
-        """Resolve raw_action_dim from the embodiment, cross-checking if explicit."""
+        """Use an explicit raw width or infer it from the embodiment table."""
         if raw_action_dim is None:
             return resolve_raw_action_dim(domain_name)
-        raw_action_dim = int(raw_action_dim)
-        # Cross-check against the table when the domain name is resolvable.
-        if isinstance(domain_name, str):
-            try:
-                expected = resolve_raw_action_dim(domain_name)
-            except ValueError:
-                expected = None
-            if expected is not None and expected != raw_action_dim:
-                raise ValueError(
-                    f"raw_action_dim={raw_action_dim} conflicts with the table value "
-                    f"{expected} for domain_name={domain_name!r}; pass the matching "
-                    f"value or omit raw_action_dim to auto-resolve."
-                )
-        return raw_action_dim
+        return int(raw_action_dim)
+
+    @staticmethod
+    def _flip_gripper_channel(action: Any) -> torch.Tensor:
+        """Copy an action tensor and invert its final gripper channel."""
+        tensor = torch.as_tensor(action, dtype=torch.float32).clone()
+        if tensor.ndim not in (2, 3) or tensor.shape[-1] < 1:
+            raise ValueError(
+                "Gripper flipping expects action shaped [T,D] or [B,T,D], got "
+                f"{tuple(tensor.shape)}."
+            )
+        tensor[..., -1] = 1.0 - tensor[..., -1]
+        return tensor
 
     def _load_action_stats(self, stats_path: str) -> None:
         """Load output-denormalization tensors from an external stats JSON.
@@ -471,7 +490,12 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         t: Transition = {}
         t[IMAGES] = raw.get("images")
         t[TASK] = raw.get("task", raw.get("prompt", ""))
-        t[COND_ACTION] = raw.get("action") or raw.get("cond_action")
+        cond_action = raw.get("action")
+        if cond_action is None:
+            cond_action = raw.get("cond_action")
+        if cond_action is not None and self.flip_gripper:
+            cond_action = self._flip_gripper_channel(cond_action)
+        t[COND_ACTION] = cond_action
         t[DOMAIN_ID] = raw.get("domain_name", raw.get("domain_id", self.domain_name))
         t[MODE] = raw.get("mode", self.mode)
         return t
@@ -480,6 +504,7 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         """Extract typed output from the final transition."""
         return Cosmos3PolicyProcessedInputs(
             pixel_values=transition[PIXEL_VALUES],
+            caption=transition[CAPTION],
             text_ids=transition[TEXT_IDS],
             text_mask=transition[TEXT_MASK],
             neg_text_ids=transition[NEG_TEXT_IDS],
@@ -490,8 +515,11 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
             action_chunk=transition[ACTION_CHUNK],
             raw_action_dim=transition[RAW_ACTION_DIM],
             video_shape=transition[VIDEO_SHAPE],
+            video_num_frames=self.action_chunk_size + 1,
             content_size=(transition[META_HEIGHT], transition[META_WIDTH]),
             cond_frame_indexes=self.cond_frame_indexes,
+            cond_action_indexes=transition[COND_ACTION_INDEXES],
+            action_start_frame_offset=transition[ACTION_START_FRAME_OFFSET],
         )
 
     def build_preprocessor(self) -> ProcessorPipeline:
@@ -508,8 +536,7 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
                 append_metadata=self.append_metadata,
                 prompt_format=self.prompt_format,
                 view_point=self.view_point,
-                # Duration in the caption uses the rollout length = chunk + 1
-                # (the target frame count), not the observation frame count.
+                additional_view_description=self.additional_view_description,
                 fps=self.fps,
                 num_frames=self.action_chunk_size + 1,
             ),
@@ -518,6 +545,7 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
                 raw_action_dim=self.raw_action_dim,
                 action_dim=self.action_dim,
                 mode=self.mode,
+                action_history_length=self.action_history_length,
             ),
             Cosmos3DomainResolveStep(),
         ]
@@ -544,13 +572,11 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         returned in the model's (normalized) action space.
         """
         if isinstance(output, torch.Tensor):
-            action = self._denormalize_action(output[:, :, : self.raw_action_dim])
+            action = self._postprocess_action(output)
             return {"action": action.cpu()}
         result: dict[str, Any] = {}
         if "action" in output:
-            action = self._denormalize_action(
-                output["action"][:, :, : self.raw_action_dim]
-            )
+            action = self._postprocess_action(output["action"])
             result["action"] = action.cpu()
         if "pixels" in output:
             result["pixels"] = output["pixels"].cpu()
@@ -558,15 +584,181 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
             result["video"] = output["video"].cpu()
         return result
 
+    def _postprocess_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Remove clean history, denormalize, and restore gripper convention."""
+        action = action[:, self.action_history_length :, : self.raw_action_dim]
+        action = self._denormalize_action(action)
+        if self.flip_gripper:
+            action = self._flip_gripper_channel(action)
+        return action
+
+
+class Cosmos3RoboLabPolicyProcessor(Cosmos3PolicyProcessor):
+    """Native-compatible adapter for the Cosmos3 RoboLab/OpenPI request schema.
+
+    The adapter composes the optional three-camera observation, performs the
+    server's fixed 540x640 bilinear resize, conditions on joint-position history,
+    and restores the external gripper convention on output.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer_name_or_path: str,
+        format_prompt_as_json: bool = False,
+        image_height: int = 540,
+        image_width: int = 640,
+        action_chunk_size: int = 32,
+        history_length: int = 1,
+        domain_name: str | int = "droid_lerobot",
+        raw_action_dim: int = 8,
+        action_dim: int = 64,
+        fps: float = 15.0,
+        negative_prompt: str = "",
+        device: torch.device | str = "cpu",
+        params_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.robolab_image_height = int(image_height)
+        self.robolab_image_width = int(image_width)
+        super().__init__(
+            tokenizer_name_or_path=tokenizer_name_or_path,
+            height=544,
+            width=736,
+            num_frames=action_chunk_size + 1,
+            mode="policy",
+            domain_name=domain_name,
+            action_chunk_size=action_chunk_size,
+            raw_action_dim=raw_action_dim,
+            action_dim=action_dim,
+            negative_prompt=negative_prompt,
+            fps=fps,
+            image_size=480,
+            append_metadata=True,
+            prompt_format="json" if format_prompt_as_json else "plain",
+            view_point="concat_view",
+            additional_view_description=COSMOS3_ROBOLAB_CONCAT_VIEW_DESCRIPTION,
+            cond_frame_indexes=(0,),
+            action_history_length=history_length,
+            flip_gripper=True,
+            device=device,
+            params_dtype=params_dtype,
+        )
+
+    @staticmethod
+    def _as_rgb_uint8(value: Any, key: str) -> np.ndarray:
+        """Validate one RoboLab RGB observation."""
+        image = np.asarray(value)
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError(f"{key!r} must have shape [H,W,3], got {image.shape}.")
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(image)
+
+    @staticmethod
+    def _resize_rgb_uint8(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+        """Match the RoboLab server's float bilinear resize and uint8 cast."""
+        import torch.nn.functional as F
+
+        tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()
+        resized = F.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
+        return resized.squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
+
+    def _compose_roboarena_views(self, raw: dict[str, Any]) -> np.ndarray | None:
+        """Compose wrist-over-two-exterior cameras using the native layout."""
+        keys = (
+            "observation/wrist_image_left",
+            "observation/exterior_image_1_left",
+            "observation/exterior_image_2_left",
+        )
+        if not all(key in raw for key in keys):
+            return None
+        wrist = self._as_rgb_uint8(raw[keys[0]], keys[0])
+        left = self._as_rgb_uint8(raw[keys[1]], keys[1])
+        right = self._as_rgb_uint8(raw[keys[2]], keys[2])
+        half_size = (wrist.shape[0] // 2, wrist.shape[1] // 2)
+        left = self._resize_rgb_uint8(left, half_size)
+        right = self._resize_rgb_uint8(right, half_size)
+        return np.concatenate([wrist, np.concatenate([left, right], axis=1)], axis=0)
+
+    def _extract_robolab_image(self, raw: dict[str, Any]) -> np.ndarray:
+        """Extract the direct or composed RoboLab observation image."""
+        if "observation/image" in raw:
+            return self._as_rgb_uint8(raw["observation/image"], "observation/image")
+        if "images" in raw:
+            return self._as_rgb_uint8(raw["images"], "images")
+        image = self._compose_roboarena_views(raw)
+        if image is not None:
+            return image
+        raise ValueError(
+            "RoboLab input requires 'observation/image', 'images', or all three "
+            "wrist/exterior camera keys."
+        )
+
+    @staticmethod
+    def _as_history(value: Any, key: str, width: int | None = None) -> np.ndarray:
+        """Convert a RoboLab state history to contiguous float32 rows."""
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim == 1:
+            array = array[None, :]
+        if array.ndim != 2 or (width is not None and array.shape[-1] != width):
+            expected = f"[T,{width}]" if width is not None else "[T,D]"
+            raise ValueError(f"{key!r} must have shape {expected}, got {array.shape}.")
+        return np.ascontiguousarray(array)
+
+    def _extract_joint_history(self, raw: dict[str, Any]) -> np.ndarray:
+        """Build oldest-to-newest joint/gripper rows in external convention."""
+        length = self.action_history_length
+        joints = self._as_history(
+            raw["observation/joint_position"],
+            "observation/joint_position",
+            self.raw_action_dim - 1,
+        )
+        gripper = np.asarray(raw["observation/gripper_position"], dtype=np.float32)
+        if gripper.ndim == 0:
+            gripper = gripper.reshape(1, 1)
+        elif gripper.ndim == 1:
+            gripper = gripper[:, None]
+        if gripper.ndim != 2 or gripper.shape[-1] != 1:
+            raise ValueError(
+                "'observation/gripper_position' must have shape [T,1], [T], or "
+                f"scalar, got {gripper.shape}."
+            )
+        if len(joints) < length or len(gripper) < length:
+            raise ValueError(
+                f"RoboLab history_length={length} requires at least {length} state rows."
+            )
+        return np.concatenate([joints[-length:], gripper[-length:]], axis=-1)
+
+    def preprocess(self, raw: dict[str, Any]) -> Cosmos3PolicyProcessedInputs:
+        """Adapt one RoboLab/OpenPI observation and run the common processor."""
+        image = self._extract_robolab_image(raw)
+        size = (self.robolab_image_height, self.robolab_image_width)
+        if image.shape[:2] != size:
+            image = self._resize_rgb_uint8(image, size)
+
+        adapted: dict[str, Any] = {
+            "images": image,
+            "task": raw.get("prompt", raw.get("task", "")),
+            "domain_name": raw.get("domain_name", self.domain_name),
+        }
+        cond_action = raw.get("cond_action")
+        if cond_action is None and self.action_history_length > 0:
+            cond_action = self._extract_joint_history(raw)
+        if cond_action is not None:
+            adapted["cond_action"] = cond_action
+        return super().preprocess(adapted)
+
 
 __all__ = [
     "Cosmos3GenerationOutput",
     "Cosmos3GenerationPostProcessor",
     "Cosmos3PolicyProcessedInputs",
     "Cosmos3PolicyProcessor",
+    "Cosmos3RoboLabPolicyProcessor",
     "Cosmos3Processor",
     "Cosmos3TokenizedPrompt",
     "COSMOS3_VISION_START_TOKEN",
+    "COSMOS3_ROBOLAB_CONCAT_VIEW_DESCRIPTION",
     "EMBODIMENT_TO_DOMAIN_ID",
     "EMBODIMENT_TO_RAW_ACTION_DIM",
     "cosmos3_default_negative_prompt",

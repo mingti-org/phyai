@@ -11,10 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import phyai.parallel as P
 from phyai.engine_config import get_engine_config, resolve_engine_defaults
 from phyai.layers.attention.attention.layer import Attention
 from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -139,6 +141,7 @@ class TimestepEmbedder(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        reference_precision: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -146,6 +149,7 @@ class TimestepEmbedder(nn.Module):
             device = get_engine_config().device.target
         self.frequency_embedding_size = frequency_embedding_size
         self.hidden_size = hidden_size
+        self.reference_precision = reference_precision
         self.linear_1 = ReplicatedLinear(
             frequency_embedding_size,
             hidden_size,
@@ -172,9 +176,15 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None].float() * self.freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         t_freq = t_freq.to(self.linear_1.weight.dtype)
-        h, _ = self.linear_1(t_freq)
+        if self.reference_precision:
+            h, _ = _replicated_linear(self.linear_1, t_freq)
+        else:
+            h, _ = self.linear_1(t_freq)
         h = F.silu(h)
-        out, _ = self.linear_2(h)
+        if self.reference_precision:
+            out, _ = _replicated_linear(self.linear_2, h)
+        else:
+            out, _ = self.linear_2(h)
         return out
 
 
@@ -229,6 +239,128 @@ class DomainAwareLinear(nn.Module):
         return torch.bmm(x, w) + bias.unsqueeze(1)
 
 
+class Cosmos3RMSNorm(RMSNorm):
+    def __init__(
+        self,
+        *args,
+        reference_precision: bool = False,
+        affine_in_fp32: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.reference_precision = reference_precision
+        self.affine_in_fp32 = affine_in_fp32
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if not self.reference_precision:
+            return super().forward(x, residual)
+        if residual is not None:
+            raise RuntimeError("Cosmos3 reference RMSNorm does not fuse residual add.")
+        input_dtype = x.dtype
+        hidden = x.float()
+        variance = hidden.pow(2).mean(-1, keepdim=True)
+        hidden = hidden * torch.rsqrt(variance + self.variance_epsilon)
+        if self.affine_in_fp32:
+            return (self.weight.float() * hidden).to(input_dtype)
+        return self.weight * hidden.to(input_dtype)
+
+
+def _column_linear(
+    layer: ColumnParallelLinear, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if layer.sp_axis is not None:
+        x = P.all_gather(x, axis=layer.sp_axis, dim=0)
+    bias = None if layer.skip_bias_add else layer.bias
+    output = F.linear(x, layer.weight, bias)
+    if layer.gather_output and layer.tp_size > 1:
+        output = P.all_gather(output, axis=layer.axis, dim=-1)
+    return output, layer.bias if layer.skip_bias_add else None
+
+
+def _row_linear(
+    layer: RowParallelLinear, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not layer.input_is_parallel and layer.tp_size > 1:
+        shard = x.shape[-1] // layer.tp_size
+        x = x.narrow(-1, layer.tp_rank * shard, shard).contiguous()
+    bias = (
+        layer.bias
+        if layer.bias is not None and layer.tp_rank == 0 and not layer.skip_bias_add
+        else None
+    )
+    output = F.linear(x, layer.weight, bias)
+    if layer.reduce_results and layer.tp_size > 1:
+        if layer.sp_axis is not None:
+            output = P.reduce_scatter(output, axis=layer.sp_axis, dim=0)
+        else:
+            output = P.all_reduce(output, axis=layer.axis)
+    return output, layer.bias if layer.skip_bias_add else None
+
+
+def _replicated_linear(
+    layer: ReplicatedLinear, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    bias = None if layer.skip_bias_add else layer.bias
+    return F.linear(x, layer.weight, bias), (
+        layer.bias if layer.skip_bias_add else None
+    )
+
+
+def _project_qkv(
+    layer: QKVParallelLinear,
+    x: torch.Tensor,
+    sizes: tuple[int, int, int],
+    *,
+    split: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not split:
+        qkv, _ = layer(x)
+        return qkv.split(sizes, dim=-1)
+    if layer.bias is not None or layer.sp_axis is not None or layer.gather_output:
+        raise RuntimeError(
+            "Cosmos3 reference QKV requires bias-free local projections without SP."
+        )
+    weights = layer.weight.split(sizes, dim=0)
+    return tuple(F.linear(x, weight) for weight in weights)
+
+
+class Cosmos3MLP(DenseMLP):
+    def __init__(self, *args, split_gate_up: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.split_gate_up = split_gate_up
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.split_gate_up:
+            return super().forward(x)
+        if not self.gated:
+            hidden, _ = _column_linear(self.fc1, x)
+            if self.activation != "relu2":
+                raise RuntimeError(
+                    "Cosmos3 reference plain MLP currently supports only ReLU2."
+                )
+            hidden = F.relu(hidden).square()
+            output, _ = _row_linear(self.fc2, hidden)
+            return output
+        if self.activation != "silu":
+            raise RuntimeError(
+                "Cosmos3 split gate/up currently supports only the native SiLU MLP."
+            )
+        layer = self.gate_up_proj
+        if layer.bias is not None or layer.sp_axis is not None or layer.gather_output:
+            raise RuntimeError(
+                "Cosmos3 reference gate/up requires bias-free local projections without SP."
+            )
+        gate_size, up_size = layer.output_partition_sizes
+        gate_weight, up_weight = layer.weight.split((gate_size, up_size), dim=0)
+        gate = F.linear(x, gate_weight)
+        up = F.linear(x, up_weight)
+        activated = F.silu(gate) * up
+        out, _ = _row_linear(self.down_proj, activated)
+        return out
+
+
 class Cosmos3CausalAttention(nn.Module):
     """UND pathway: causal self-attention; returns ``(out, K, V)``"""
 
@@ -245,10 +377,13 @@ class Cosmos3CausalAttention(nn.Module):
         params_dtype: torch.dtype | None,
         qk_norm: bool = True,
         use_und_k_norm_for_gen: bool = False,
+        split_qkv: bool = False,
+        norm_affine_in_fp32: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
+        self.split_qkv = split_qkv
         # Fused Q/K/V column-parallel projection: one matmul (one hidden read,
         # one kernel) instead of three separate to_q/to_k/to_v. The separate
         # checkpoint leaves (to_q/to_k/to_v) still load via the fused loader's
@@ -278,29 +413,35 @@ class Cosmos3CausalAttention(nn.Module):
         self.num_local_heads = self.q_size // head_dim
         self.num_local_kv_heads = self.k_size // head_dim
         if qk_norm:
-            self.norm_q = RMSNorm(
+            self.norm_q = Cosmos3RMSNorm(
                 head_dim,
                 eps=rms_norm_eps,
                 backend=norm_backend,
                 dtype=params_dtype,
+                reference_precision=split_qkv,
+                affine_in_fp32=norm_affine_in_fp32,
                 prefix=f"{prefix}.norm_q" if prefix else "",
             )
-            self.norm_k = RMSNorm(
+            self.norm_k = Cosmos3RMSNorm(
                 head_dim,
                 eps=rms_norm_eps,
                 backend=norm_backend,
                 dtype=params_dtype,
+                reference_precision=split_qkv,
+                affine_in_fp32=norm_affine_in_fp32,
                 prefix=f"{prefix}.norm_k" if prefix else "",
             )
         else:
             self.norm_q = nn.Identity()
             self.norm_k = nn.Identity()
         if use_und_k_norm_for_gen and qk_norm is False:
-            self.k_norm_und_for_gen: nn.Module | None = RMSNorm(
+            self.k_norm_und_for_gen: nn.Module | None = Cosmos3RMSNorm(
                 head_dim,
                 eps=rms_norm_eps,
                 backend=norm_backend,
                 dtype=params_dtype,
+                reference_precision=split_qkv,
+                affine_in_fp32=norm_affine_in_fp32,
                 prefix=f"{prefix}.k_norm_und_for_gen" if prefix else "",
             )
         else:
@@ -320,8 +461,12 @@ class Cosmos3CausalAttention(nn.Module):
         freqs_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, S, _ = hidden_states.shape
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _project_qkv(
+            self.qkv_proj,
+            hidden_states,
+            (self.q_size, self.k_size, self.v_size),
+            split=self.split_qkv,
+        )
         q = q.view(B, S, self.num_local_heads, self.head_dim)
         k = k.view(B, S, self.num_local_kv_heads, self.head_dim)
         v = v.view(B, S, self.num_local_kv_heads, self.head_dim)
@@ -343,7 +488,10 @@ class Cosmos3CausalAttention(nn.Module):
             q_rotated, k_rotated, v
         )  # [B, S, H, D]  (4-D padded causal path)
         out = out.reshape(B, S, -1)
-        out, _ = self.to_out(out)
+        if self.split_qkv:
+            out, _ = _row_linear(self.to_out, out)
+        else:
+            out, _ = self.to_out(out)
         return out, k_for_gen, v
 
 
@@ -362,10 +510,13 @@ class Cosmos3CrossAttention(nn.Module):
         norm_backend: str,
         params_dtype: torch.dtype | None,
         qk_norm: bool = True,
+        split_qkv: bool = False,
+        norm_affine_in_fp32: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
+        self.split_qkv = split_qkv
         # Fused Q/K/V column-parallel projection (see Cosmos3CausalAttention).
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -392,18 +543,22 @@ class Cosmos3CrossAttention(nn.Module):
         self.num_local_heads = self.q_size // head_dim
         self.num_local_kv_heads = self.k_size // head_dim
         if qk_norm:
-            self.norm_q = RMSNorm(
+            self.norm_q = Cosmos3RMSNorm(
                 head_dim,
                 eps=rms_norm_eps,
                 backend=norm_backend,
                 dtype=params_dtype,
+                reference_precision=split_qkv,
+                affine_in_fp32=norm_affine_in_fp32,
                 prefix=f"{prefix}.norm_q" if prefix else "",
             )
-            self.norm_k = RMSNorm(
+            self.norm_k = Cosmos3RMSNorm(
                 head_dim,
                 eps=rms_norm_eps,
                 backend=norm_backend,
                 dtype=params_dtype,
+                reference_precision=split_qkv,
+                affine_in_fp32=norm_affine_in_fp32,
                 prefix=f"{prefix}.norm_k" if prefix else "",
             )
         else:
@@ -426,8 +581,12 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, S_gen, _ = hidden_states.shape
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _project_qkv(
+            self.qkv_proj,
+            hidden_states,
+            (self.q_size, self.k_size, self.v_size),
+            split=self.split_qkv,
+        )
         q = q.view(B, S_gen, self.num_local_heads, self.head_dim)
         k = k.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
         v = v.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
@@ -438,7 +597,10 @@ class Cosmos3CrossAttention(nn.Module):
         v_all = torch.cat([v_und, v], dim=1)
         out = self.attn(q, k_all, v_all)  # [B, S_gen, H, D]
         out = out.reshape(B, S_gen, -1)
-        out, _ = self.to_out(out)
+        if self.split_qkv:
+            out, _ = _row_linear(self.to_out, out)
+        else:
+            out, _ = self.to_out(out)
         return out
 
 
@@ -452,6 +614,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         attn_backend: str,
         norm_backend: str,
         params_dtype: torch.dtype | None,
+        reference_precision: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -468,23 +631,29 @@ class Cosmos3UndDecoderLayer(nn.Module):
             use_und_k_norm_for_gen=(
                 config.use_und_k_norm_for_gen and config.qk_norm_for_diffusion
             ),
+            split_qkv=reference_precision,
+            norm_affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.self_attn" if prefix else "",
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=reference_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.input_layernorm" if prefix else "",
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=reference_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.post_attention_layernorm" if prefix else "",
         )
-        self.mlp = DenseMLP(
+        self.mlp = Cosmos3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             activation=config.hidden_act,
@@ -492,6 +661,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             plain_hf_legs=("up_proj", "down_proj"),
+            split_gate_up=reference_precision,
             prefix=f"{prefix}.mlp" if prefix else "",
         )
 
@@ -519,6 +689,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         attn_backend: str,
         norm_backend: str,
         params_dtype: torch.dtype | None,
+        reference_precision: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -532,23 +703,29 @@ class Cosmos3GenDecoderLayer(nn.Module):
             norm_backend=norm_backend,
             params_dtype=params_dtype,
             qk_norm=config.qk_norm_for_diffusion,
+            split_qkv=reference_precision,
+            norm_affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.cross_attention" if prefix else "",
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=reference_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.input_layernorm" if prefix else "",
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=reference_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.post_attention_layernorm" if prefix else "",
         )
-        self.mlp = DenseMLP(
+        self.mlp = Cosmos3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             activation=config.hidden_act,
@@ -556,6 +733,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             plain_hf_legs=("up_proj", "down_proj"),
+            split_gate_up=reference_precision,
             prefix=f"{prefix}.mlp" if prefix else "",
         )
 
@@ -590,6 +768,7 @@ class Cosmos3LanguageModel(nn.Module):
         norm_backend: str,
         params_dtype: torch.dtype | None,
         device: torch.device | str | None,
+        reference_precision: bool = False,
         prefix: str = "language_model",
     ) -> None:
         super().__init__()
@@ -617,17 +796,20 @@ class Cosmos3LanguageModel(nn.Module):
                     attn_backend=attn_backend,
                     norm_backend=norm_backend,
                     params_dtype=params_dtype,
+                    reference_precision=reference_precision,
                     prefix=f"{prefix}.layers.{i}" if prefix else "",
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
         # Reserved for a future prompt upsampler; present in the checkpoint.
-        self.norm = RMSNorm(
+        self.norm = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=reference_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix=f"{prefix}.norm" if prefix else "",
         )
 
@@ -650,6 +832,7 @@ class Cosmos3Condition:
     freqs_gen: tuple[torch.Tensor, torch.Tensor]
     video_shape: tuple[int, int, int]
     action_len: int = 0
+    action_start_frame_offset: int = 1
     sound_len: int = 0
 
 
@@ -683,6 +866,9 @@ class Cosmos3Transformer(nn.Module):
         self.sound_gen = config.sound_gen
         self.sound_dim = config.sound_dim
         self.action_dim = config.action_dim
+        self.reference_policy_precision = (
+            config.action_gen and config.policy_modeling_mode == "reference"
+        )
 
         self.language_model = Cosmos3LanguageModel(
             config,
@@ -690,6 +876,7 @@ class Cosmos3Transformer(nn.Module):
             norm_backend=norm_backend,
             params_dtype=params_dtype,
             device=device,
+            reference_precision=self.reference_policy_precision,
             prefix="language_model",
         )
         self.gen_layers = nn.ModuleList(
@@ -699,16 +886,19 @@ class Cosmos3Transformer(nn.Module):
                     attn_backend=attn_backend,
                     norm_backend=norm_backend,
                     params_dtype=params_dtype,
+                    reference_precision=self.reference_policy_precision,
                     prefix=f"gen_layers.{i}",
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm_moe_gen = RMSNorm(
+        self.norm_moe_gen = Cosmos3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             backend=norm_backend,
             dtype=params_dtype,
+            reference_precision=self.reference_policy_precision,
+            affine_in_fp32=config.hidden_act == "relu2",
             prefix="norm_moe_gen",
         )
         self.proj_in = ReplicatedLinear(
@@ -727,8 +917,11 @@ class Cosmos3Transformer(nn.Module):
         )
         self.time_embedder = TimestepEmbedder(
             config.hidden_size,
-            params_dtype=params_dtype,
+            params_dtype=(
+                torch.float32 if self.reference_policy_precision else params_dtype
+            ),
             device=device,
+            reference_precision=self.reference_policy_precision,
             prefix="time_embedder",
         )
 
@@ -824,6 +1017,7 @@ class Cosmos3Transformer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         action_len: int = 0,
+        action_start_frame_offset: int = 1,
         sound_len: int = 0,
         sound_fps: float | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
@@ -833,7 +1027,7 @@ class Cosmos3Transformer(nn.Module):
         ``[B, S, 1, D]`` (the ``1`` broadcasts over the head axis). When
         ``action_len > 0`` the GEN positions are ``cat([video, action])`` — action
         shares the video's media temporal offset, a ``(T,1,1)`` grid at tcf=1 with
-        ``start_frame_offset=1`` (the action packing convention). When
+        ``start_frame_offset=action_start_frame_offset``. When
         ``sound_len > 0`` a sound ``(T,1,1)`` grid (tcf=1, ``start_frame_offset=0``,
         modulated by ``sound_fps``) is appended after the video/action positions
         (the sound packing convention).
@@ -883,7 +1077,7 @@ class Cosmos3Transformer(nn.Module):
                     # action temporal positions by ``temporal_compression_factor``.
                     base_temporal_compression_factor=self.temporal_compression_factor,
                     enable_fps_modulation=self.enable_fps_modulation,
-                    start_frame_offset=1,
+                    start_frame_offset=action_start_frame_offset,
                 )
                 v_pos = torch.cat([v_pos, a_pos.to(v_pos.dtype)], dim=1)
             if sound_len > 0:
@@ -928,6 +1122,40 @@ class Cosmos3Transformer(nn.Module):
         )
         return time_embed.unsqueeze(1) * gate
 
+    def _add_reference_timestep(
+        self,
+        tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        mask: torch.Tensor | None,
+        per_frame: int,
+    ) -> torch.Tensor:
+        batch, sequence, hidden = tokens.shape
+        if sequence % per_frame:
+            raise ValueError(
+                f"token sequence {sequence} is not divisible by per_frame={per_frame}."
+            )
+        frames = sequence // per_frame
+        if mask is None:
+            mask = torch.ones((batch, frames), dtype=torch.bool, device=tokens.device)
+        if mask.shape != (batch, frames):
+            raise ValueError(
+                f"timestep mask shape {tuple(mask.shape)} must equal {(batch, frames)}."
+            )
+        token_mask = mask.bool().repeat_interleave(per_frame, dim=1)
+        flat_indexes = token_mask.flatten().nonzero(as_tuple=False).flatten()
+        if flat_indexes.numel() == 0:
+            return tokens
+        token_timesteps = timestep[:, None].expand(batch, sequence)[token_mask]
+        embeds = self.time_embedder(token_timesteps * self.timestep_scale).to(
+            tokens.dtype
+        )
+        indexes = flat_indexes[:, None].expand(-1, hidden)
+        return (
+            tokens.reshape(batch * sequence, hidden)
+            .scatter_add(0, indexes, embeds)
+            .reshape(batch, sequence, hidden)
+        )
+
     def encode_condition(
         self,
         text_ids: torch.Tensor,
@@ -936,6 +1164,7 @@ class Cosmos3Transformer(nn.Module):
         fps: float | None = None,
         *,
         action_len: int = 0,
+        action_start_frame_offset: int = 1,
         sound_len: int = 0,
         sound_fps: float | None = None,
     ) -> Cosmos3Condition:
@@ -949,8 +1178,9 @@ class Cosmos3Transformer(nn.Module):
         caches it per CFG branch and reuses it across every denoise step.
 
         ``action_len`` / ``sound_len`` extend the GEN rope positions with the
-        action / sound ``(T, 1, 1)`` grid; they must match the ``action_latents`` /
-        ``sound_latents`` later passed to :meth:`forward`.
+        action / sound ``(T, 1, 1)`` grid; ``action_start_frame_offset`` aligns the
+        first action token with its video frame. The lengths must match the
+        ``action_latents`` / ``sound_latents`` later passed to :meth:`forward`.
         """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
@@ -970,6 +1200,7 @@ class Cosmos3Transformer(nn.Module):
             text_ids.device,
             dtype,
             action_len=action_len,
+            action_start_frame_offset=action_start_frame_offset,
             sound_len=sound_len,
             sound_fps=sound_fps,
         )
@@ -982,6 +1213,7 @@ class Cosmos3Transformer(nn.Module):
             freqs_gen=freqs_gen,
             video_shape=video_shape,
             action_len=action_len,
+            action_start_frame_offset=action_start_frame_offset,
             sound_len=sound_len,
         )
 
@@ -1034,12 +1266,22 @@ class Cosmos3Transformer(nn.Module):
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
 
         # Patchify + project + additive timestep embedding (video tokens).
-        hidden_video, _ = self.proj_in(self.patchify(hidden_states, t, h, w))
-        time_embed = self.time_embedder(timestep * self.timestep_scale)
-        time_embed = time_embed.to(hidden_video.dtype)
-        hidden_gen = hidden_video + self._gate_timestep(
-            time_embed, noisy_frame_mask, hp * wp
-        )
+        video_patches = self.patchify(hidden_states, t, h, w)
+        if self.reference_policy_precision:
+            hidden_video, _ = _replicated_linear(self.proj_in, video_patches)
+        else:
+            hidden_video, _ = self.proj_in(video_patches)
+        if self.reference_policy_precision:
+            hidden_gen = self._add_reference_timestep(
+                hidden_video, timestep, noisy_frame_mask, hp * wp
+            )
+            time_embed = None
+        else:
+            time_embed = self.time_embedder(timestep * self.timestep_scale)
+            time_embed = time_embed.to(hidden_video.dtype)
+            hidden_gen = hidden_video + self._gate_timestep(
+                time_embed, noisy_frame_mask, hp * wp
+            )
         s_video = hidden_gen.shape[1]
 
         # Action stream (policy / forward- & inverse-dynamics): domain-aware
@@ -1052,9 +1294,14 @@ class Cosmos3Transformer(nn.Module):
                 )
             action_tok = self.action_proj_in(action_latents, action_domain_id)
             action_tok = action_tok + self.action_modality_embed.to(action_tok.dtype)
-            action_tok = action_tok + self._gate_timestep(
-                time_embed, action_noisy_mask, 1
-            )
+            if self.reference_policy_precision:
+                action_tok = self._add_reference_timestep(
+                    action_tok, timestep, action_noisy_mask, 1
+                )
+            else:
+                action_tok = action_tok + self._gate_timestep(
+                    time_embed, action_noisy_mask, 1
+                )
             hidden_gen = torch.cat([hidden_gen, action_tok], dim=1)
 
         # Sound stream (T2VS / I2VS): plain projection + modality embed + gated
@@ -1069,9 +1316,19 @@ class Cosmos3Transformer(nn.Module):
                     f"sound_latents length {sound_latents.shape[1]} != "
                     f"condition.sound_len {condition.sound_len}."
                 )
-            sound_tok, _ = self.audio_proj_in(sound_latents)
+            if self.reference_policy_precision:
+                sound_tok, _ = _replicated_linear(self.audio_proj_in, sound_latents)
+            else:
+                sound_tok, _ = self.audio_proj_in(sound_latents)
             sound_tok = sound_tok + self.audio_modality_embed.to(sound_tok.dtype)
-            sound_tok = sound_tok + self._gate_timestep(time_embed, sound_noisy_mask, 1)
+            if self.reference_policy_precision:
+                sound_tok = self._add_reference_timestep(
+                    sound_tok, timestep, sound_noisy_mask, 1
+                )
+            else:
+                sound_tok = sound_tok + self._gate_timestep(
+                    time_embed, sound_noisy_mask, 1
+                )
             hidden_gen = torch.cat([hidden_gen, sound_tok], dim=1)
 
         # GEN pathway: cross-attend to the precomputed UND K/V at the GEN positions.
@@ -1082,13 +1339,42 @@ class Cosmos3Transformer(nn.Module):
             hidden_gen = layer(hidden_gen, k_und, v_und, freqs_cos, freqs_sin)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        video_out, _ = self.proj_out(hidden_gen[:, :s_video])
+        if self.reference_policy_precision:
+            video_out, _ = _replicated_linear(self.proj_out, hidden_gen[:, :s_video])
+        else:
+            video_out, _ = self.proj_out(hidden_gen[:, :s_video])
         video_vel = self.unpatchify(video_out, t, h, w)
         if action_latents is not None:
-            action_vel = self.action_proj_out(hidden_gen[:, s_video:], action_domain_id)
+            action_hidden = hidden_gen[:, s_video:]
+            if action_noisy_mask is None:
+                action_vel = self.action_proj_out(action_hidden, action_domain_id)
+            else:
+                if action_noisy_mask.shape != action_hidden.shape[:2]:
+                    raise ValueError(
+                        f"action_noisy_mask shape {tuple(action_noisy_mask.shape)} "
+                        f"must equal {tuple(action_hidden.shape[:2])}."
+                    )
+                action_vel = action_hidden.new_zeros(
+                    (*action_hidden.shape[:2], self.action_dim)
+                )
+                # note(chenghua): Match native decoding: conditioned rows never
+                # enter llm2action, so its BF16 GEMM sees only noisy action rows.
+                for batch_index in range(action_hidden.shape[0]):
+                    noisy = action_noisy_mask[batch_index].bool()
+                    if noisy.any():
+                        projected = self.action_proj_out(
+                            action_hidden[batch_index : batch_index + 1, noisy],
+                            action_domain_id[batch_index : batch_index + 1],
+                        )
+                        action_vel[batch_index, noisy] = projected[0]
             return video_vel, action_vel
         if sound_latents is not None:
-            sound_vel, _ = self.audio_proj_out(hidden_gen[:, s_video:])
+            if self.reference_policy_precision:
+                sound_vel, _ = _replicated_linear(
+                    self.audio_proj_out, hidden_gen[:, s_video:]
+                )
+            else:
+                sound_vel, _ = self.audio_proj_out(hidden_gen[:, s_video:])
             return video_vel, sound_vel
         return video_vel
 

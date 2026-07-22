@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -39,11 +39,12 @@ class Cosmos3PolicyArgs(EntryArgs):
 
     checkpoint_dir: str | Path | None = None
     config: Cosmos3Config | None = None
-    # Default flow_shift for the action-policy sampler.
-    flow_shift: float = 10.0
+    # note(chenghua): Released DROID policy serving uses linear-flow UniPC shift 5.
+    flow_shift: float = 5.0
     # note(chenghua): Native policy inference uses linear-flow UniPC, including
     # for Nano checkpoints whose exported Diffusers config requests Karras sigmas.
     use_karras_sigmas: bool | None = False
+    policy_modeling_mode: str | None = None
     decode_video: bool = False
     weight_strict: bool = False
 
@@ -79,6 +80,8 @@ class Cosmos3PolicyEntry(Entry):
             if args.config is not None
             else load_config(ckpt / "transformer", Cosmos3Config)
         )
+        if args.policy_modeling_mode is not None:
+            config = replace(config, policy_modeling_mode=args.policy_modeling_mode)
         with use_quant_plan(load_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
@@ -115,10 +118,11 @@ class Cosmos3PolicyEntry(Entry):
             logger,
             logging.INFO,
             "Cosmos3 policy plugin ready (decode_video=%s, flow_shift=%s, "
-            "use_karras_sigmas=%s).",
+            "use_karras_sigmas=%s, modeling_mode=%s).",
             self.decode_video,
             args.flow_shift,
             use_karras,
+            config.policy_modeling_mode,
         )
 
     def step(

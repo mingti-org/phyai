@@ -63,7 +63,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
         *,
         vae: Cosmos3WanVAE | None = None,
         device: torch.device | str | None = None,
-        flow_shift: float = 10.0,
+        flow_shift: float = 5.0,
         use_karras_sigmas: bool = False,
         use_cuda_graph: bool = False,
     ) -> None:
@@ -148,10 +148,19 @@ class Cosmos3PolicyWNScheduler(Scheduler):
             video_clean = list(range(t_lat))
         else:
             video_clean = [0]
-        action_clean = request.mode == "forward_dynamics"
+        if request.cond_action_indexes is not None:
+            action_clean = list(request.cond_action_indexes)
+        elif request.mode == "forward_dynamics":
+            action_clean = list(range(chunk))
+        else:
+            action_clean = []
         if any(index < 0 or index >= t_lat for index in video_clean):
             raise ValueError(
                 f"condition frame indexes {video_clean} are outside latent T={t_lat}."
+            )
+        if any(index < 0 or index >= chunk for index in action_clean):
+            raise ValueError(
+                f"condition action indexes {action_clean} are outside action T={chunk}."
             )
 
         seed = int(request.seed)
@@ -189,21 +198,27 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                 )
             video[:, :, video_clean] = cond_video[:, :, video_clean]
         cond_action = (
-            request.cond_action.to(dev, dt).float()
+            request.cond_action.to(dev, dt).float().clone()
             if request.cond_action is not None
             else None
         )
-        if action_clean and cond_action is not None:
-            action = cond_action.clone()
-            action[:, :, raw:] = 0.0
+        if action_clean:
+            if cond_action is None:
+                raise ValueError(
+                    "cond_action is required when action conditioning indexes are set."
+                )
+            if cond_action.shape != action.shape:
+                raise ValueError(
+                    f"cond_action shape {tuple(cond_action.shape)} must equal "
+                    f"{tuple(action.shape)}."
+                )
+            cond_action[:, :, raw:] = 0.0
+            action[:, action_clean] = cond_action[:, action_clean]
 
         video_mask = torch.ones(batch, t_lat, dtype=torch.bool, device=dev)
         video_mask[:, video_clean] = False
-        action_mask = (
-            torch.zeros(batch, chunk, dtype=torch.bool, device=dev)
-            if action_clean
-            else torch.ones(batch, chunk, dtype=torch.bool, device=dev)
-        )
+        action_mask = torch.ones(batch, chunk, dtype=torch.bool, device=dev)
+        action_mask[:, action_clean] = False
 
         text_ids, text_mask = request.text_ids.to(dev), request.text_mask.to(dev)
         neg_ids, neg_mask = request.neg_text_ids.to(dev), request.neg_text_mask.to(dev)
@@ -256,6 +271,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                         action_latents=model_action,
                         action_domain_id=domain,
                         action_noisy_mask=action_mask,
+                        action_start_frame_offset=request.action_start_frame_offset,
                     )
                     # all_gather over cfg is rank-ordered -> [cond, uncond] at dim 0.
                     v_pair = P.all_gather(v_local.unsqueeze(0), axis="cfg", dim=0)
@@ -269,9 +285,8 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                     action = uni_a.step(a_vel, timestep, action)
                     if cond_video is not None:
                         video[:, :, video_clean] = cond_video[:, :, video_clean]
-                    if action_clean and cond_action is not None:
-                        action = cond_action.clone()
-                        action[:, :, raw:] = 0.0
+                    if action_clean:
+                        action[:, action_clean] = cond_action[:, action_clean]
         else:
             with event_scope("cosmos3.policy_denoise_loop"):
                 for timestep in uni_v.timesteps:
@@ -290,6 +305,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                         action_latents=model_action,
                         action_domain_id=domain,
                         action_noisy_mask=action_mask,
+                        action_start_frame_offset=request.action_start_frame_offset,
                     )
                     if do_cfg:
                         vu, au = self.runner.forward(
@@ -304,6 +320,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                             action_latents=model_action,
                             action_domain_id=domain,
                             action_noisy_mask=action_mask,
+                            action_start_frame_offset=request.action_start_frame_offset,
                         )
                         v_vel = vu + request.guidance_scale * (v_vel - vu)
                         a_vel = au + request.guidance_scale * (a_vel - au)
@@ -314,9 +331,8 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                     action = uni_a.step(a_vel, timestep, action)
                     if cond_video is not None:
                         video[:, :, video_clean] = cond_video[:, :, video_clean]
-                    if action_clean and cond_action is not None:
-                        action = cond_action.clone()
-                        action[:, :, raw:] = 0.0
+                    if action_clean:
+                        action[:, action_clean] = cond_action[:, action_clean]
 
         out = {"video": video, "action": action[:, :, :raw]}
         if decode_video:
