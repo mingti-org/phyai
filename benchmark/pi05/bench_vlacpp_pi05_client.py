@@ -137,9 +137,15 @@ def make_setup_fn(args: argparse.Namespace):
                 return
             phase_samples["server_total_latency_ms"].append(float(r.latency_ms_total))
             phase_samples["server_vision_latency_ms"].append(float(r.latency_ms_vision))
-            phase_samples["server_inference_latency_ms"].append(float(r.latency_ms_inference))
-            phase_samples["server_prefill_latency_ms"].append(float(r.latency_ms_prefill))
-            phase_samples["server_denoise_latency_ms"].append(float(r.latency_ms_denoise))
+            phase_samples["server_inference_latency_ms"].append(
+                float(r.latency_ms_inference)
+            )
+            phase_samples["server_prefill_latency_ms"].append(
+                float(r.latency_ms_prefill)
+            )
+            phase_samples["server_denoise_latency_ms"].append(
+                float(r.latency_ms_denoise)
+            )
             update_phase_summary()
 
         def teardown() -> None:
