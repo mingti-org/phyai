@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470"
+     font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.3"/>
+      <feOffset dx="0" dy="1"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.15"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="960" height="470" fill="#fafbfc"/>
+
+  <!-- Brand mark -->
+  <text x="26" y="32" font-size="12" font-weight="700" fill="#003399">PhyAI</text>
+  <text x="26" y="47" font-size="9" fill="#999">© All rights reserved</text>
+
+  <!-- Title -->
+  <text x="480" y="38" text-anchor="middle" font-size="21" font-weight="600" fill="#1a1a1a">Quantization by example</text>
+  <text x="480" y="59" text-anchor="middle" font-size="12" fill="#667">Three checkpoint keys resolving through one QuantPlan</text>
+
+  <!-- Plan strip -->
+  <rect x="30" y="80" width="900" height="72" rx="10" fill="#f4f7fb" stroke="#d9e2ef" stroke-width="1.3"/>
+  <text x="48" y="103" font-size="12" font-weight="700" fill="#003399">QuantPlan · built from an HF fp8 config</text>
+  <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="11">
+    <text x="48" y="125" fill="#334"><tspan fill="#8a4fbf">Rule</tspan>(Matcher(<tspan fill="#2f8a4f">"name"</tspan>, <tspan fill="#2f8a4f">"lm_head"</tspan>), <tspan fill="#c25">None</tspan>)<tspan fill="#aaa">   # skip → bf16</tspan></text>
+    <text x="48" y="144" fill="#334"><tspan fill="#8a4fbf">default</tspan> = fp8<tspan fill="#aaa">   ·   weight: per-channel   ·   activation: dynamic per-token</tspan></text>
+  </g>
+
+  <!-- Column headers -->
+  <text x="175" y="182" text-anchor="middle" font-size="10.5" font-weight="700" fill="#999" letter-spacing="0.6">CHECKPOINT PREFIX</text>
+  <text x="500" y="182" text-anchor="middle" font-size="10.5" font-weight="700" fill="#999" letter-spacing="0.6">RESOLVES TO</text>
+  <text x="800" y="182" text-anchor="middle" font-size="10.5" font-weight="700" fill="#999" letter-spacing="0.6">ALLOCATED PARAMETERS</text>
+
+  <!-- ===================== ROW 1: qkv_proj → fp8 ===================== -->
+  <g>
+    <rect x="30" y="196" width="292" height="58" rx="8" fill="#fff" stroke="#F5A65B" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="46" y="230" font-size="11" fill="#333" font-family="ui-monospace, 'SF Mono', Menlo, monospace">model.layers.0.self_attn.qkv_proj</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 322 225 L 356 225"/><path d="M 351 221 L 356 225 L 351 229"/>
+    </g>
+    <text x="368" y="221" font-size="12" font-weight="600" fill="#d98530">default rule</text>
+    <text x="368" y="239" font-size="11" fill="#777">→ fp8 scheme</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 636 225 L 670 225"/><path d="M 665 221 L 670 225 L 665 229"/>
+    </g>
+    <rect x="672" y="196" width="258" height="58" rx="8" fill="#fff7ef" stroke="#F5A65B" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="686" y="216" font-size="12" font-weight="700" fill="#d98530">Fp8Spec</text>
+    <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="10" fill="#6b5a44">
+      <text x="686" y="233">weight: fp8_e4m3  [N, K]</text>
+      <text x="686" y="248">weight_scale: fp32  [N]</text>
+    </g>
+  </g>
+
+  <!-- ===================== ROW 2: gate_up_proj → fp8 ===================== -->
+  <g>
+    <rect x="30" y="274" width="292" height="58" rx="8" fill="#fff" stroke="#F5A65B" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="46" y="308" font-size="11" fill="#333" font-family="ui-monospace, 'SF Mono', Menlo, monospace">model.layers.0.mlp.gate_up_proj</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 322 303 L 356 303"/><path d="M 351 299 L 356 303 L 351 307"/>
+    </g>
+    <text x="368" y="299" font-size="12" font-weight="600" fill="#d98530">default rule</text>
+    <text x="368" y="317" font-size="11" fill="#777">→ fp8 scheme</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 636 303 L 670 303"/><path d="M 665 299 L 670 303 L 665 307"/>
+    </g>
+    <rect x="672" y="274" width="258" height="58" rx="8" fill="#fff7ef" stroke="#F5A65B" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="686" y="294" font-size="12" font-weight="700" fill="#d98530">Fp8Spec</text>
+    <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="10" fill="#6b5a44">
+      <text x="686" y="311">weight: fp8_e4m3  [N, K]</text>
+      <text x="686" y="326">weight_scale: fp32  [N]</text>
+    </g>
+  </g>
+
+  <!-- ===================== ROW 3: lm_head → skip (bf16) ===================== -->
+  <g>
+    <rect x="30" y="352" width="292" height="58" rx="8" fill="#fff" stroke="#4A90D9" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="46" y="386" font-size="11" fill="#333" font-family="ui-monospace, 'SF Mono', Menlo, monospace">lm_head</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 322 381 L 356 381"/><path d="M 351 377 L 356 381 L 351 385"/>
+    </g>
+    <text x="368" y="377" font-size="12" font-weight="600" fill="#2f6db0">Rule: name = lm_head</text>
+    <text x="368" y="395" font-size="11" fill="#777">→ skip (None)</text>
+
+    <g stroke="#9aa0a6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 636 381 L 670 381"/><path d="M 665 377 L 670 381 L 665 385"/>
+    </g>
+    <rect x="672" y="352" width="258" height="58" rx="8" fill="#f2f8fd" stroke="#4A90D9" stroke-width="1.6" filter="url(#soft-shadow)"/>
+    <text x="686" y="372" font-size="12" font-weight="700" fill="#2f6db0">Bf16Spec</text>
+    <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="10" fill="#4a5b6b">
+      <text x="686" y="389">weight: bf16  [N, K]</text>
+      <text x="686" y="404">(no scale)</text>
+    </g>
+  </g>
+
+  <!-- Footnote -->
+  <text x="30" y="440" font-size="10.5" fill="#8a8f96"><tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace">resolve()</tspan> walks the rules top to bottom; the first match wins, and anything unmatched falls through to <tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace">default</tspan>.</text>
+  <text x="30" y="457" font-size="10.5" fill="#8a8f96">The <tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace">"name"</tspan> matcher hits either the full prefix or just its last segment, so <tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace">lm_head</tspan> matches wherever it sits.</text>
+</svg>

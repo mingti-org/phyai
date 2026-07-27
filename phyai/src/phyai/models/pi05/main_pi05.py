@@ -38,6 +38,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config, set_engine_config
+from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_ws1_pi05 import (
@@ -174,11 +175,12 @@ class PI05Entry(Entry):
         # value the user left at its "unset" default.
         eng = self._apply_recommended_engine(eng, config)
 
-        self.model = PI05Model(
-            config,
-            vision_params_dtype=args.vision_params_dtype,
-            device=eng.device.target,
-        )
+        with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
+            self.model = PI05Model(
+                config,
+                vision_params_dtype=args.vision_params_dtype,
+                device=eng.device.target,
+            )
 
         if args.checkpoint_dir is not None:
             load_pretrained(

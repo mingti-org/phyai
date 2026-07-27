@@ -1,0 +1,84 @@
+---
+title: "Quantization overview"
+description: "The layered design of PhyAI's quantization subsystem: a four-stage pipeline from checkpoint config to physical weight format."
+icon: "layer-group"
+---
+
+# Quantization
+
+Quantization stores and computes weights and activations at lower precision than bf16 (fp8, nvfp4, and so on) to save memory and raise throughput. The hard part is not how any single format does its math. It is that one engine has to accept several quantized checkpoints that come from different tools with different conventions, while leaving model code almost untouched.
+
+PhyAI splits the problem into two layers:
+
+- **Semantic layer**: what a tensor is quantized to. It describes only the mathematical properties (dtype, granularity, symmetry) and says nothing about scale layout, kernel, or device.
+- **Physical layer**: what the tensor looks like in memory. Its dtype, the shape and layout of its scales, whether it needs post-load processing, and which kernel the forward pass runs.
+
+One explicit lowering step sits between the two layers. The semantic description is translated into a physical format once the device is known, and the physical format then allocates parameters and picks a kernel. Adding a new framework's config parser and adding a new physical kernel touch different files, so neither disturbs the other.
+
+![The layered design of quantization: config, plan, and scheme are all device-independent semantics; only materialize lowers them to a physical format](/images/quantization/layered-design.svg)
+
+One line, left to right: an importer recognizes the config as a `QuantPlan`, the `QuantPlan` resolves a `QuantScheme` by layer name, and `materialize` lowers that semantics into a `WeightSpec`. The first three stages never touch hardware. Only `materialize` reads the SM version, so the boundary falls between scheme and spec.
+
+# The four-stage pipeline
+
+What each stage in the figure actually does:
+
+| Stage | Input | Output | Code |
+| --- | --- | --- | --- |
+| Recognize | the checkpoint's quant config | `QuantPlan` | `layers/quant/importers/` |
+| Match | layer name + layer class | `QuantScheme` (or skip) | `layers/quant/plan.py` |
+| Lower | `QuantScheme` + SM version | `WeightSpec` | `layers/quant/materialize.py` |
+| Realize | `WeightSpec` | parameter allocation + kernel choice | `layers/quant/{bf16,fp8,nvfp4}.py` |
+
+Each stage reads only the output of the one before it and never reaches back. An importer collects assorted configs into a single rule table. The rule table answers one question by layer name: which scheme this layer uses. `materialize` translates semantics into physical form and makes the hardware-dependent choices here (for example, NVFP4's scale layout depends on the SM version).
+
+# Example: how three keys land
+
+Zoom into the `QuantPlan → WeightSpec` span above. Take an fp8 checkpoint whose plan has two rules: skip `lm_head`, send everything else to fp8. Three weight prefixes run through the rule table and land on different physical formats.
+
+![How one QuantPlan resolves three checkpoint weight keys](/images/quantization/resolve-example.svg)
+
+`qkv_proj` and `gate_up_proj` are not named by any rule, so they fall through to `default` and get an `Fp8Spec`: the weight is stored as `fp8_e4m3` with a fp32 `weight_scale` (per-channel, one per output channel), and the activation is quantized dynamically per token at runtime. `lm_head` hits the first skip rule, its `scheme` is `None`, so it stays bf16 with just a `weight` and no scale. Rules match top to bottom and stop at the first hit; everything else takes `default`.
+
+# Running a quantized checkpoint
+
+Model entries already wire up quantized loading, so running a quantized checkpoint uses the same code as a normal one. Take pi0.5:
+
+```python
+from pathlib import Path
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+import torch
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(checkpoint_dir=Path("/path/to/quantized_pi05")),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+        ),
+    )
+)
+```
+
+While building the model, the entry reads the checkpoint's quant config, builds the matching `QuantPlan`, and sets it as the active plan:
+
+```python
+with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
+    self.model = PI05Model(config, ...)
+```
+
+If the checkpoint has no quant config, `load_quant_plan` returns `None`, the model falls back to bf16, and behavior is identical to before. Wiring up quantization needs no branch on the model side. This loading is already connected in the pi0, pi0.5, and cosmos3 entries.
+
+# What's supported today
+
+On the config side, three frameworks are recognized:
+
+| Framework | Source file | Detection |
+| --- | --- | --- |
+| HF flat fp8 | `quantization_config` in `config.json` | `quant_method == "fp8"` |
+| compressed-tensors (llm-compressor) | `quantization_config` in `config.json` | `quant_method == "compressed-tensors"` |
+| NVIDIA ModelOpt | `hf_quant_config.json` or inline | `quant_algo` present |
+
+For how to configure it or hand-write rules, see [Configuring quantization](/quantization/configuration). To change physical formats or add a framework, see [Internals and extension](/quantization/internals).

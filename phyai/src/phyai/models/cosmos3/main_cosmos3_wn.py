@@ -24,6 +24,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
+from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
     cosmos3_avae_weight_remap,
@@ -94,9 +95,10 @@ class Cosmos3WNEntry(Entry):
             else load_config(ckpt / "transformer", Cosmos3Config)
         )
 
-        self.transformer = Cosmos3Transformer(
-            config, params_dtype=dtype, device=device
-        ).eval()
+        with use_quant_plan(load_quant_plan(ckpt / "transformer")):
+            self.transformer = Cosmos3Transformer(
+                config, params_dtype=dtype, device=device
+            ).eval()
         load_pretrained(
             self.transformer,
             ckpt / "transformer",

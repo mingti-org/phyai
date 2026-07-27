@@ -10,6 +10,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
+from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.modeling_pi0 import PI0Model
 from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request, PI0WS1Scheduler
@@ -105,11 +106,12 @@ class PI0Entry(Entry):
         else:
             config = PI0Config()
 
-        self.model = PI0Model(
-            config,
-            vision_params_dtype=args.vision_params_dtype,
-            device=eng.device.target,
-        )
+        with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
+            self.model = PI0Model(
+                config,
+                vision_params_dtype=args.vision_params_dtype,
+                device=eng.device.target,
+            )
         if args.checkpoint_dir is not None:
             load_pretrained(
                 self.model,

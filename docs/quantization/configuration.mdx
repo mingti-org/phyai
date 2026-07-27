@@ -1,0 +1,156 @@
+---
+title: "Configuring quantization"
+description: "How to set a Linear layer's quantization: automatic loading from a checkpoint, a hand-written QuantPlan, or a scheme passed to a single Linear."
+icon: "sliders"
+---
+
+# How a Linear picks its precision
+
+Every Linear picks one physical `spec` at construction. The order is fixed in `LinearBase.__init__` (`phyai/src/phyai/layers/linear/layers.py`): four options, highest priority first.
+
+```python
+if spec is not None:                       # 1. explicit spec: use it directly
+    self.spec = spec
+elif scheme is not None:                    # 2. explicit scheme: materialize into a spec
+    self.spec = materialize(scheme, sm_arch())
+else:
+    plan = get_active_plan()                # 3. consult the active plan
+    resolved = (
+        plan.resolve(prefix, type(self))
+        if (plan is not None and prefix)
+        else None
+    )
+    self.spec = (                           # matched: materialize; else fall back to bf16
+        materialize(resolved, sm_arch()) if resolved is not None else Bf16Spec()
+    )
+```
+
+| Priority | Source | When it applies |
+| --- | --- | --- |
+| 1 | `spec=` | you already have a physical spec and want to bypass the semantic layer |
+| 2 | `scheme=` | you want to set semantics for this layer and let `materialize` choose the physical format |
+| 3 | active `QuantPlan` | configure by layer name in bulk; this is the path automatic checkpoint loading takes |
+| fallback | `Bf16Spec` | no plan, no match, no explicit config, so it stays bf16 |
+
+Most of the time you only meet option 3: the plan is built automatically when the checkpoint loads, and you pass nothing.
+
+# Automatic loading from a checkpoint
+
+`load_quant_plan(checkpoint_dir)` (`layers/quant/active.py`) reads two places:
+
+- `quantization_config` in `config.json`, falling back to `compression_config`
+- a standalone `hf_quant_config.json` (used by ModelOpt)
+
+If neither is present it returns `None` and the model stays bf16. If it finds one, it hands off to an importer to recognize the framework and build the plan. Three are recognized today:
+
+<Tabs>
+  <Tab title="HF fp8">
+    `quant_method` is `fp8` in `config.json`:
+
+    ```json
+    {
+      "quantization_config": {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        "ignored_layers": ["lm_head"]
+      }
+    }
+    ```
+
+    `weight_block_size` present means block granularity; absent means per-channel. Any `activation_scheme` other than `"static"` means dynamic activation quantization. Layers listed in `ignored_layers` (or `modules_to_not_convert`) are skipped and stay bf16.
+  </Tab>
+  <Tab title="compressed-tensors">
+    The llm-compressor export format, `quant_method` is `compressed-tensors`:
+
+    ```json
+    {
+      "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "ignore": ["lm_head"],
+        "config_groups": {
+          "group_0": {
+            "targets": ["Linear"],
+            "weights": {"type": "int", "num_bits": 8, "strategy": "channel"},
+            "input_activations": {"type": "int", "num_bits": 8, "strategy": "token", "dynamic": true}
+          }
+        }
+      }
+    }
+    ```
+
+    Each `config_groups` entry becomes one rule. `targets` decides the match: a `"re:"` prefix is a regex, a bare capitalized name with no dot (like `Linear`) is a layer class name, anything else is a layer name. `strategy` maps to granularity (`tensor` / `channel` / `block` / `token`).
+  </Tab>
+  <Tab title="NVIDIA ModelOpt">
+    A standalone `hf_quant_config.json`, or inline in `config.json`:
+
+    ```json
+    {
+      "quantization": {
+        "quant_algo": "NVFP4",
+        "exclude_modules": ["lm_head"]
+      }
+    }
+    ```
+
+    A single `quant_algo` covers every Linear: `FP4` goes to nvfp4, `FP8` goes to fp8. Layers in `exclude_modules` (or `ignore`) are skipped. This exclusion matches by exact layer name (or its last segment), not by glob.
+  </Tab>
+</Tabs>
+
+The three importers are tried in a fixed order (fp8 → compressed-tensors → modelopt). On success it logs one line telling you which file the config came from.
+
+# Hand-writing a QuantPlan
+
+When automatic loading is not enough, you can assemble the rule table yourself. A `QuantPlan` is an ordered sequence of `Rule`s plus a fallback `default`. Each `Rule` pairs a `Matcher` with a `QuantScheme`; a `scheme` of `None` means skip (stay bf16).
+
+```python
+from phyai.layers.quant.active import use_quant_plan
+from phyai.layers.quant.granularity import Granularity
+from phyai.layers.quant.plan import Matcher, QuantPlan, Rule
+from phyai.layers.quant.scheme import QDType, QuantScheme, TensorQuant
+
+fp8 = QuantScheme(
+    weight=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL),
+    input=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL, dynamic=True),
+)
+
+plan = QuantPlan(
+    rules=(
+        Rule(Matcher("name", "lm_head"), None),   # skip → bf16
+        Rule(Matcher("glob", "*.mlp.*"), fp8),     # only Linears under MLP → fp8
+    ),
+    default=None,                                  # everything else → bf16
+)
+
+with use_quant_plan(plan):
+    model = MyModel(...)   # during construction, each Linear resolves itself
+```
+
+`Matcher` supports four kinds of match:
+
+| kind | how it matches | good for |
+| --- | --- | --- |
+| `name` | equals the full prefix, or equals the last segment | naming one layer |
+| `glob` | `fnmatch(prefix, pattern)` | a batch of similarly-named layers |
+| `regex` | `re.match(pattern, prefix)` | complex prefix patterns |
+| `module_cls` | pattern is a substring of the layer class name | matching by layer type, not name |
+
+`resolve` walks top to bottom; the first matching `Rule` wins, and if none match it uses `default`.
+
+# Passing a scheme to a single Linear
+
+To change one layer without building a whole table, pass `scheme` straight to that Linear. It skips the plan and goes directly to `materialize`:
+
+```python
+from phyai.layers.linear.layers import RowParallelLinear
+
+layer = RowParallelLinear(
+    in_features, out_features,
+    scheme=fp8,          # bypass the active plan
+    prefix="decoder.layers.0.mlp.down_proj",
+)
+```
+
+# How scales are loaded
+
+The scale parameters a physical spec allocates (`weight_scale`, `input_scale`, `weight_global_scale`) get their `hf_keys` and loader attached by `LinearBase._attach_optional_scales`, marked optional. A pre-quantized checkpoint's scales then load automatically, and a plain bf16 checkpoint that lacks them does not error on the missing keys.

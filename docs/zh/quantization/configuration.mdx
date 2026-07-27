@@ -1,0 +1,157 @@
+---
+title: "配置量化"
+description: "怎么配置一层 Linear 的量化设置：从 checkpoint 自动加载到手写 QuantPlan、或给单个 Linear 指定 scheme。"
+icon: "sliders"
+---
+
+# Linear 怎么决定自己的精度
+
+每个 Linear 在构造时都要挑一个物理 `spec`。挑的顺序在 `LinearBase.__init__`（`phyai/src/phyai/layers/linear/layers.py`）里写死，四选一，从高到低：
+
+```python
+if spec is not None:                       # 1. 显式传了 spec：直接用
+    self.spec = spec
+elif scheme is not None:                    # 2. 显式传了 scheme：materialize 成 spec
+    self.spec = materialize(scheme, sm_arch())
+else:
+    plan = get_active_plan()                # 3. 看当前生效的 plan
+    resolved = (
+        plan.resolve(prefix, type(self))
+        if (plan is not None and prefix)
+        else None
+    )
+    self.spec = (                           # 命中就 materialize，否则退回 bf16
+        materialize(resolved, sm_arch()) if resolved is not None else Bf16Spec()
+    )
+```
+
+| 优先级 | 来源 | 什么时候用 |
+| --- | --- | --- |
+| 1 | `spec=` | 你已经有现成的物理 spec，绕过语义层 |
+| 2 | `scheme=` | 只想给这一层指定语义，让 `materialize` 决定物理格式 |
+| 3 | 当前 `QuantPlan` | 按层名批量配置，checkpoint 自动加载走的就是这条 |
+| 兜底 | `Bf16Spec` | 没 plan、没命中、没显式配置，保持 bf16 |
+
+大多数情况你只会碰到第 3 条：加载 checkpoint 时 plan 自动建好，你什么都不用传。
+
+# 从 checkpoint 自动加载
+
+`load_quant_plan(checkpoint_dir)`（`layers/quant/active.py`）读两个地方：
+
+- `config.json` 里的 `quantization_config`，没有就退而找 `compression_config`
+- 独立的 `hf_quant_config.json`（ModelOpt 用这个）
+
+两个都没有就返回 `None`，模型保持 bf16。读到了就交给 importer 认框架、建计划。目前认三种：
+
+<Tabs>
+  <Tab title="HF fp8">
+    `config.json` 里 `quant_method` 是 `fp8`：
+
+    ```json
+    {
+      "quantization_config": {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        "ignored_layers": ["lm_head"]
+      }
+    }
+    ```
+
+    `weight_block_size` 在就走 block 粒度，不在就 per-channel。`activation_scheme` 不是 `"static"` 就按动态激活量化。`ignored_layers`（或 `modules_to_not_convert`）列出的层跳过，保持 bf16。
+  </Tab>
+  <Tab title="compressed-tensors">
+    llm-compressor 导出的格式，`quant_method` 是 `compressed-tensors`：
+
+    ```json
+    {
+      "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "ignore": ["lm_head"],
+        "config_groups": {
+          "group_0": {
+            "targets": ["Linear"],
+            "weights": {"type": "int", "num_bits": 8, "strategy": "channel"},
+            "input_activations": {"type": "int", "num_bits": 8, "strategy": "token", "dynamic": true}
+          }
+        }
+      }
+    }
+    ```
+
+    每个 `config_groups` 项拆成一条规则。`targets` 决定匹配方式：`"re:"` 开头当正则，一个大写开头、不带点的裸名（像 `Linear`）当层的类名，其余当层名。`strategy` 映射到粒度（`tensor` / `channel` / `block` / `token`）。
+  </Tab>
+  <Tab title="NVIDIA ModelOpt">
+    独立的 `hf_quant_config.json`，或内联在 `config.json` 里：
+
+    ```json
+    {
+      "quantization": {
+        "quant_algo": "NVFP4",
+        "exclude_modules": ["lm_head"]
+      }
+    }
+    ```
+
+    一个 `quant_algo` 管所有 Linear：带 `FP4` 走 nvfp4，带 `FP8` 走 fp8。`exclude_modules`（或 `ignore`）里的层跳过。这里的排除按层名精确匹配（或匹配最后一段），不做 glob。
+  </Tab>
+</Tabs>
+
+三个 importer 按固定顺序试（fp8 → compressed-tensors → modelopt）。加载成功后会打一行日志，告诉你 config 从哪个文件读来的。
+
+# 手写一个 QuantPlan
+
+自动加载不够用时，可以自己拼一张规则表。`QuantPlan` 就是一串有序的 `Rule`，加一个兜底的 `default`。每条 `Rule` 是一个 `Matcher` 配一个 `QuantScheme`，`scheme` 传 `None` 表示跳过（保持 bf16）。
+
+```python
+from phyai.layers.quant.active import use_quant_plan
+from phyai.layers.quant.granularity import Granularity
+from phyai.layers.quant.plan import Matcher, QuantPlan, Rule
+from phyai.layers.quant.scheme import QDType, QuantScheme, TensorQuant
+
+fp8 = QuantScheme(
+    weight=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL),
+    input=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL, dynamic=True),
+)
+
+plan = QuantPlan(
+    rules=(
+        Rule(Matcher("name", "lm_head"), None),   # 跳过 → bf16
+        Rule(Matcher("glob", "*.mlp.*"), fp8),     # 只有 MLP 里的 Linear → fp8
+    ),
+    default=None,                                  # 其余 → bf16
+)
+
+with use_quant_plan(plan):
+    model = MyModel(...)   # 构造期间，每个 Linear 自己 resolve
+```
+
+`Matcher` 有四种匹配方式：
+
+| kind | 怎么匹配 | 适合 |
+| --- | --- | --- |
+| `name` | 等于完整 prefix，或等于最后一段 | 点名某一层 |
+| `glob` | `fnmatch(prefix, pattern)` | 一批路径相似的层 |
+| `regex` | `re.match(pattern, prefix)` | 前缀规律复杂时 |
+| `module_cls` | pattern 是层类名的子串 | 按层的类型，而非名字 |
+
+`resolve` 自上而下走，第一条命中的 `Rule` 说了算，都不中就用 `default`。
+
+# 给单个 Linear 指定 scheme
+
+只想改一层、不想建整张表，直接把 `scheme` 传给这个 Linear 就行。它会跳过 plan，直接 `materialize`：
+
+```python
+from phyai.layers.linear.layers import RowParallelLinear
+
+layer = RowParallelLinear(
+    in_features, out_features,
+    scheme=fp8,          # 越过 active plan
+    prefix="decoder.layers.0.mlp.down_proj",
+)
+```
+
+# scale 是怎么加载的
+
+物理 spec 分配的 scale 参数（`weight_scale`、`input_scale`、`weight_global_scale`）由 `LinearBase._attach_optional_scales` 挂上 `hf_keys` 和 loader，并标成可选。于是预量化 checkpoint 里的这些 scale 会自动对上加载；普通 bf16 checkpoint 里没有它们，也不会因为 key 缺失而报错。
+

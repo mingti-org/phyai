@@ -25,7 +25,10 @@ from phyai.engine_config import get_engine_config
 from phyai.layers.linear.dispatch import get_linear_dispatcher
 from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant import AllocationRequest
+from phyai.layers.quant.active import get_active_plan
+from phyai.layers.quant.materialize import materialize
 from phyai.parallel.state import resolve_mesh
+from phyai.utils.cuda import sm_arch
 from phyai.weights.shards import _Leg, fused, replicated, sharded
 
 
@@ -54,6 +57,7 @@ class LinearBase(nn.Module):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
@@ -62,7 +66,20 @@ class LinearBase(nn.Module):
         self.out_features = out_features
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.skip_bias_add = skip_bias_add
-        self.spec = spec if spec is not None else Bf16Spec()
+        if spec is not None:
+            self.spec = spec
+        elif scheme is not None:
+            self.spec = materialize(scheme, sm_arch())
+        else:
+            plan = get_active_plan()
+            resolved = (
+                plan.resolve(prefix, type(self))
+                if (plan is not None and prefix)
+                else None
+            )
+            self.spec = (
+                materialize(resolved, sm_arch()) if resolved is not None else Bf16Spec()
+            )
         self.device = (
             device if device is not None else get_engine_config().device.target
         )
@@ -118,6 +135,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
@@ -128,6 +146,7 @@ class ReplicatedLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            scheme=scheme,
             device=device,
             prefix=prefix,
         )
@@ -198,6 +217,7 @@ class ColumnParallelLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         output_sizes: list[int] | None = None,
         mesh: str = "model",
         device: torch.device | str | None = None,
@@ -210,6 +230,7 @@ class ColumnParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            scheme=scheme,
             device=device,
             prefix=prefix,
         )
@@ -313,6 +334,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         hf_legs: Sequence[str] | None = None,
         mesh: str = "model",
         device: torch.device | str | None = None,
@@ -328,6 +350,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            scheme=scheme,
             output_sizes=output_sizes,
             mesh=mesh,
             device=device,
@@ -395,6 +418,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         hf_legs: Mapping[str, str] | None = None,
         mesh: str = "model",
         device: torch.device | str | None = None,
@@ -434,6 +458,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            scheme=scheme,
             output_sizes=[q_size, kv_size, kv_size],
             mesh=mesh,
             device=device,
@@ -508,6 +533,7 @@ class RowParallelLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        scheme: object | None = None,
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -519,6 +545,7 @@ class RowParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            scheme=scheme,
             device=device,
             prefix=prefix,
         )
