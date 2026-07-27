@@ -398,3 +398,6 @@ from phyai.models.cosmos3 import main_cosmos3_wn as _main_cosmos3_wn  # noqa: E4
 from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy_wn as _main_cosmos3_policy_wn,
 )
+from phyai.models.minicpm_robot_track import (  # noqa: E402, F401
+    main_minicpm_robot_track as _main_minicpm_robot_track,
+)
