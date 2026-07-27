@@ -42,7 +42,8 @@
                 "group": "GR00T",
                 "pages": [
                   "models/gr00t/ws1",
-                  "models/gr00t/n17-accuracy-parity"
+                  "models/gr00t/n17-accuracy-parity",
+                  "models/gr00t/n17-libero-closed-loop"
                 ]
               },
               {
@@ -102,7 +103,8 @@
                 "group": "GR00T",
                 "pages": [
                   "zh/models/gr00t/ws1",
-                  "zh/models/gr00t/n17-accuracy-parity"
+                  "zh/models/gr00t/n17-accuracy-parity",
+                  "zh/models/gr00t/n17-libero-closed-loop"
                 ]
               },
               {
