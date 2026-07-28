@@ -71,6 +71,8 @@ class MiniCPMRobotTrackWS1Scheduler(Scheduler):
                 f"{expected_lengths}, got {tuple(text_lengths.shape)}."
             )
         self.validate_integer_tensor("text_lengths", text_lengths)
+        # Raising a synchronous ValueError requires a host sync. At batch size 1,
+        # copying this scalar is faster than launching device-side range kernels.
         lengths_cpu = text_lengths.detach().to(device="cpu", dtype=torch.long)
         lengths_valid = (lengths_cpu >= 1) & (lengths_cpu <= self.config.text_capacity)
         if not bool(lengths_valid.all()):

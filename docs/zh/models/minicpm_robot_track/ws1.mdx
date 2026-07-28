@@ -1,0 +1,230 @@
+---
+title: "MiniCPM-RobotTrack本地部署"
+description: "使用PhyAI运行32帧初始化和单帧waypoint推理。"
+icon: "route"
+---
+
+# 概述
+
+本指南使用PhyAI Engine运行MiniCPM-RobotTrack。模型输入32帧RGB
+图像和一条文本指令，输出8个`[x, y, yaw]` waypoint。示例只包含
+本地推理，不启动网络服务。
+
+```text
+32帧RGB + 文本指令
+  -> PIL BICUBIC resize + tokenizer
+  -> DINOv3 + SigLIP
+  -> 31帧coarse token历史 + 当前帧fine token
+  -> MiniCPM4 policy + trajectory head
+  -> 8个[x, y, yaw] waypoint
+```
+
+# 环境要求
+
+- Linux和支持CUDA的NVIDIA GPU
+- Python 3.12或更高版本
+- [`uv`](https://docs.astral.sh/uv/)
+- MiniCPM-RobotTrack checkpoint
+- 本地DINOv3和SigLIP checkpoint
+- 按时间顺序命名的RGB图像目录
+
+PhyAI不分发模型权重。接入遵循
+[OpenBMB/MiniCPM-Robot](https://github.com/OpenBMB/MiniCPM-Robot/tree/main/MiniCPM-RobotTrack)
+发布的checkpoint和模型结构。
+
+# 安装
+
+在仓库根目录执行：
+
+```bash
+uv sync
+```
+
+下面的命令都使用`uv run`，确保命令运行在workspace环境中。
+
+## Jetson Orin与CUDA12.6
+
+主workspace仍要求Python 3.12或更高版本。Jetson AI Lab的
+[CUDA12.6索引](https://pypi.jetson-ai-lab.io/jp6/cu126/torch/2.11.0)
+目前为JetPack 6提供CPython 3.10版PyTorch 2.11 wheel，其中包含Orin需要的
+`sm_87`设备代码。使用示例目录中的独立project，不要修改根
+`pyproject.toml`：
+
+```bash
+unset VIRTUAL_ENV
+uv sync \
+  --project examples/minicpm_robot_track/jetson-cu126 \
+  --python /usr/bin/python3.10
+
+uv build --package phyai-ext --wheel \
+  --out-dir .cache/jetson-cu126-wheels
+uv pip install --python 3.12 \
+  --target .cache/jetson-cu126-runtime \
+  --no-deps --reinstall \
+  .cache/jetson-cu126-wheels/phyai_ext-*.whl
+
+export PYTHONPATH="$PWD/.cache/jetson-cu126-runtime:$PWD/phyai/src:$PWD/phyai-kernel:$PWD/phyai-utils-tools/src"
+```
+
+`phyai-ext`生成`py3-none-linux_aarch64` wheel，但包元数据沿用主workspace的
+Python 3.12要求。上面的命令使用Python 3.12将wheel展开到独立目录，
+RobotTrack进程仍使用独立project中的Python 3.10：
+
+```bash
+examples/minicpm_robot_track/jetson-cu126/.venv/bin/python -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())'
+```
+
+预期输出包含Torch `2.11.0`、CUDA `12.6`和`sm_87`。这套project只用于
+Jetson运行时，不会降低仓库对外声明的Python版本。
+
+# 准备输入
+
+示例按文件名中的数字顺序读取图像，取最后32帧。图像不足32帧时，
+使用窗口中最早的一帧在左侧补齐。Processor使用PIL BICUBIC将每帧
+resize到`384x384`。
+
+| 请求 | 输入 | 用途 |
+| --- | --- | --- |
+| 完整窗口 | 32帧RGB | 创建或替换stream的视觉历史 |
+| 增量请求 | 1帧RGB | 为已初始化的stream推进一帧 |
+
+<Note>
+  Policy序列长度固定为256 tokens。这不是图像分辨率，两个视觉塔的
+  输入都是`384x384`。
+</Note>
+
+# 运行一次推理
+
+端到端示例会初始化32帧窗口，再提交一帧增量输入，并检查输出是
+有限值且shape为`(1, 8, 3)`。
+
+视觉runner通过PhyAI直接加载DINOv3和SigLIP checkpoint。
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark_e2e.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --dino-checkpoint /path/to/dinov3-vit-s16 \
+  --siglip-checkpoint /path/to/siglip-so400m-patch14-384 \
+  --vision-attention-backend sdpa \
+  --vision-norm-backend phyai-kernel \
+  --vision-dtype float16 \
+  --frames-dir /path/to/ordered/rgb/frames \
+  --instruction "Follow the person in the red shirt." \
+  --warmup 0 \
+  --iters 1 \
+  --cold-iters 1
+```
+
+使用上面的Jetson独立project时，把`uv run python`替换为
+`examples/minicpm_robot_track/jetson-cu126/.venv/bin/python`。
+
+# 一次请求怎样运行
+
+<Steps>
+  <Step title="处理图像和文本">
+    `MiniCPMRobotTrackProcessor` resize RGB图像，并将指令token压紧到固定输入中。
+  </Step>
+  <Step title="编码新的视觉输入">
+    DINOv3和SigLIP通过PhyAI执行。增量请求只编码新帧。
+  </Step>
+  <Step title="更新stream历史">
+    GridPool生成coarse历史token和当前帧fine token。Engine为每个
+    `stream_id`保留31帧coarse token。
+  </Step>
+  <Step title="运行policy">
+    MiniCPM4 policy和trajectory head返回shape为`(1, 8, 3)`的float32 tensor。
+  </Step>
+</Steps>
+
+# 滑动窗口约定
+
+stream的第一个请求必须包含32帧。`frame_index`是窗口最后一帧的序号。
+后续请求每次提交一帧，并使用连续序号。
+
+| 情况 | Engine行为 |
+| --- | --- |
+| 新`stream_id`提交32帧 | 初始化stream |
+| 已存在的`stream_id`提交32帧 | 替换完整历史 |
+| 提交下一个`frame_index` | 只编码新帧并推进窗口 |
+| 重复最新的`frame_index` | 复用已提交的视觉特征 |
+| 跳过序号或使用更旧的序号 | 报错 |
+| 未知或已淘汰的stream提交单帧 | 报错，需要重新提交32帧 |
+
+视觉状态只在policy推理成功后提交。默认最多缓存8个stream，超过
+上限后按LRU淘汰。
+
+# Benchmark
+
+使用10次预热和50次计时测量稳态单帧时延：
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark_e2e.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --dino-checkpoint /path/to/dinov3-vit-s16 \
+  --siglip-checkpoint /path/to/siglip-so400m-patch14-384 \
+  --frames-dir /path/to/ordered/rgb/frames \
+  --warmup 10 \
+  --iters 50 \
+  --cold-iters 1 \
+  --json-output /tmp/robottrack_phyai.json
+```
+
+下表使用PhyAI policy和视觉runner、相同的Processor与图像，并执行10次预热和
+50次计时。
+
+| 指标 | P50时延 |
+| --- | ---: |
+| Vision Graph | 94.98 ms |
+| Policy Graph | 30.34 ms |
+| Engine | 126.40 ms |
+| Processor | 6.82 ms |
+| 原始RGB到waypoint | 133.92 ms |
+
+`Engine P50`从Processor完成resize和tokenizer之后开始。时延不包含RPC、
+网络传输、相机帧龄和机器人控制。这些数值来自一套Orin环境，部署时
+需要在目标设备重新测量。
+
+已经有coarse/fine视觉token时，使用`benchmark.py`只测固定MiniCPM
+policy：
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --attention-backend flashinfer \
+  --linear-kernel auto \
+  --warmup 5 \
+  --iters 30
+```
+
+# PhyAI视觉执行
+
+PhyAI直接加载DINOv3和SigLIP checkpoint，并以FP16运行两个视觉塔。
+Attention使用PhyAI的SDPA路径，LayerNorm使用`phyai-kernel`。接入没有改变
+DINOv3和SigLIP的层数、维度、token网格和输出。
+
+Policy和稳态单帧视觉分别使用一张CUDA Graph。32帧初始化的shape
+不同，因此使用eager执行。`--no-vision-cuda-graph`只关闭Vision
+Graph，`--no-cuda-graph`同时关闭两张Graph。
+
+# 验证
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q \
+  phyai-utils-tools/tests/test_minicpm_robot_track_processor.py
+
+uv run ruff check \
+  examples/minicpm_robot_track \
+  phyai-utils-tools/src/phyai_utils_tools/models/minicpm_robot_track \
+  phyai/src/phyai/models/minicpm_robot_track
+```
+
+固定输入的数值对比只用来检查接入正确性。真实跟随效果仍需要在
+RobotTrack评测或目标机器人上验证。
+
+# 当前限制
+
+- 只支持单GPU和batch size 1。
+- Policy长度固定为256 tokens，视觉输入固定为`384x384`。
+- stream必须先接收32帧，之后才能接收单帧增量请求。
+- 示例不测量传输和机器人控制时延。

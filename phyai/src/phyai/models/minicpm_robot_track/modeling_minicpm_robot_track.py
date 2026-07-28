@@ -35,7 +35,11 @@ def attach_replicated_weight(parameter: nn.Parameter, key: str) -> None:
 
 
 def minicpm_robot_track_weight_remap(name: str) -> str | None:
-    """Drop the config-derived output scale buffer from checkpoint loading."""
+    """Drop the checkpoint buffer because PhyAI derives the scale from config.
+
+    ``load_pretrained`` indexes parameters rather than buffers, so the official
+    checkpoint's ``output_scale`` key must be removed for strict loading.
+    """
 
     if name == "output_scale":
         return None

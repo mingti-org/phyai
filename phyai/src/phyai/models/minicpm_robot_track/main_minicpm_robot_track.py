@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import torch
 
@@ -35,8 +35,11 @@ class MiniCPMRobotTrackArgs(EntryArgs):
     checkpoint_dir: str | Path
     config: MiniCPMRobotTrackConfig | None = None
     batch_size: int = 1
-    dino_engine_path: str | Path | None = None
-    siglip_engine_path: str | Path | None = None
+    dino_checkpoint_dir: str | Path | None = None
+    siglip_checkpoint_dir: str | Path | None = None
+    vision_attention_backend: str = "sdpa"
+    vision_norm_backend: str | None = "phyai-kernel"
+    vision_params_dtype: Literal["float16", "bfloat16"] = "float16"
     use_vision_cuda_graph: bool = True
     max_cached_streams: int = 8
     float32_norm_backend: str = "phyai-kernel"
@@ -77,8 +80,14 @@ class MiniCPMRobotTrackEntry(Entry):
             batch_size=args.batch_size,
             device=engine_config.device.target,
             use_cuda_graph=engine_config.runtime.use_cuda_graph,
-            dino_engine_path=args.dino_engine_path,
-            siglip_engine_path=args.siglip_engine_path,
+            dino_checkpoint_dir=args.dino_checkpoint_dir,
+            siglip_checkpoint_dir=args.siglip_checkpoint_dir,
+            vision_attention_backend=args.vision_attention_backend,
+            vision_norm_backend=args.vision_norm_backend,
+            vision_params_dtype={
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }[args.vision_params_dtype],
             use_vision_cuda_graph=(
                 engine_config.runtime.use_cuda_graph and args.use_vision_cuda_graph
             ),

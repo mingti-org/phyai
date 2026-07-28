@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import time
 from pathlib import Path
@@ -37,8 +38,19 @@ from transformers import AutoTokenizer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--dino-engine", required=True, type=Path)
-    parser.add_argument("--siglip-engine", required=True, type=Path)
+    parser.add_argument("--dino-checkpoint", required=True, type=Path)
+    parser.add_argument("--siglip-checkpoint", required=True, type=Path)
+    parser.add_argument("--vision-attention-backend", default="sdpa")
+    parser.add_argument(
+        "--vision-norm-backend",
+        choices=("flashinfer", "phyai-kernel"),
+        default="phyai-kernel",
+    )
+    parser.add_argument(
+        "--vision-dtype",
+        choices=("float16", "bfloat16"),
+        default="float16",
+    )
     parser.add_argument("--frames-dir", required=True, type=Path)
     parser.add_argument("--instruction", default="Follow the person in the red shirt.")
     parser.add_argument(
@@ -61,12 +73,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _natural_sort_key(path: Path) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in re.split(r"(\d+)", path.name)
+    )
+
+
 def load_rgb_window(frames_dir: Path, window_size: int = 32) -> torch.Tensor:
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     paths = sorted(
-        path
-        for path in frames_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in extensions
+        (
+            path
+            for path in frames_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in extensions
+        ),
+        key=_natural_sort_key,
     )
     if not paths:
         raise FileNotFoundError(f"No RGB images found under {frames_dir}.")
@@ -109,7 +131,6 @@ def main() -> int:
             "--warmup must be non-negative; --iters, --cold-iters, and an "
             "explicit --resize-workers must be positive."
         )
-
     config = load_config(args.checkpoint, MiniCPMRobotTrackConfig)
     tokenizer = AutoTokenizer.from_pretrained(
         args.checkpoint, trust_remote_code=True, local_files_only=True
@@ -124,36 +145,42 @@ def main() -> int:
         text_capacity=config.text_capacity,
         resize_workers=args.resize_workers,
     )
-    raw_frames = load_rgb_window(args.frames_dir, config.history_frames + 1)
-    processor_start = time.perf_counter()
-    processed = processor.preprocess({"images": raw_frames, "task": args.instruction})
-    cold_processor_ms = (time.perf_counter() - processor_start) * 1000.0
-
-    engine_config = EngineConfig(
-        backends=BackendConfig(attn=args.attention_backend, norm="flashinfer"),
-        device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
-        parallel=ParallelConfig(),
-        runtime=RuntimeConfig(
-            use_cuda_graph=not args.no_cuda_graph,
-            force_linear_kernel=(
-                None if args.linear_kernel == "auto" else args.linear_kernel
-            ),
-        ),
-    )
-    engine = Engine(
-        EngineArgs(
-            plugin="minicpm_robot_track",
-            plugin_args=MiniCPMRobotTrackArgs(
-                checkpoint_dir=args.checkpoint,
-                config=config,
-                dino_engine_path=args.dino_engine,
-                siglip_engine_path=args.siglip_engine,
-                use_vision_cuda_graph=not args.no_vision_cuda_graph,
-            ),
-            config=engine_config,
-        )
-    )
+    engine: Engine | None = None
     try:
+        raw_frames = load_rgb_window(args.frames_dir, config.history_frames + 1)
+        processor_start = time.perf_counter()
+        processed = processor.preprocess(
+            {"images": raw_frames, "task": args.instruction}
+        )
+        cold_processor_ms = (time.perf_counter() - processor_start) * 1000.0
+
+        engine_config = EngineConfig(
+            backends=BackendConfig(attn=args.attention_backend, norm="flashinfer"),
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            parallel=ParallelConfig(),
+            runtime=RuntimeConfig(
+                use_cuda_graph=not args.no_cuda_graph,
+                force_linear_kernel=(
+                    None if args.linear_kernel == "auto" else args.linear_kernel
+                ),
+            ),
+        )
+        engine = Engine(
+            EngineArgs(
+                plugin="minicpm_robot_track",
+                plugin_args=MiniCPMRobotTrackArgs(
+                    checkpoint_dir=args.checkpoint,
+                    config=config,
+                    dino_checkpoint_dir=args.dino_checkpoint,
+                    siglip_checkpoint_dir=args.siglip_checkpoint,
+                    vision_attention_backend=args.vision_attention_backend,
+                    vision_norm_backend=args.vision_norm_backend,
+                    vision_params_dtype=args.vision_dtype,
+                    use_vision_cuda_graph=not args.no_vision_cuda_graph,
+                ),
+                config=engine_config,
+            )
+        )
         cold = engine.step(
             MiniCPMRobotTrackImageRequest(
                 frames=processed.frames,
@@ -259,6 +286,10 @@ def main() -> int:
             "model": "MiniCPM-RobotTrack",
             "device": torch.cuda.get_device_name(),
             "input_seq_length": config.input_seq_length,
+            "vision_backend": "phyai",
+            "vision_attention_backend": args.vision_attention_backend,
+            "vision_norm_backend": args.vision_norm_backend,
+            "vision_dtype": args.vision_dtype,
             "policy_cuda_graph": not args.no_cuda_graph,
             "vision_cuda_graph": not args.no_cuda_graph
             and not args.no_vision_cuda_graph,
@@ -300,7 +331,8 @@ def main() -> int:
             )
         return 0
     finally:
-        engine.close()
+        if engine is not None:
+            engine.close()
         processor.close()
 
 

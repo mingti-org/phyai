@@ -39,6 +39,12 @@
                 ]
               },
               {
+                "group": "MiniCPM-RobotTrack",
+                "pages": [
+                  "models/minicpm_robot_track/ws1"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "models/cosmos/ws1",
@@ -97,6 +103,12 @@
                 "pages": [
                   "zh/models/pi05/ws1",
                   "zh/models/pi05/processors"
+                ]
+              },
+              {
+                "group": "MiniCPM-RobotTrack",
+                "pages": [
+                  "zh/models/minicpm_robot_track/ws1"
                 ]
               },
               {

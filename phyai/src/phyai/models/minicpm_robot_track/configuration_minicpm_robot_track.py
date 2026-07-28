@@ -44,6 +44,70 @@ _MINICPM4_LONGROPE_FACTORS = (
 
 
 @dataclass(frozen=True)
+class DINOv3TrackVisionConfig(PretrainedConfig):
+    """DINOv3 ViT-S/16 geometry used by the RobotTrack vision encoder."""
+
+    hidden_size: int = 384
+    intermediate_size: int = 1536
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 6
+    image_size: int = 384
+    patch_size: int = 16
+    num_channels: int = 3
+    num_register_tokens: int = 4
+    layer_norm_eps: float = 1e-5
+    rope_theta: float = 100.0
+
+    def __post_init__(self) -> None:
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("DINOv3 image_size must be divisible by patch_size.")
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "DINOv3 hidden_size must be divisible by num_attention_heads."
+            )
+        if self.head_dim % 4:
+            raise ValueError("DINOv3 head_dim must be divisible by four for 2D RoPE.")
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @property
+    def num_patches(self) -> int:
+        return (self.image_size // self.patch_size) ** 2
+
+
+@dataclass(frozen=True)
+class SiglipTrackVisionConfig(PretrainedConfig):
+    """SigLIP So400m/14@384 geometry used by RobotTrack."""
+
+    hidden_size: int = 1152
+    intermediate_size: int = 4304
+    num_hidden_layers: int = 27
+    num_attention_heads: int = 16
+    image_size: int = 384
+    patch_size: int = 14
+    num_channels: int = 3
+    layer_norm_eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.image_size < self.patch_size:
+            raise ValueError("SigLIP image_size must be at least one patch.")
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "SigLIP hidden_size must be divisible by num_attention_heads."
+            )
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @property
+    def num_patches(self) -> int:
+        return (self.image_size // self.patch_size) ** 2
+
+
+@dataclass(frozen=True)
 class MiniCPM4TrackConfig(PretrainedConfig):
     """MiniCPM4-0.5B backbone fields used by RobotTrack."""
 
@@ -93,6 +157,13 @@ class MiniCPM4TrackConfig(PretrainedConfig):
                 f"MiniCPM-RobotTrack requires rope_type='longrope', got "
                 f"{self.rope_type!r}."
             )
+        if self.original_max_position_embeddings <= 1:
+            raise ValueError("original_max_position_embeddings must be greater than 1.")
+        if self.max_position_embeddings < self.original_max_position_embeddings:
+            raise ValueError(
+                "max_position_embeddings must be greater than or equal to "
+                "original_max_position_embeddings for LongRoPE."
+            )
         expected_factors = self.head_dim // 2
         if len(self.short_factor) != expected_factors:
             raise ValueError(
@@ -140,7 +211,7 @@ class MiniCPMRobotTrackConfig(PretrainedConfig):
             ("fine_tokens_current_frame", self.fine_tokens_current_frame),
         ):
             side = round(value**0.5) if value > 0 else 0
-            if side * side != value:
+            if value <= 0 or side * side != value:
                 raise ValueError(f"{name} must be a positive square number.")
         if self.num_waypoints < 2:
             raise ValueError("num_waypoints must be at least 2.")
@@ -156,6 +227,11 @@ class MiniCPMRobotTrackConfig(PretrainedConfig):
             raise ValueError(
                 f"input_seq_length={self.input_seq_length} is too short for "
                 f"{self.fixed_non_text_tokens} fixed non-text tokens."
+            )
+        if self.text_capacity > self.max_text_tokens:
+            raise ValueError(
+                f"text_capacity={self.text_capacity} exceeds the checkpoint's "
+                f"max_text_tokens={self.max_text_tokens}."
             )
         if self.input_seq_length > self.backbone.max_position_embeddings:
             raise ValueError("input_seq_length exceeds the MiniCPM4 position limit.")
@@ -181,4 +257,9 @@ class MiniCPMRobotTrackConfig(PretrainedConfig):
         return self.input_seq_length - self.fixed_non_text_tokens
 
 
-__all__ = ["MiniCPM4TrackConfig", "MiniCPMRobotTrackConfig"]
+__all__ = [
+    "DINOv3TrackVisionConfig",
+    "MiniCPM4TrackConfig",
+    "MiniCPMRobotTrackConfig",
+    "SiglipTrackVisionConfig",
+]

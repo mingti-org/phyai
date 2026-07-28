@@ -137,7 +137,7 @@ class MiniCPMRobotTrackPolicyRunner(ModelRunner):
 
 
 class MiniCPMRobotTrackModelRunner(ModelRunner):
-    """Own policy, vision engines, CUDA Graphs, and explicit stream state."""
+    """Own policy and vision runners, CUDA Graphs, and explicit stream state."""
 
     def __init__(
         self,
@@ -146,8 +146,11 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
         batch_size: int,
         device: torch.device | str,
         use_cuda_graph: bool = True,
-        dino_engine_path: str | Path | None = None,
-        siglip_engine_path: str | Path | None = None,
+        dino_checkpoint_dir: str | Path | None = None,
+        siglip_checkpoint_dir: str | Path | None = None,
+        vision_attention_backend: str = "sdpa",
+        vision_norm_backend: str | None = "phyai-kernel",
+        vision_params_dtype: torch.dtype = torch.float16,
         use_vision_cuda_graph: bool = True,
         max_cached_streams: int = 8,
     ) -> None:
@@ -155,10 +158,12 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
             raise ValueError("batch_size must be positive.")
         if max_cached_streams <= 0:
             raise ValueError("max_cached_streams must be positive.")
-        if (dino_engine_path is None) != (siglip_engine_path is None):
+        if (dino_checkpoint_dir is None) != (siglip_checkpoint_dir is None):
             raise ValueError(
-                "dino_engine_path and siglip_engine_path must be configured together."
+                "dino_checkpoint_dir and siglip_checkpoint_dir must be configured "
+                "together."
             )
+        vision_configured = dino_checkpoint_dir is not None
         self.model = model
         self.config = model.config
         self.batch_size = int(batch_size)
@@ -172,14 +177,17 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
             use_cuda_graph=use_cuda_graph,
         )
         self.vision_runner: MiniCPMRobotTrackVisionRunner | None = None
-        if dino_engine_path is not None and siglip_engine_path is not None:
+        if vision_configured:
             if self.batch_size != 1:
                 raise ValueError(
                     "Raw-image RobotTrack inference currently requires batch_size=1."
                 )
             self.vision_runner = MiniCPMRobotTrackVisionRunner(
-                dino_engine_path=dino_engine_path,
-                siglip_engine_path=siglip_engine_path,
+                dino_checkpoint_dir=dino_checkpoint_dir,
+                siglip_checkpoint_dir=siglip_checkpoint_dir,
+                vision_attention_backend=vision_attention_backend,
+                vision_norm_backend=vision_norm_backend,
+                vision_params_dtype=vision_params_dtype,
                 history_frames=self.config.history_frames,
                 coarse_tokens_per_frame=self.config.coarse_tokens_per_frame,
                 fine_tokens_current_frame=self.config.fine_tokens_current_frame,
@@ -210,10 +218,11 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
             self.vision_runner.setup()
 
     def reset_stream(self, stream_id: str | None = None) -> None:
-        if stream_id is None:
-            self.stream_states.clear()
-        else:
-            self.stream_states.pop(stream_id, None)
+        with self.inference_lock:
+            if stream_id is None:
+                self.stream_states.clear()
+            else:
+                self.stream_states.pop(stream_id, None)
 
     def to_device_batch(
         self, batch: MiniCPMRobotTrackForwardBatch
@@ -248,12 +257,13 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
             self.stream_states.popitem(last=False)
 
     @torch.inference_mode()
-    def forward_images(
+    def _forward_images(
         self, batch: MiniCPMRobotTrackImageForwardBatch
     ) -> MiniCPMRobotTrackImageForwardOutput:
         if self.vision_runner is None:
             raise RuntimeError(
-                "Raw-image inference is disabled; configure both TensorRT engine paths."
+                "Raw-image inference is disabled; configure both PhyAI vision "
+                "checkpoint paths."
             )
         total_pair = None
         if batch.collect_timing:
@@ -320,7 +330,7 @@ class MiniCPMRobotTrackModelRunner(ModelRunner):
     ) -> torch.Tensor | MiniCPMRobotTrackImageForwardOutput:
         with self.inference_lock:
             if isinstance(batch, MiniCPMRobotTrackImageForwardBatch):
-                return self.forward_images(batch)
+                return self._forward_images(batch)
             if isinstance(batch, MiniCPMRobotTrackForwardBatch):
                 return self.policy_runner.forward(self.to_device_batch(batch))
             raise TypeError(

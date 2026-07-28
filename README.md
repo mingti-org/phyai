@@ -25,6 +25,7 @@ https://github.com/user-attachments/assets/46256274-88a3-412c-ba7c-1826fd57a254
 
 ## News
 
+- [2026/07] 🚀 Support [MiniCPM-RobotTrack](https://phyai.mintlify.app/models/minicpm_robot_track/ws1) with 32-frame RGB initialization, single-frame sliding-window inference, and checkpoint-backed PhyAI-native FP16 vision.
 - [2026/07] 🚀 Day 0 support for MiniCPM-Robotic [blog](https://mingti-org.github.io/phyai-blog/blogs/260719-day-0-minicpm-robotic/).
 - [2026/07] 👏 Introducing PhyAI, a latency-first serving engine for Physical AI. [Read the Blog](https://mingti-org.github.io/phyai-blog/blogs/260718-phyai/).
 - [2026/07] 🚀 Support Cosmos3-Super (TP + CFG parallel) in the Cosmos3 [WN generation path](https://phyai.mintlify.app/models/cosmos/wn).

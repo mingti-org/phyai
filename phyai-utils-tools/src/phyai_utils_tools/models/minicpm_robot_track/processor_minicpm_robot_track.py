@@ -107,9 +107,11 @@ class MiniCPMRobotTrackProcessor(BaseModelProcessor):
 
 def make_minicpm_robot_track_processors(
     **kwargs: Any,
-) -> tuple[ProcessorPipeline, ProcessorPipeline]:
+) -> tuple[ProcessorPipeline, ProcessorPipeline, MiniCPMRobotTrackProcessor]:
+    """Return both pipelines and their resource-owning processor."""
+
     processor = MiniCPMRobotTrackProcessor(**kwargs)
-    return processor.preprocessor, processor.postprocessor
+    return processor.preprocessor, processor.postprocessor, processor
 
 
 __all__ = [

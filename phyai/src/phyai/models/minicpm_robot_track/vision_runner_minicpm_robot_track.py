@@ -1,4 +1,4 @@
-"""TensorRT vision towers and sliding-window packing for RobotTrack."""
+"""PhyAI vision towers and sliding-window packing for RobotTrack."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 
+from phyai.models.minicpm_robot_track.modeling_vision_minicpm_robot_track import (
+    MiniCPMRobotTrackPhyAIVisionEncoder,
+)
 from phyai.runtime.cuda_graph_manager import CudaGraph
 from phyai.runtime.model_runner import ModelRunner
 
@@ -77,114 +79,14 @@ def classify_vision_request(
     return "append"
 
 
-class _StaticTensorRTEngine:
-    """Bind one static TensorRT engine directly to torch CUDA tensors."""
+class _PhyAISiglipPooled:
+    """Adapt the 27x27 PhyAI SigLIP output to RobotTrack's 24x24 grid."""
 
-    def __init__(
-        self,
-        engine_path: str | Path,
-        *,
-        expected_input_shape: tuple[int, ...],
-        expected_output_shape: tuple[int, ...],
-        device: torch.device,
-    ) -> None:
-        try:
-            import tensorrt as trt
-        except ImportError as exc:
-            raise ImportError(
-                "Raw-image RobotTrack inference requires the TensorRT Python package."
-            ) from exc
+    def __init__(self, encoder: MiniCPMRobotTrackPhyAIVisionEncoder) -> None:
+        self.encoder = encoder
 
-        if device.type != "cuda":
-            raise ValueError("RobotTrack TensorRT vision inference requires CUDA.")
-        self.device = device
-        self._trt = trt
-        self._logger = trt.Logger(trt.Logger.WARNING)
-        self._runtime = trt.Runtime(self._logger)
-        path = Path(engine_path)
-        with path.open("rb") as handle:
-            self._engine = self._runtime.deserialize_cuda_engine(handle.read())
-        if self._engine is None:
-            raise RuntimeError(f"Failed to deserialize TensorRT engine: {path}")
-        self._context = self._engine.create_execution_context()
-        if self._context is None:
-            raise RuntimeError(f"Failed to create TensorRT context: {path}")
-
-        input_names: list[str] = []
-        output_names: list[str] = []
-        for index in range(self._engine.num_io_tensors):
-            name = self._engine.get_tensor_name(index)
-            mode = self._engine.get_tensor_mode(name)
-            if mode == trt.TensorIOMode.INPUT:
-                input_names.append(name)
-            elif mode == trt.TensorIOMode.OUTPUT:
-                output_names.append(name)
-        if len(input_names) != 1 or len(output_names) != 1:
-            raise RuntimeError(
-                f"Expected one input and one output in {path}, got "
-                f"inputs={input_names}, outputs={output_names}."
-            )
-        self._input_name = input_names[0]
-        self._output_name = output_names[0]
-        input_shape = tuple(
-            int(value) for value in self._engine.get_tensor_shape(self._input_name)
-        )
-        output_shape = tuple(
-            int(value) for value in self._engine.get_tensor_shape(self._output_name)
-        )
-        if input_shape != expected_input_shape:
-            raise ValueError(
-                f"{path.name} input shape must be {expected_input_shape}, "
-                f"got {input_shape}."
-            )
-        if output_shape != expected_output_shape:
-            raise ValueError(
-                f"{path.name} output shape must be {expected_output_shape}, "
-                f"got {output_shape}."
-            )
-        if self._engine.get_tensor_dtype(self._input_name) != trt.float32:
-            raise ValueError(f"{path.name} must accept float32 input tensors.")
-        if self._engine.get_tensor_dtype(self._output_name) != trt.float32:
-            raise ValueError(f"{path.name} must return float32 output tensors.")
-
-        self.input_shape = input_shape
-        self.output_shape = output_shape
-        self._output = torch.empty(
-            output_shape, dtype=torch.float32, device=self.device
-        )
-        self._stream = torch.cuda.Stream(device=self.device)
-
-    @torch.inference_mode()
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
-        if tuple(inputs.shape) != self.input_shape:
-            raise ValueError(
-                f"TensorRT input must have shape {self.input_shape}, "
-                f"got {tuple(inputs.shape)}."
-            )
-        if inputs.device != self.device:
-            raise ValueError(
-                f"TensorRT input must be on {self.device}, got {inputs.device}."
-            )
-        if inputs.dtype != torch.float32 or not inputs.is_contiguous():
-            inputs = inputs.to(dtype=torch.float32).contiguous()
-
-        current_stream = torch.cuda.current_stream(self.device)
-        self._stream.wait_stream(current_stream)
-        self._context.set_tensor_address(self._input_name, int(inputs.data_ptr()))
-        self._context.set_tensor_address(
-            self._output_name, int(self._output.data_ptr())
-        )
-        ok = self._context.execute_async_v3(self._stream.cuda_stream)
-        if ok is False:
-            raise RuntimeError("TensorRT execute_async_v3 failed.")
-        current_stream.wait_stream(self._stream)
-        return self._output
-
-    def close(self) -> None:
-        self._output = torch.empty(0, device=self.device)
-        self._context = None
-        self._engine = None
-        self._runtime = None
+        return self.encoder.pool_siglip(self.encoder.siglip(inputs))
 
 
 class MiniCPMRobotTrackVisionRunner(ModelRunner):
@@ -193,8 +95,11 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
     def __init__(
         self,
         *,
-        dino_engine_path: str | Path,
-        siglip_engine_path: str | Path,
+        dino_checkpoint_dir: str | Path,
+        siglip_checkpoint_dir: str | Path,
+        vision_attention_backend: str = "sdpa",
+        vision_norm_backend: str | None = "phyai-kernel",
+        vision_params_dtype: torch.dtype = torch.float16,
         history_frames: int,
         coarse_tokens_per_frame: int,
         fine_tokens_current_frame: int,
@@ -205,7 +110,7 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
     ) -> None:
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
-            raise ValueError("RobotTrack TensorRT vision inference requires CUDA.")
+            raise ValueError("RobotTrack PhyAI vision inference requires CUDA.")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.image_size = int(image_size)
@@ -214,10 +119,13 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
         self.fine_tokens_current_frame = int(fine_tokens_current_frame)
         self.vision_feature_dim = int(vision_feature_dim)
         self.use_cuda_graph = bool(use_cuda_graph)
-        if self.image_size != 384:
+        if vision_params_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                "Released RobotTrack TensorRT engines require 384x384 input."
+                "RobotTrack PhyAI vision supports float16 or bfloat16 parameters."
             )
+        self.vision_params_dtype = vision_params_dtype
+        if self.image_size != 384:
+            raise ValueError("RobotTrack vision towers require 384x384 input.")
         if (
             self.coarse_tokens_per_frame != 4
             or self.fine_tokens_current_frame != 64
@@ -228,19 +136,15 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
                 "and vision_feature_dim=1536."
             )
 
-        input_shape = (1, 3, self.image_size, self.image_size)
-        self.dino = _StaticTensorRTEngine(
-            dino_engine_path,
-            expected_input_shape=input_shape,
-            expected_output_shape=(1, 576, 384),
-            device=self.device,
+        self._phyai_encoder = MiniCPMRobotTrackPhyAIVisionEncoder(
+            dino_checkpoint_dir=dino_checkpoint_dir,
+            siglip_checkpoint_dir=siglip_checkpoint_dir,
+            attn_backend=vision_attention_backend,
+            norm_backend=vision_norm_backend,
+            params_dtype=self.vision_params_dtype,
         )
-        self.siglip = _StaticTensorRTEngine(
-            siglip_engine_path,
-            expected_input_shape=input_shape,
-            expected_output_shape=(1, 576, 1152),
-            device=self.device,
-        )
+        self.dino = self._phyai_encoder.dino
+        self.siglip = _PhyAISiglipPooled(self._phyai_encoder)
         self._dino_mean = self._channel_tensor(_DINO_MEAN)
         self._dino_std = self._channel_tensor(_DINO_STD)
         self._siglip_mean = self._channel_tensor(_SIGLIP_MEAN)
@@ -319,8 +223,18 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
         batch_size, token_count, hidden_size = tokens.shape
         if token_count != 24 * 24:
             raise ValueError(f"Expected a 24x24 token grid, got {token_count} tokens.")
+        if 24 % output_side:
+            raise ValueError(f"output_side={output_side} must divide the 24x24 grid.")
         features = tokens.transpose(1, 2).reshape(batch_size, hidden_size, 24, 24)
-        features = F.adaptive_avg_pool2d(features, (output_side, output_side))
+        block_size = 24 // output_side
+        features = features.reshape(
+            batch_size,
+            hidden_size,
+            output_side,
+            block_size,
+            output_side,
+            block_size,
+        ).mean(dim=(3, 5))
         return features.flatten(2).transpose(1, 2).contiguous()
 
     def _forward_single_frame(
@@ -332,7 +246,7 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
         siglip_tokens = self.siglip(
             ((frame - self._siglip_mean) / self._siglip_std).contiguous()
         )
-        combined = torch.cat((dino_tokens, siglip_tokens), dim=-1)
+        combined = torch.cat((dino_tokens, siglip_tokens), dim=-1).float()
         return self._pool_tokens(combined, 2), self._pool_tokens(combined, 8)
 
     @torch.inference_mode()
@@ -422,7 +336,7 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
                 pool_pair = self._event_pair() if collect_timing else None
                 if pool_pair is not None:
                     pool_pair[0].record()
-                combined = torch.cat((dino_tokens, siglip_tokens), dim=-1)
+                combined = torch.cat((dino_tokens, siglip_tokens), dim=-1).float()
                 coarse = self._pool_tokens(combined, output_side=2)[0]
                 fine_current = self._pool_tokens(combined, output_side=8)
                 encoded_coarse.append(coarse.detach().clone())
@@ -444,7 +358,11 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
             ]
         if not history:
             raise RuntimeError("RobotTrack vision history is empty after encoding.")
-        history = [history[0]] * (self.history_frames - len(history)) + history
+        if len(history) != self.history_frames:
+            raise RuntimeError(
+                f"RobotTrack vision history must contain {self.history_frames} "
+                f"frames, got {len(history)}."
+            )
         coarse_tokens = torch.cat(history, dim=0).unsqueeze(0)
         next_state = MiniCPMRobotTrackVisionState(
             coarse_history=tuple(history),
@@ -462,8 +380,7 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
 
     def close(self) -> None:
         self.graph = None
-        self.dino.close()
-        self.siglip.close()
+        self._phyai_encoder.close()
 
 
 def resolve_cuda_event_timings(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from phyai_utils_tools.processing.transition import (
     TASK,
     Transition,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def to_uint8_rgb(frame: Any) -> np.ndarray:
@@ -173,9 +176,8 @@ class MiniCPMRobotTrackTokenizerStep(ProcessorStep):
         encoded = self.tokenizer(
             tasks,
             return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.text_capacity,
+            padding=False,
+            truncation=False,
         )
         input_ids = encoded["input_ids"].to(torch.long)
         attention_mask = encoded["attention_mask"].to(torch.bool)
@@ -190,6 +192,17 @@ class MiniCPMRobotTrackTokenizerStep(ProcessorStep):
         valid_ids = input_ids[0, attention_mask[0]]
         if valid_ids.numel() == 0:
             raise ValueError("The RobotTrack task produced zero valid tokens.")
+        if valid_ids.numel() > self.text_capacity:
+            logger.warning(
+                "MiniCPM-RobotTrack task produced %d tokens; truncating to "
+                "text_capacity=%d.",
+                valid_ids.numel(),
+                self.text_capacity,
+            )
+            if getattr(self.tokenizer, "truncation_side", "right") == "left":
+                valid_ids = valid_ids[-self.text_capacity :]
+            else:
+                valid_ids = valid_ids[: self.text_capacity]
         compact_ids[0, : valid_ids.numel()] = valid_ids
         out = transition.copy()
         out[INPUT_IDS] = compact_ids
