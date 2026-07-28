@@ -345,6 +345,8 @@ class GR00TProcessor:
         kwargs["embodiment_id_mapping"] = embodiment_id_mapping
         kwargs.update(overrides)
         modality_configs = parse_modality_configs(kwargs.pop("modality_configs"))
+        statistics = kwargs.pop("statistics")
+        embodiment_id_mapping = kwargs.pop("embodiment_id_mapping")
         keep = {
             "max_state_dim",
             "max_action_dim",
@@ -586,6 +588,20 @@ class GR00TProcessor:
 
     def _validate_observation(self, observation: GR00TObservation) -> None:
         cfg = self.modality_config
+        expected_batch_size: int | None = None
+
+        def validate_batch_size(batch_size: int, *, field: str) -> None:
+            nonlocal expected_batch_size
+            if batch_size <= 0:
+                raise ValueError(f"{field} must have a non-empty batch dimension.")
+            if expected_batch_size is None:
+                expected_batch_size = batch_size
+            elif batch_size != expected_batch_size:
+                raise ValueError(
+                    f"{field} batch mismatch: got {batch_size}, "
+                    f"expected {expected_batch_size}."
+                )
+
         for key in cfg["state"].modality_keys:
             if key not in observation.state:
                 raise ValueError(f"observation.state requires key {key!r}.")
@@ -594,6 +610,7 @@ class GR00TProcessor:
                 raise TypeError(f"state {key!r} must be np.float32 ndarray.")
             if arr.ndim != 3:
                 raise ValueError(f"state {key!r} must have shape (B,T,D).")
+            validate_batch_size(arr.shape[0], field=f"state {key!r}")
             if arr.shape[1] != len(cfg["state"].delta_indices):
                 raise ValueError(
                     f"state {key!r} horizon mismatch: got {arr.shape[1]}, "
@@ -602,6 +619,25 @@ class GR00TProcessor:
         for key in cfg["language"].modality_keys:
             if key not in observation.language:
                 raise ValueError(f"observation.language requires key {key!r}.")
+            values = observation.language[key]
+            if not isinstance(values, (list, tuple)):
+                raise TypeError(f"language {key!r} must be a sequence of sequences.")
+            validate_batch_size(len(values), field=f"language {key!r}")
+            expected_horizon = len(cfg["language"].delta_indices)
+            for batch_index, history in enumerate(values):
+                if not isinstance(history, (list, tuple)):
+                    raise TypeError(
+                        f"language {key!r}[{batch_index}] must be a sequence."
+                    )
+                if len(history) != expected_horizon:
+                    raise ValueError(
+                        f"language {key!r}[{batch_index}] horizon mismatch: "
+                        f"got {len(history)}, expected {expected_horizon}."
+                    )
+                if not all(isinstance(text, str) for text in history):
+                    raise TypeError(
+                        f"language {key!r}[{batch_index}] must contain only strings."
+                    )
         for key in cfg["video"].modality_keys:
             if key not in observation.video:
                 raise ValueError(f"observation.video requires key {key!r}.")
@@ -610,6 +646,7 @@ class GR00TProcessor:
                 raise TypeError(f"video {key!r} must be np.uint8 ndarray.")
             if arr.ndim != 5 or arr.shape[-1] != 3:
                 raise ValueError(f"video {key!r} must have shape (B,T,H,W,3).")
+            validate_batch_size(arr.shape[0], field=f"video {key!r}")
             if arr.shape[1] != len(cfg["video"].delta_indices):
                 raise ValueError(
                     f"video {key!r} horizon mismatch: got {arr.shape[1]}, "

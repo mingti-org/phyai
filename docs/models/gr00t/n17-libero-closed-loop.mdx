@@ -93,12 +93,27 @@ uv run --with pyzmq --with msgpack --with msgpack-numpy \
   --host 0.0.0.0 \
   --port 5556 \
   --max-batch-size 1 \
-  --capture-task \
-  "put both the alphabet soup and the tomato sauce in the basket" \
+  --capture-suite libero_10 \
   --seed 42
 ```
 
 If the Cosmos-Reason2 files are not cached, add `--online` on the first run.
+The built-in processor does not require remote code. Only pass
+`--trust-remote-code` for a custom processor repository whose code you trust.
+With CUDA graphs enabled, `--max-batch-size` is the captured batch size and
+must equal the client's actual request batch. This client sends one environment
+per request, so both values are `1`; when using the official client, set it to
+the same value as `--n-envs`.
+`--capture-suite libero_10` scans all ten tasks before the socket is bound, then
+deduplicates profiles by their complete Backbone and Action Head Graph structure.
+The ten canonical prompts share the same structure, so setup runs one
+representative warmup and captures one graph for each stage. Runtime requests
+only replay these graphs. For a custom fixed task subset, replace it with one
+repeated `--capture-task "..."` argument per task structure; equivalent
+structures are still captured only once.
+The Action Head uses SDPA in this CUDA Graph path. If the optional FlashInfer
+backend is selected, the scheduler disables CUDA Graphs for both the Backbone
+and Action Head so the complete request runs eagerly.
 After `Server is ready and listening` appears, run the client from another
 terminal with the same exported variables:
 

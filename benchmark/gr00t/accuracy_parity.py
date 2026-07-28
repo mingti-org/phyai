@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -187,30 +188,32 @@ def build_engine_and_processor(
     config = load_config(checkpoint, GR00TN17Config)
     loading_kwargs = {
         "local_files_only": not args.online,
-        "trust_remote_code": True,
+        "trust_remote_code": args.trust_remote_code,
     }
     processor = GR00TProcessor.from_pretrained(
         checkpoint,
         embodiment_tag=args.embodiment_tag,
-        model_name=args.processor_model_name or config.backbone.model_name,
+        model_name=args.processor_model_name_or_path or config.backbone.model_name,
         transformers_loading_kwargs=loading_kwargs,
     )
-    capture_trajectory_id = args.traj_ids[0]
-    capture_trajectory = load_trajectory(dataset, capture_trajectory_id)
-    capture_frames = load_frames(
-        dataset,
-        frame_cache,
-        capture_trajectory_id,
-        processor.modality_config["video"].modality_keys,
-    )
-    capture_profile, _ = prepare_request(
-        processor,
-        capture_trajectory,
-        capture_frames,
-        0,
-        modality_meta,
-        tasks,
-    )
+    capture_profiles = []
+    for trajectory_id in args.traj_ids:
+        capture_trajectory = load_trajectory(dataset, trajectory_id)
+        capture_frames = load_frames(
+            dataset,
+            frame_cache,
+            trajectory_id,
+            processor.modality_config["video"].modality_keys,
+        )
+        capture_profile, _ = prepare_request(
+            processor,
+            capture_trajectory,
+            capture_frames,
+            0,
+            modality_meta,
+            tasks,
+        )
+        capture_profiles.append(capture_profile)
     engine = Engine(
         EngineArgs(
             plugin="gr00t_n17",
@@ -218,8 +221,7 @@ def build_engine_and_processor(
                 checkpoint_dir=checkpoint,
                 config=config,
                 max_batch_size=1,
-                backbone_transformers_loading_kwargs=loading_kwargs,
-                capture_profiles=(capture_profile,),
+                capture_profiles=tuple(capture_profiles),
             ),
             config=EngineConfig(
                 device=DeviceConfig(
@@ -338,7 +340,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-horizon", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--processor-model-name", default=None)
+    parser.add_argument("--processor-model-name-or-path", default=None)
     parser.add_argument(
         "--frame-cache",
         default=None,
@@ -348,6 +350,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--online",
         action="store_true",
         help="allow Hugging Face downloads for tokenizer and preprocessor files",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help=(
+            "allow Transformers to execute custom code from the processor model "
+            "repository; only use this with a repository you trust"
+        ),
     )
     parser.add_argument(
         "--no-cuda-graph",
@@ -366,6 +376,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.trust_remote_code:
+        warnings.warn(
+            "--trust-remote-code allows execution of code from the processor "
+            "model repository.",
+            stacklevel=1,
+        )
     set_seed(args.seed)
 
     dataset = Path(args.dataset_path)

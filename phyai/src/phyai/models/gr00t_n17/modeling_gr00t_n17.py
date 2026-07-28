@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,13 +79,11 @@ class GR00TN17Backbone(nn.Module):
         qwen3vl_model: nn.Module | None = None,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
-        transformers_loading_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.config = config.backbone
         self.params_dtype = params_dtype
         self.target_device = torch.device(device) if device is not None else None
-        self.transformers_loading_kwargs = dict(transformers_loading_kwargs or {})
         self.qwen3vl_model = self._build_qwen3vl_model(qwen3vl_model)
 
     def prepare_input(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -135,10 +131,6 @@ class GR00TN17Backbone(nn.Module):
             attention_backend=self.config.attention_backend,
         ).eval()
 
-    def _load_qwen3vl_model(self) -> nn.Module:
-        """Return the already-built Qwen3-VL backbone."""
-        return self.qwen3vl_model
-
     def prepare_position_ids(
         self, batch: dict[str, torch.Tensor]
     ) -> torch.Tensor | None:
@@ -154,7 +146,7 @@ class GR00TN17Backbone(nn.Module):
                 "backbone position-id inputs require image_grid_thw, "
                 "video_grid_thw, or both."
             )
-        qwen3vl_model = self._load_qwen3vl_model()
+        qwen3vl_model = self.qwen3vl_model
         native_model = getattr(qwen3vl_model, "model", None)
         if native_model is None or not hasattr(native_model, "get_rope_index"):
             return None
@@ -205,12 +197,12 @@ class GR00TN17Backbone(nn.Module):
         )
         return model_inputs
 
-    def _build_output(
+    def build_output(
         self,
         backbone_features: torch.Tensor,
         model_inputs: dict[str, torch.Tensor],
     ) -> GR00TN17BackboneOutput:
-        qwen3vl_model = self._load_qwen3vl_model()
+        qwen3vl_model = self.qwen3vl_model
         image_token_id = qwen3vl_model.config.image_token_id
         visual_mask = model_inputs["input_ids"] == image_token_id
         video_token_id = getattr(qwen3vl_model.config, "video_token_id", None)
@@ -224,17 +216,9 @@ class GR00TN17Backbone(nn.Module):
             image_mask=visual_mask,
         )
 
-    def build_graph_output(
-        self,
-        backbone_features: torch.Tensor,
-        model_inputs: dict[str, torch.Tensor],
-    ) -> GR00TN17BackboneOutput:
-        """Wrap a captured-core ``pre_norm_hidden_state`` into a backbone output."""
-        return self._build_output(backbone_features, model_inputs)
-
     def forward(self, inputs: dict[str, torch.Tensor]) -> GR00TN17BackboneOutput:
         model_inputs = self._prepare_model_inputs(inputs)
-        outputs = self._load_qwen3vl_model()(**model_inputs)
+        outputs = self.qwen3vl_model(**model_inputs)
         # Native Qwen3-VL returns the pre-final-norm tensor directly. Accept
         # structured outputs too so injected backbone modules stay usable.
         if torch.is_tensor(outputs):
@@ -243,7 +227,7 @@ class GR00TN17Backbone(nn.Module):
             backbone_features = getattr(outputs, "pre_norm_hidden_state", None)
             if backbone_features is None:
                 backbone_features = outputs.hidden_states[-1]
-        return self._build_output(backbone_features, model_inputs)
+        return self.build_output(backbone_features, model_inputs)
 
 
 # ============================================================================ #
@@ -581,7 +565,6 @@ class GR00TN17MultiEmbodimentActionEncoder(nn.Module):
 
     def __init__(self, action_dim: int, hidden_size: int, num_embodiments: int) -> None:
         super().__init__()
-        self.hidden_size = int(hidden_size)
         self.W1 = GR00TN17CategorySpecificLinear(
             num_embodiments, action_dim, hidden_size
         )
@@ -710,7 +693,7 @@ class GR00TN17Attention(nn.Module):
                 f"match K/V batch/source shape {(batch, k.shape[1])}."
             )
         mask = attention_mask.to(device=q.device, dtype=torch.bool)
-        if self.attention_backend == "sdpa" and batch > 1:
+        if self.attention_backend == "sdpa":
             out = F.scaled_dot_product_attention(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
@@ -743,7 +726,6 @@ class GR00TN17Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        encoder_hidden_states: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if attention_mask is None:
@@ -773,7 +755,6 @@ class GR00TN17Attention(nn.Module):
             q,
             k,
             v,
-            encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
         )
         out = out.contiguous().view(batch, target_len, self.inner_dim)
@@ -1383,13 +1364,11 @@ class GR00TN17ActionHead(nn.Module):
     def denoise_step(
         self,
         actions: torch.Tensor,
-        step: int,
         *,
         backbone_features: torch.Tensor,
         state_features: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: GR00TN17BackboneOutput,
-        action_input: GR00TN17ActionInput,
         timesteps: torch.Tensor,
         dt: float,
         action_position_ids: torch.Tensor,
@@ -1466,7 +1445,6 @@ class GR00TN17Model(nn.Module):
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         backbone_qwen3vl_model: nn.Module | None = None,
-        backbone_transformers_loading_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1489,15 +1467,9 @@ class GR00TN17Model(nn.Module):
             qwen3vl_model=backbone_qwen3vl_model,
             params_dtype=self.params_dtype,
             device=device,
-            transformers_loading_kwargs=backbone_transformers_loading_kwargs,
         )
         if device is not None:
             self.backbone.to(device=device)
-
-    def prepare_backbone_input(
-        self, inputs: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return self.backbone.prepare_input(inputs)
 
     def prepare_action_input(
         self, inputs: dict[str, torch.Tensor]
@@ -1535,7 +1507,7 @@ class GR00TN17Model(nn.Module):
             key: move(key, value) if isinstance(value, torch.Tensor) else value
             for key, value in dict(inputs).items()
         }
-        return self.prepare_backbone_input(moved), self.prepare_action_input(moved)
+        return self.backbone.prepare_input(moved), self.prepare_action_input(moved)
 
 
 __all__ = [

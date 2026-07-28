@@ -25,13 +25,13 @@ action 比较。
 
 | Benchmark | PhyAI Avg Acc | Isaac-GR00T Avg Acc |
 | --- | ---: | ---: |
-| LIBERO demo，trajectory `0`-`4` | `0.987312` | `0.987152` |
+| LIBERO demo，trajectory `0`-`4` | `0.987320` | `0.987152` |
 
 对应的误差如下：
 
 | 实现 | Avg MSE | Avg MAE | Avg Acc |
 | --- | ---: | ---: | ---: |
-| PhyAI | `0.001266` | `0.012688` | `0.987312` |
+| PhyAI | `0.001272` | `0.012680` | `0.987320` |
 | Isaac-GR00T | `0.001285` | `0.012848` | `0.987152` |
 
 ## 评估配置
@@ -76,6 +76,8 @@ uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
 
 如果本地还没有 Cosmos-Reason2 tokenizer 和 preprocessor 缓存，仅在第一次运行时
 追加 `--online`。
+内置Cosmos-Reason2 processor不需要执行远程代码；只有在使用可信的自定义processor
+仓库时才传入`--trust-remote-code`。
 
 Isaac-GR00T 参考值根据 NVIDIA 官方模型和 processor 在相同设置下生成的解码
 action 计算。NVIDIA 的

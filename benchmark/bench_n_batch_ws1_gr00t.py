@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -141,7 +142,7 @@ def make_request(
     *,
     checkpoint: Path,
     embodiment_tag: str,
-    backbone_model_name_or_path: str,
+    processor_model_name_or_path: str,
     transformers_loading_kwargs: dict[str, Any],
     batch_size: int,
     image_size: int,
@@ -153,7 +154,7 @@ def make_request(
     processor = GR00TProcessor.from_pretrained(
         checkpoint,
         embodiment_tag=embodiment_tag,
-        model_name=backbone_model_name_or_path,
+        model_name=processor_model_name_or_path,
         transformers_loading_kwargs=transformers_loading_kwargs,
     )
     observation = make_synthetic_observation(
@@ -196,20 +197,24 @@ def make_setup_fn(
     image_size: int,
     task: str,
     online: bool,
-    backbone_model_name_or_path: str | None,
+    trust_remote_code: bool,
+    processor_model_name_or_path: str | None,
     emit_module_nvtx: bool,
 ):
     """Build the per-batch-size ``setup_fn`` closure."""
     plugin_cfg = load_config(checkpoint, GR00TN17Config)
     device = torch.device(device_target)
-    model_name = backbone_model_name_or_path or plugin_cfg.backbone.model_name
-    loading_kwargs = {"trust_remote_code": True, "local_files_only": not online}
+    model_name = processor_model_name_or_path or plugin_cfg.backbone.model_name
+    loading_kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": not online,
+    }
 
     def setup_fn(batch_size: int) -> bnb.BenchSpec:
         capture_profile = make_request(
             checkpoint=checkpoint,
             embodiment_tag=embodiment_tag,
-            backbone_model_name_or_path=model_name,
+            processor_model_name_or_path=model_name,
             transformers_loading_kwargs=loading_kwargs,
             batch_size=batch_size,
             image_size=image_size,
@@ -222,8 +227,6 @@ def make_setup_fn(
                     checkpoint_dir=checkpoint,
                     max_batch_size=batch_size,
                     capture_profiles=(capture_profile,),
-                    backbone_model_name_or_path=backbone_model_name_or_path,
-                    backbone_transformers_loading_kwargs=loading_kwargs,
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(target=device_target, params_dtype=dtype),
@@ -263,7 +266,7 @@ def make_extras_fn(
     image_size: int,
     task: str,
     embodiment_tag: str,
-    backbone_model_name_or_path: str | None,
+    processor_model_name_or_path: str | None,
 ):
     def extras_fn(batch_size: int, spec: bnb.BenchSpec) -> dict[str, Any]:
         return {
@@ -278,7 +281,7 @@ def make_extras_fn(
             "num_views": num_views,
             "image_size": image_size,
             "task": task,
-            "backbone_model_name_or_path": backbone_model_name_or_path,
+            "processor_model_name_or_path": processor_model_name_or_path,
             "action_horizon": action_horizon,
             "action_dim": action_dim,
             "denoising_steps": denoising_steps,
@@ -341,12 +344,21 @@ def main() -> None:
         help="Allow HuggingFace downloads (default: local_files_only).",
     )
     parser.add_argument(
-        "--backbone-model-name-or-path",
+        "--trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow Transformers to execute custom code from the processor model "
+            "repository. Only use this with a repository you trust."
+        ),
+    )
+    parser.add_argument(
+        "--processor-model-name-or-path",
         type=str,
         default=None,
         help=(
-            "Optional Qwen3-VL backbone tokenizer/config path or HuggingFace repo id. "
-            "Defaults to the backbone model name stored in the GR00T config."
+            "Optional processor-only tokenizer/preprocessor path or Hugging Face "
+            "repo id. This does not override the engine Backbone config or weights. "
+            "Defaults to the model name stored in the GR00T config."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -359,6 +371,12 @@ def main() -> None:
     if not args.checkpoint.is_dir():
         raise NotADirectoryError(
             f"--checkpoint must be a directory, got: {args.checkpoint}"
+        )
+    if args.trust_remote_code:
+        warnings.warn(
+            "--trust-remote-code allows execution of code from the processor "
+            "model repository.",
+            stacklevel=1,
         )
 
     torch.manual_seed(args.seed)
@@ -380,7 +398,8 @@ def main() -> None:
         image_size=args.image_size,
         task=args.task,
         online=args.online,
-        backbone_model_name_or_path=args.backbone_model_name_or_path,
+        trust_remote_code=args.trust_remote_code,
+        processor_model_name_or_path=args.processor_model_name_or_path,
         emit_module_nvtx=profile_cfg.emit_module_nvtx,
     )
     extras_fn = make_extras_fn(
@@ -394,7 +413,7 @@ def main() -> None:
         image_size=args.image_size,
         task=args.task,
         embodiment_tag=args.embodiment_tag,
-        backbone_model_name_or_path=args.backbone_model_name_or_path,
+        processor_model_name_or_path=args.processor_model_name_or_path,
     )
 
     runner = bnb.NBatchBenchRunner(

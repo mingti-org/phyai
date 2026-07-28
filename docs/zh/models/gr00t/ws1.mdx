@@ -118,7 +118,7 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
     from phyai_utils_tools.models.gr00t import GR00TProcessor
 
     checkpoint_dir = Path("checkpoints/GR00T-N1.7-LIBERO/libero_10")
-    loading_kwargs = {"trust_remote_code": True, "local_files_only": False}
+    loading_kwargs = {"trust_remote_code": False, "local_files_only": False}
     cfg = load_config(checkpoint_dir, GR00TN17Config)
 
     processor = GR00TProcessor.from_pretrained(
@@ -156,7 +156,6 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
             plugin_args=GR00TN17Args(
                 checkpoint_dir=checkpoint_dir,
                 max_batch_size=1,
-                backbone_transformers_loading_kwargs=loading_kwargs,
                 capture_profiles=(request,),
             ),
             config=EngineConfig(
@@ -178,9 +177,9 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
 
     processor 会从所选 checkpoint 中读取必需的相机视角、状态字段、语言字段和历史长度。对于使用相对动作的 checkpoint，需要保留 `prepared.raw_state`；decoder 会用它在机器人参考系中还原动作。
 
-    启用 CUDA Graph 后，`capture_profiles` 会在 engine 构造期间完成 workspace 稳定和图捕获，profile 的输出会被丢弃；第一个匹配的正式请求可直接回放图。传入一份能代表当前 engine 实际输入的 prepared request 即可；固定配置的 LIBERO 示例只需要上面这一份 profile。只有同一个 engine 还会处理其他序列长度 bucket、相机布局、batch shape 或具身组合时，才需要增加 profile。未列出的输入结构仍会走安全的按需准备路径。
+    启用CUDA Graph后，`capture_profiles`会在engine构造期间完成workspace稳定和图捕获；完整Backbone和Action Head Graph结构相同的profile会在预热前去重，profile输出会被丢弃，匹配的正式请求只回放这些图。Action Head复用Backbone序列长度bucket，因此有效token长度不同的提示词在其余Graph key字段也一致时共享两部分Graph。需要为当前engine可能处理的每种输入结构提供prepared request；固定配置的LIBERO示例只需要上面这一份profile。如果同一个engine还会处理其他序列长度bucket、image-grid或相机布局、batch shape、embodiment category、action shape或mask结构，则需要增加对应profile。未注册但本应支持Graph的输入会直接报错，运行时不会捕获或替换Graph。固定Graph模式覆盖两个runner：只要任一runner不支持捕获，例如Action Head配置为FlashInfer attention，scheduler就会同时关闭两部分CUDA Graph，并让完整请求统一走eager。
 
-    `max_batch_size` 是调度器允许的 batch 上限。如果后续请求需要更大的 batch，需要重新构建 engine。
+    `max_batch_size`是调度器允许的batch上限。启用CUDA Graph时，每种运行时batch shape还必须匹配setup profile；未捕获的较小batch不能复用较大batch的Graph。如果服务使用的batch shape发生变化，需要用对应profile重新构建engine。
 
     `GR00TN17Request.noise` 是可选项。不传时会采样高斯噪声；需要进行确定性回归检查时，可以传入固定 tensor。
   </Step>
@@ -206,12 +205,12 @@ uv run python examples/gr00t/run_gr00t.py \
 
 脚本会输出 `engine.step()` 的延迟统计：3 次不计时运行和 30 次计时的 mean / median / std / min / max。CUDA Graph 在 engine 构造期间完成捕获；不计时运行只用于稳定延迟测量。observation 预处理、输入搬运到 GPU 以及动作解码不在计时循环内。
 
-合成输入只用于验证执行链路，其预测动作不具有任务层面的实际意义。上述命令假设 Cosmos-Reason2 tokenizer 和 preprocessor 已在本地缓存。如果首次运行时缺少这些文件，请加上 `--online`；后续运行再去掉该参数。
+合成输入只用于验证执行链路，其预测动作不具有任务层面的实际意义。上述命令假设Cosmos-Reason2 tokenizer和preprocessor已在本地缓存。如果首次运行时缺少这些文件，请加上`--online`；后续运行再去掉该参数。如需指定本地tokenizer/preprocessor快照，传入`--processor-model-name-or-path <path>`；该参数不会覆盖engine的Backbone配置或权重。内置Cosmos-Reason2 processor不需要执行远程代码；只有在使用可信的自定义processor仓库时才传入`--trust-remote-code`。
 
 # 当前限制
 
 - 调度器仅支持单张 GPU。Tensor parallel、continuous batching、preemption 和网络 policy server 不在这条执行路径的支持范围内。
-- `max_batch_size` 在 engine 构建时固定。
+- `max_batch_size`在engine构建时固定。启用CUDA Graph时，每种实际batch shape还必须出现在`capture_profiles`中。
 - engine 返回归一化且经过 padding 的动作。需要使用匹配的 processor 和 `raw_state`，才能还原 checkpoint 对应的物理动作字段。
 
 # 完整示例
@@ -238,7 +237,7 @@ IMAGE_SIZE = 256
 EMBODIMENT_TAG = "LIBERO_PANDA"
 
 cfg = load_config(CHECKPOINT_DIR, GR00TN17Config)
-loading_kwargs = {"trust_remote_code": True, "local_files_only": True}
+loading_kwargs = {"trust_remote_code": False, "local_files_only": True}
 
 processor = GR00TProcessor.from_pretrained(
     CHECKPOINT_DIR,
@@ -289,7 +288,6 @@ engine = Engine(
         plugin_args=GR00TN17Args(
             checkpoint_dir=CHECKPOINT_DIR,
             max_batch_size=BATCH_SIZE,
-            backbone_transformers_loading_kwargs=loading_kwargs,
             capture_profiles=(request,),
         ),
         config=EngineConfig(

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, ClassVar
+from typing import Callable, ClassVar
 
 import torch
 
@@ -17,7 +17,6 @@ from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import (
     GR00TN17Request,
     GR00TN17WS1Scheduler,
 )
-from phyai.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from phyai.utils import load_config
 from phyai.weights import load_pretrained
 
@@ -71,40 +70,6 @@ def _compose_remap(
     )
 
 
-def _resolve_backbone_config_dir(
-    model_name_or_path: str,
-    *,
-    local_files_only: bool = False,
-    revision: str | None = None,
-) -> str:
-    candidate = Path(model_name_or_path)
-    if candidate.is_dir():
-        return str(candidate)
-
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(
-        model_name_or_path,
-        revision=revision,
-        allow_patterns=["config.json"],
-        local_files_only=local_files_only,
-    )
-
-
-def _load_qwen3vl_config(
-    model_name_or_path: str,
-    *,
-    local_files_only: bool = False,
-    revision: str | None = None,
-) -> Qwen3VLConfig:
-    backbone_dir = _resolve_backbone_config_dir(
-        model_name_or_path,
-        local_files_only=local_files_only,
-        revision=revision,
-    )
-    return load_config(backbone_dir, Qwen3VLConfig)
-
-
 @dataclass
 class GR00TN17Args(EntryArgs):
     """Args bundle for the GR00T-N1.7 plugin.
@@ -119,8 +84,12 @@ class GR00TN17Args(EntryArgs):
     ``phyai_utils_tools.models.gr00t.GR00TProcessor``. Hence there is no
     ``embodiment_tag`` / processor knob here — those live with the processor.
 
-    ``capture_profiles`` contains prepared requests whose CUDA graphs are
-    captured during engine setup. Their outputs are discarded.
+    ``capture_profiles`` contains prepared requests whose unique CUDA Graph
+    structures are stabilized and captured during engine setup. Equivalent
+    profiles are deduplicated before warmup and their outputs are discarded.
+    With CUDA Graphs enabled, runtime requests must match one of these
+    structures; runtime capture and graph replacement are intentionally
+    disabled.
     """
 
     checkpoint_dir: str | Path | None = None
@@ -128,8 +97,6 @@ class GR00TN17Args(EntryArgs):
     max_batch_size: int = 1
     weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
     weight_strict: bool = True
-    backbone_model_name_or_path: str | Path | None = None
-    backbone_transformers_loading_kwargs: dict[str, Any] | None = None
     capture_profiles: Sequence[GR00TN17Request] = ()
 
 
@@ -156,28 +123,11 @@ class GR00TN17Entry(Entry):
             config = load_config(args.checkpoint_dir, GR00TN17Config)
         else:
             config = GR00TN17Config()
-        if args.backbone_model_name_or_path is not None:
-            qwen3vl_config = _load_qwen3vl_config(
-                str(args.backbone_model_name_or_path),
-                local_files_only=(args.backbone_transformers_loading_kwargs or {}).get(
-                    "local_files_only", False
-                ),
-                revision=config.backbone.model_revision,
-            )
-            config = replace(
-                config,
-                backbone=replace(
-                    config.backbone,
-                    model_name=str(args.backbone_model_name_or_path),
-                    qwen3vl=qwen3vl_config,
-                ),
-            )
 
         self.model = GR00TN17Model(
             config,
             params_dtype=eng.device.params_dtype,
             device=eng.device.target,
-            backbone_transformers_loading_kwargs=args.backbone_transformers_loading_kwargs,
         )
 
         if args.checkpoint_dir is not None:

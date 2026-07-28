@@ -118,7 +118,7 @@ raw cameras + state + instruction
     from phyai_utils_tools.models.gr00t import GR00TProcessor
 
     checkpoint_dir = Path("checkpoints/GR00T-N1.7-LIBERO/libero_10")
-    loading_kwargs = {"trust_remote_code": True, "local_files_only": False}
+    loading_kwargs = {"trust_remote_code": False, "local_files_only": False}
     cfg = load_config(checkpoint_dir, GR00TN17Config)
 
     processor = GR00TProcessor.from_pretrained(
@@ -156,7 +156,6 @@ raw cameras + state + instruction
             plugin_args=GR00TN17Args(
                 checkpoint_dir=checkpoint_dir,
                 max_batch_size=1,
-                backbone_transformers_loading_kwargs=loading_kwargs,
                 capture_profiles=(request,),
             ),
             config=EngineConfig(
@@ -178,9 +177,9 @@ raw cameras + state + instruction
 
     The processor reads the required camera views, state fields, language key, and history lengths from the selected checkpoint. Keep `prepared.raw_state` for checkpoints that use relative actions; the decoder needs it to reconstruct actions in the robot's reference frame.
 
-    With CUDA graphs enabled, `capture_profiles` are stabilized and captured while the engine is constructed. Profile outputs are discarded, and the first matching request uses graph replay directly. Pass a prepared request representative of the inputs this engine will serve; the fixed LIBERO example needs only the profile shown above. Add profiles only if the same engine will serve other sequence-length buckets, camera layouts, batch shapes, or embodiment combinations. An unlisted structure falls back to safe lazy preparation.
+    With CUDA graphs enabled, `capture_profiles` are stabilized and captured while the engine is constructed. Profiles with the same complete Backbone and Action Head Graph structure are deduplicated before warmup, their outputs are discarded, and matching runtime requests only replay those graphs. The Action Head reuses the Backbone sequence bucket, so prompts in the same bucket share both graphs when their remaining Graph-key fields also match. Pass prepared requests covering every input structure this engine will serve; the fixed LIBERO example needs only the profile shown above. Add profiles if the same engine serves other sequence-length buckets, image-grid or camera layouts, batch shapes, embodiment categories, action shapes, or mask structures. An unlisted graph-compatible structure raises an error instead of capturing or replacing graphs at runtime. Fixed Graph mode spans both runners: if either runner does not support capture, such as an Action Head configured with FlashInfer attention, the scheduler disables CUDA Graphs for both and runs the complete request eagerly.
 
-    `max_batch_size` is the scheduler's upper bound. Rebuild the engine if a later request needs a larger batch.
+    `max_batch_size` is the scheduler's upper bound. In CUDA Graph mode, every runtime batch shape must also match a setup profile; a smaller but uncaptured batch does not reuse a larger-batch graph. Rebuild the engine with the required profiles if the served batch shapes change.
 
     `GR00TN17Request.noise` is optional. Leave it unset to sample Gaussian noise, or provide a fixed tensor for deterministic regression checks.
   </Step>
@@ -206,12 +205,12 @@ uv run python examples/gr00t/run_gr00t.py \
 
 The script prints `engine.step()` latency statistics (mean / median / std / min / max over 3 untimed runs + 30 timed runs). CUDA Graph capture happens during engine construction; the untimed steps only stabilize the latency measurement. Observation preprocessing, input transfer to the GPU, and action decoding are outside the timed loop.
 
-The synthetic inputs only test the execution path; their predicted actions have no task-level meaning. The command assumes the Cosmos-Reason2 tokenizer and preprocessor are already cached. Add `--online` to the first run only if those files are missing, then omit it for later runs.
+The synthetic inputs only test the execution path; their predicted actions have no task-level meaning. The command assumes the Cosmos-Reason2 tokenizer and preprocessor are already cached. Add `--online` to the first run only if those files are missing, then omit it for later runs. To use a specific local tokenizer/preprocessor snapshot, pass `--processor-model-name-or-path <path>`; this option does not override the engine's Backbone config or weights. The built-in Cosmos-Reason2 processor does not require remote code. Only pass `--trust-remote-code` when using a custom processor repository whose code you trust.
 
 # Current limitations
 
 - The scheduler supports one GPU. Tensor parallelism, continuous batching, preemption, and a network policy server are outside this path.
-- `max_batch_size` is fixed when the engine is built.
+- `max_batch_size` is fixed when the engine is built. CUDA Graph mode also requires every served batch shape to be represented in `capture_profiles`.
 - The engine returns normalized, padded actions. Use the matching processor and `raw_state` to recover the checkpoint's physical action fields.
 
 # Full example
@@ -238,7 +237,7 @@ IMAGE_SIZE = 256
 EMBODIMENT_TAG = "LIBERO_PANDA"
 
 cfg = load_config(CHECKPOINT_DIR, GR00TN17Config)
-loading_kwargs = {"trust_remote_code": True, "local_files_only": True}
+loading_kwargs = {"trust_remote_code": False, "local_files_only": True}
 
 processor = GR00TProcessor.from_pretrained(
     CHECKPOINT_DIR,
@@ -289,7 +288,6 @@ engine = Engine(
         plugin_args=GR00TN17Args(
             checkpoint_dir=CHECKPOINT_DIR,
             max_batch_size=BATCH_SIZE,
-            backbone_transformers_loading_kwargs=loading_kwargs,
             capture_profiles=(request,),
         ),
         config=EngineConfig(

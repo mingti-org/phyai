@@ -3,8 +3,8 @@
 Runners own CUDA graph capture, request-scoped sampling state, and the
 multi-step action denoising loop. The model modules remain parameter
 containers plus single-step math. Setup profiles run eagerly before capture so
-external workspaces have stable storage. An unlisted graph shape is stabilized
-on first use before later capture.
+external workspaces have stable storage. Runtime requests only replay graphs
+captured during setup.
 """
 
 from __future__ import annotations
@@ -29,7 +29,11 @@ from phyai.models.qwen3_vl.modeling_qwen3_vl import (
     get_vision_cu_seqlens,
     get_vision_position_ids,
 )
-from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphRegistry
+from phyai.runtime.cuda_graph_manager import (
+    CudaGraph,
+    CudaGraphError,
+    CudaGraphRegistry,
+)
 from phyai.runtime.model_runner import ModelRunner
 
 
@@ -95,11 +99,32 @@ class GR00TN17BackboneRunner(ModelRunner):
                 return int(bucket)
         return None
 
-    def _replay_or_capture(self, core_fn, inputs: dict, key: tuple) -> torch.Tensor:
+    def _replay_or_capture(
+        self,
+        core_fn,
+        inputs: dict,
+        key: tuple,
+        vision_cu_seqlens: torch.Tensor,
+        *,
+        allow_capture: bool,
+    ) -> torch.Tensor:
         graph = self.graphs.get(key)
         if graph is None:
+            if not allow_capture:
+                raise CudaGraphError(
+                    "No GR00T-N1.7 backbone CUDA Graph was captured for this "
+                    "runtime input profile. Add a representative request to "
+                    "GR00TN17Args.capture_profiles during engine setup."
+                )
+            if key not in self._warmed_graph_keys:
+                raise CudaGraphError(
+                    "GR00T-N1.7 backbone CUDA Graph capture requires an eager "
+                    "setup warmup for the same input profile."
+                )
             graph = CudaGraph()
-            self._vision_graph_states[key] = self._make_vision_graph_state(inputs)
+            self._vision_graph_states[key] = self._make_vision_graph_state(
+                vision_cu_seqlens
+            )
             core_fn = partial(
                 core_fn,
                 vision_graph_state=self._vision_graph_states[key],
@@ -117,7 +142,7 @@ class GR00TN17BackboneRunner(ModelRunner):
         if "pixel_values_videos" in model_inputs or "video_grid_thw" in model_inputs:
             return None
 
-        qwen3vl_model = backbone._load_qwen3vl_model()
+        qwen3vl_model = backbone.qwen3vl_model
         qwen_model = qwen3vl_model.model
         input_ids = model_inputs["input_ids"]
         attention_mask = model_inputs["attention_mask"]
@@ -160,9 +185,9 @@ class GR00TN17BackboneRunner(ModelRunner):
         cu_seqlens = get_vision_cu_seqlens(image_grid_thw)
         cos, sin = qwen_model.language_model.rotary_emb.get_cos_sin(position_ids)
 
-        # The graph path currently handles image-only visual inputs. Video
-        # tensors fall back before this point, so image-token indices are the
-        # full visual insertion set for the captured core.
+        # This graph plan handles image-only visual inputs. Video inputs return
+        # no graph plan before this point, so image-token indices are the full
+        # visual insertion set for the captured core.
         image_mask = input_ids == qwen3vl_model.config.image_token_id
         visual_index = image_mask.reshape(-1).nonzero(as_tuple=True)[0]
         key = (
@@ -178,19 +203,25 @@ class GR00TN17BackboneRunner(ModelRunner):
             "bilinear_indices": bilinear_indices,
             "bilinear_weights": bilinear_weights,
             "vision_position_ids": vision_position_ids,
-            "cu_seqlens": cu_seqlens,
             "cos": cos,
             "sin": sin,
             "visual_index": visual_index,
         }
-        return self._backbone_core, buffers, key, model_inputs
+        return self._backbone_core, buffers, key, model_inputs, cu_seqlens
 
-    def _make_vision_graph_state(self, inputs: dict[str, torch.Tensor]) -> tuple:
+    def capture_profile_key(
+        self,
+        backbone_inputs: dict[str, torch.Tensor],
+    ) -> tuple[object, ...] | None:
+        """Return the exact Backbone Graph key without running the layers."""
+        plan = self._backbone_graph_plan(backbone_inputs)
+        return None if plan is None else plan[2]
+
+    def _make_vision_graph_state(self, cu_seqlens: torch.Tensor) -> tuple:
         from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
 
-        qwen_model = self.model.backbone._load_qwen3vl_model().model
+        qwen_model = self.model.backbone.qwen3vl_model.model
         visual = qwen_model.visual
-        cu_seqlens = inputs["cu_seqlens"]
         workspace = get_global_fi_workspace(cu_seqlens.device)
         wrappers = []
         for block in visual.blocks:
@@ -270,12 +301,11 @@ class GR00TN17BackboneRunner(ModelRunner):
         bilinear_indices: torch.Tensor,
         bilinear_weights: torch.Tensor,
         vision_position_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         visual_index: torch.Tensor,
     ) -> SimpleNamespace:
-        qwen_model = self.model.backbone._load_qwen3vl_model().model
+        qwen_model = self.model.backbone.qwen3vl_model.model
         visual = qwen_model.visual
         hidden_states = visual.patch_embed(pixel_values.to(dtype=visual.dtype))
         pos_embeds = (
@@ -338,7 +368,13 @@ class GR00TN17BackboneRunner(ModelRunner):
         inputs,
         *,
         force_eager_warmup: bool = False,
+        allow_cuda_graph_capture: bool = False,
     ) -> GR00TN17BackboneOutput:
+        if force_eager_warmup and allow_cuda_graph_capture:
+            raise ValueError(
+                "force_eager_warmup and allow_cuda_graph_capture are mutually "
+                "exclusive."
+            )
         self.last_forward_used_eager_warmup = False
         backbone_inputs = dict(inputs)
         if "position_ids" not in backbone_inputs:
@@ -349,11 +385,17 @@ class GR00TN17BackboneRunner(ModelRunner):
         if self.use_cuda_graph:
             plan = self._backbone_graph_plan(backbone_inputs)
             if plan is None:
+                if not force_eager_warmup:
+                    raise CudaGraphError(
+                        "This GR00T-N1.7 backbone input is not supported by the "
+                        "fixed CUDA Graph path. Disable CUDA Graphs for dynamic "
+                        "or unsupported inputs."
+                    )
                 self.last_forward_used_eager_warmup = True
                 return backbone.forward(backbone_inputs)
-            core_fn, buffers, key, model_inputs = plan
-            if force_eager_warmup or key not in self._warmed_graph_keys:
-                vision_graph_state = self._make_vision_graph_state(buffers)
+            core_fn, buffers, key, model_inputs, vision_cu_seqlens = plan
+            if force_eager_warmup:
+                vision_graph_state = self._make_vision_graph_state(vision_cu_seqlens)
                 output = core_fn(
                     vision_graph_state=vision_graph_state,
                     **buffers,
@@ -362,22 +404,25 @@ class GR00TN17BackboneRunner(ModelRunner):
                 self._warmed_graph_keys.add(key)
                 self.last_forward_used_eager_warmup = True
             else:
-                features = self._replay_or_capture(core_fn, buffers, key)
-            return backbone.build_graph_output(features, model_inputs)
+                features = self._replay_or_capture(
+                    core_fn,
+                    buffers,
+                    key,
+                    vision_cu_seqlens,
+                    allow_capture=allow_cuda_graph_capture,
+                )
+            return backbone.build_output(features, model_inputs)
         return backbone.forward(backbone_inputs)
 
-    def reset_graphs(self) -> None:
+    def close(self) -> None:
         self.graphs = CudaGraphRegistry()
         self._vision_graph_states = {}
-
-    def close(self) -> None:
-        self.reset_graphs()
         self._warmed_graph_keys.clear()
         return None
 
 
 class GR00TN17ActionHeadRunner(ModelRunner):
-    """Runs action denoising and owns shape/category-keyed CUDA graphs."""
+    """Runs action denoising with the backbone's bucketed graph shapes."""
 
     @staticmethod
     def _supports_cuda_graph_attention(model: GR00TN17Model) -> bool:
@@ -465,6 +510,34 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         if cat_ids.ndim != 1:
             return None
         return tuple(int(v) for v in cat_ids.detach().cpu().tolist())
+
+    def capture_profile_key(
+        self,
+        backbone_graph_key: tuple[object, ...],
+        action_input: GR00TN17ActionInput,
+        noise: torch.Tensor,
+    ) -> tuple[object, ...] | None:
+        """Return a conservative Action Head Graph-equivalence key.
+
+        The Backbone Graph key determines the bucketed feature and mask shapes.
+        Action inputs add the remaining tensor structures and the embodiment
+        values baked into the category-specific captured function.
+        """
+        category_key = self._category_key(action_input)
+        if category_key is None:
+            return None
+        inputs = {
+            "state": action_input.state,
+            "embodiment_id": action_input.embodiment_id,
+            "noise": noise,
+        }
+        if action_input.action_mask is not None:
+            inputs["action_mask"] = action_input.action_mask
+        return (
+            ("backbone_graph_key", backbone_graph_key),
+            *self._shape_key(inputs),
+            ("category_key", category_key),
+        )
 
     def _prepare_noise(
         self,
@@ -583,12 +656,10 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         for step in range(action_head.num_inference_timesteps):
             actions = action_head.denoise_step(
                 actions,
-                step,
                 backbone_features=backbone_features,
                 state_features=state_features,
                 embodiment_id=action_input.embodiment_id,
                 backbone_output=backbone_output,
-                action_input=action_input,
                 encoder_kv_cache=encoder_kv_cache,
                 encoder_kv_cache_is_masked=encoder_kv_cache_is_masked,
                 static_cat_ids=static_cat_ids,
@@ -604,46 +675,6 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         # not perturb the sampled trajectory used for official parity.
         return action_head.apply_action_mask(actions, action_input.action_mask)
 
-    def _static_category_fwd_loop(
-        self,
-        *,
-        category_key: tuple[int, ...],
-        backbone_features: torch.Tensor,
-        backbone_attention_mask: torch.Tensor,
-        image_mask: torch.Tensor,
-        image_attention_mask: torch.Tensor,
-        non_image_attention_mask: torch.Tensor,
-        state: torch.Tensor,
-        embodiment_id: torch.Tensor,
-        noise: torch.Tensor,
-        image_token_indices: torch.Tensor | None = None,
-        non_image_token_indices: torch.Tensor | None = None,
-        action_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self._fwd_loop(
-            backbone_features=backbone_features,
-            backbone_attention_mask=backbone_attention_mask,
-            image_mask=image_mask,
-            image_attention_mask=image_attention_mask,
-            non_image_attention_mask=non_image_attention_mask,
-            state=state,
-            embodiment_id=embodiment_id,
-            noise=noise,
-            image_token_indices=image_token_indices,
-            non_image_token_indices=non_image_token_indices,
-            action_mask=action_mask,
-            static_cat_ids=category_key,
-        )
-
-    @staticmethod
-    def _mask_rows_are_shared(mask: torch.Tensor, name: str) -> bool:
-        if mask.ndim != 2:
-            raise ValueError(f"{name} must be 2-D, got {tuple(mask.shape)}.")
-        return mask.shape[0] <= 1 or torch.equal(
-            mask,
-            mask[:1].expand_as(mask),
-        )
-
     def _graph_inputs(
         self,
         backbone_output: GR00TN17BackboneOutput,
@@ -656,52 +687,17 @@ class GR00TN17ActionHeadRunner(ModelRunner):
                 raise ValueError("CUDA graph path requires a backbone attention mask.")
             backbone_mask = backbone_output.backbone_attention_mask.bool()
             image_mask = image_mask.bool()
-            shared_backbone_mask = self._mask_rows_are_shared(
-                backbone_mask,
-                "backbone_attention_mask",
-            )
-            shared_image_mask = self._mask_rows_are_shared(image_mask, "image_mask")
-            if shared_backbone_mask and shared_image_mask:
-                valid_indices = backbone_mask[0].nonzero(as_tuple=True)[0]
-                if valid_indices.numel() == 0:
-                    raise ValueError("backbone_attention_mask has no valid tokens.")
-                backbone_features = backbone_output.backbone_features.index_select(
-                    1, valid_indices
+            if backbone_mask.shape != backbone_output.backbone_features.shape[:2]:
+                raise ValueError(
+                    "backbone_attention_mask shape must match bucketed backbone "
+                    f"features {tuple(backbone_output.backbone_features.shape[:2])}, "
+                    f"got {tuple(backbone_mask.shape)}."
                 )
-                compact_image_mask = image_mask.index_select(1, valid_indices)
-                compact_backbone_mask = backbone_mask.new_empty(
-                    (backbone_mask.shape[0], 0)
+            if image_mask.shape != backbone_mask.shape:
+                raise ValueError(
+                    "image_mask shape must match bucketed backbone mask "
+                    f"{tuple(backbone_mask.shape)}, got {tuple(image_mask.shape)}."
                 )
-                compact_valid_mask = torch.ones_like(
-                    compact_image_mask, dtype=torch.bool
-                )
-                image_attention_mask, non_image_attention_mask = (
-                    self._alternate_vl_attention_masks(
-                        compact_valid_mask,
-                        compact_image_mask,
-                    )
-                )
-                inputs = {
-                    "backbone_features": backbone_features,
-                    "backbone_attention_mask": compact_backbone_mask,
-                    "image_mask": compact_image_mask,
-                    "image_attention_mask": image_attention_mask,
-                    "non_image_attention_mask": non_image_attention_mask,
-                    "state": action_input.state,
-                    "embodiment_id": action_input.embodiment_id,
-                    "noise": noise,
-                }
-                if self.model.action_head.config.use_alternate_vl_dit:
-                    inputs["image_token_indices"] = compact_image_mask[0].nonzero(
-                        as_tuple=True
-                    )[0]
-                    inputs["non_image_token_indices"] = (
-                        ~compact_image_mask[0]
-                    ).nonzero(as_tuple=True)[0]
-                if action_input.action_mask is not None:
-                    inputs["action_mask"] = action_input.action_mask
-                return inputs
-
             image_attention_mask, non_image_attention_mask = (
                 self._alternate_vl_attention_masks(backbone_mask, image_mask)
             )
@@ -745,7 +741,13 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         *,
         noise=None,
         force_eager_warmup: bool = False,
+        allow_cuda_graph_capture: bool = False,
     ):
+        if force_eager_warmup and allow_cuda_graph_capture:
+            raise ValueError(
+                "force_eager_warmup and allow_cuda_graph_capture are mutually "
+                "exclusive."
+            )
         self.last_forward_used_eager_warmup = False
         action_head = self.model.action_head
         action_head.validate_embodiment_id(action_input.embodiment_id)
@@ -768,12 +770,18 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         if self.use_cuda_graph:
             category_key = self._category_key(action_input)
             if category_key is None:
+                if not force_eager_warmup:
+                    raise CudaGraphError(
+                        "This GR00T-N1.7 action-head input is not supported by "
+                        "the fixed CUDA Graph path. Disable CUDA Graphs for "
+                        "dynamic or unsupported inputs."
+                    )
                 self.last_forward_used_eager_warmup = True
                 return self._fwd_loop(**inputs)
             key = self._shape_key(inputs) + (("category_key", category_key),)
-            if force_eager_warmup or key not in self._warmed_graph_keys:
-                output = self._static_category_fwd_loop(
-                    category_key=category_key,
+            if force_eager_warmup:
+                output = self._fwd_loop(
+                    static_cat_ids=category_key,
                     **inputs,
                 )
                 self._warmed_graph_keys.add(key)
@@ -781,11 +789,23 @@ class GR00TN17ActionHeadRunner(ModelRunner):
                 return output
             graph = self.graphs.get(key)
             if graph is None:
+                if not allow_cuda_graph_capture:
+                    raise CudaGraphError(
+                        "No GR00T-N1.7 action-head CUDA Graph was captured for "
+                        "this runtime input profile. Add a representative "
+                        "request to GR00TN17Args.capture_profiles during engine "
+                        "setup."
+                    )
+                if key not in self._warmed_graph_keys:
+                    raise CudaGraphError(
+                        "GR00T-N1.7 action-head CUDA Graph capture requires an "
+                        "eager setup warmup for the same input profile."
+                    )
                 graph = CudaGraph()
                 graph.capture(
-                    lambda **kwargs: self._static_category_fwd_loop(
-                        category_key=category_key,
-                        **kwargs,
+                    partial(
+                        self._fwd_loop,
+                        static_cat_ids=category_key,
                     ),
                     inputs,
                 )
@@ -793,12 +813,9 @@ class GR00TN17ActionHeadRunner(ModelRunner):
             return graph.replay(inputs).clone()
         return self._fwd_loop(**inputs)
 
-    def reset_graphs(self) -> None:
+    def close(self) -> None:
         self.graphs = CudaGraphRegistry()
         self._empty_image_masks = {}
-
-    def close(self) -> None:
-        self.reset_graphs()
         self._warmed_graph_keys.clear()
         return None
 

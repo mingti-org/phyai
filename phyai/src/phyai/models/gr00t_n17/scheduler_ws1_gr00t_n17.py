@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import logging
 
 import torch
 
@@ -17,9 +18,14 @@ from phyai.models.gr00t_n17.model_runner_gr00t_n17 import (
     GR00TN17BackboneRunner,
 )
 from phyai.models.gr00t_n17.modeling_gr00t_n17 import (
+    GR00TN17ActionInput,
     GR00TN17Model,
 )
 from phyai.runtime.schedule import Scheduler
+from phyai.utils import this_rank_log
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,18 +69,34 @@ class GR00TN17WS1Scheduler(Scheduler):
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
-        self.use_cuda_graph = bool(use_cuda_graph)
+        use_cuda_graph = bool(use_cuda_graph)
         self.backbone_runner = GR00TN17BackboneRunner(
             model,
             device=self.device,
-            use_cuda_graph=self.use_cuda_graph,
+            use_cuda_graph=use_cuda_graph,
         )
         self.action_head_runner = GR00TN17ActionHeadRunner(
             model,
             max_batch_size=self.max_batch_size,
             device=self.device,
-            use_cuda_graph=self.use_cuda_graph,
+            use_cuda_graph=use_cuda_graph,
         )
+        self.use_cuda_graph = (
+            self.backbone_runner.use_cuda_graph
+            and self.action_head_runner.use_cuda_graph
+        )
+        if (
+            self.backbone_runner.use_cuda_graph
+            != self.action_head_runner.use_cuda_graph
+        ):
+            this_rank_log(
+                logger,
+                logging.WARNING,
+                "GR00T-N1.7 CUDA Graphs require both Backbone and Action Head "
+                "runners to support capture; disabling CUDA Graphs for both.",
+            )
+        self.backbone_runner.use_cuda_graph = self.use_cuda_graph
+        self.action_head_runner.use_cuda_graph = self.use_cuda_graph
 
     def setup(
         self,
@@ -89,20 +111,43 @@ class GR00TN17WS1Scheduler(Scheduler):
         self,
         request: GR00TN17Request,
     ) -> GR00TN17Request:
-        if request.noise is not None:
-            return request
         state = request.tensors.get("state")
         if not isinstance(state, torch.Tensor) or state.ndim == 0:
             raise ValueError("A capture profile requires a batched state tensor.")
         action_head = self.model.action_head
-        noise = torch.zeros(
-            state.shape[0],
-            action_head.action_horizon,
-            action_head.action_dim,
-            dtype=self.model.params_dtype,
-            device=self.device,
-        )
+        if request.noise is None:
+            noise = torch.zeros(
+                state.shape[0],
+                action_head.action_horizon,
+                action_head.action_dim,
+                dtype=self.model.params_dtype,
+                device=self.device,
+            )
+        else:
+            noise = request.noise.to(
+                device=self.device,
+                dtype=self.model.params_dtype,
+            )
         return GR00TN17Request(tensors=request.tensors, noise=noise)
+
+    def _capture_profile_key(
+        self,
+        request: GR00TN17Request,
+    ) -> tuple[object, ...] | None:
+        if request.noise is None:
+            raise ValueError("Capture profile key generation requires fixed noise.")
+        backbone_inputs, action_inputs = self._prepare_request(request)
+        backbone_key = self.backbone_runner.capture_profile_key(backbone_inputs)
+        if backbone_key is None:
+            return None
+        action_key = self.action_head_runner.capture_profile_key(
+            backbone_key,
+            action_inputs,
+            request.noise,
+        )
+        if action_key is None:
+            return None
+        return (("backbone", backbone_key), ("action_head", action_key))
 
     @torch.no_grad()
     def capture_profiles(
@@ -117,17 +162,42 @@ class GR00TN17WS1Scheduler(Scheduler):
                     f"capture_profiles[{index}] must be GR00TN17Request, got "
                     f"{type(profile).__name__}."
                 )
-        if not profiles or not (
-            self.backbone_runner.use_cuda_graph
-            and self.action_head_runner.use_cuda_graph
-        ):
+        if not self.use_cuda_graph:
             return
+        if not profiles:
+            raise ValueError(
+                "GR00T-N1.7 fixed CUDA Graph mode requires at least one "
+                "capture profile during scheduler setup."
+            )
 
         capture_requests = tuple(self._fixed_noise_profile(p) for p in profiles)
-        for request in capture_requests:
-            self._step(request, force_eager_warmup=True)
+        unique_requests: list[tuple[int, GR00TN17Request]] = []
+        seen_keys: set[tuple[object, ...]] = set()
         for index, request in enumerate(capture_requests):
-            self._step(request)
+            key = self._capture_profile_key(request)
+            if key is None:
+                raise ValueError(
+                    f"capture_profiles[{index}] is not supported by the current "
+                    "GR00T-N1.7 CUDA Graph path."
+                )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_requests.append((index, request))
+        if len(unique_requests) != len(capture_requests):
+            this_rank_log(
+                logger,
+                logging.INFO,
+                "Deduplicated %d GR00T-N1.7 capture profiles to %d unique "
+                "Graph structures.",
+                len(capture_requests),
+                len(unique_requests),
+            )
+
+        for _, request in unique_requests:
+            self._run_setup_profile(request, capture=False)
+        for index, request in unique_requests:
+            self._run_setup_profile(request, capture=True)
             if (
                 self.backbone_runner.last_forward_used_eager_warmup
                 or self.action_head_runner.last_forward_used_eager_warmup
@@ -199,7 +269,7 @@ class GR00TN17WS1Scheduler(Scheduler):
         compacted = dict(tensors)
         pad_token_id = int(
             getattr(
-                self.model.backbone._load_qwen3vl_model().config,
+                self.model.backbone.qwen3vl_model.config,
                 "pad_token_id",
                 0,
             )
@@ -252,23 +322,10 @@ class GR00TN17WS1Scheduler(Scheduler):
             )
         return compacted
 
-    @torch.no_grad()
-    def step(self, request: GR00TN17Request) -> torch.Tensor:
-        """Run backbone + action-head denoising; return the normalized action.
-
-        Returns the ``(B, action_horizon, max_action_dim)`` normalized action
-        chunk after applying any request ``action_mask``. The caller maps it
-        back to physical units via the processor's ``decode_action`` (which
-        needs the per-request ``raw_state``).
-        """
-        return self._step(request)
-
-    def _step(
+    def _prepare_request(
         self,
         request: GR00TN17Request,
-        *,
-        force_eager_warmup: bool = False,
-    ) -> torch.Tensor:
+    ) -> tuple[dict[str, torch.Tensor], GR00TN17ActionInput]:
         tensors = request.tensors
         batch = tensors["state"].shape[0]
         if batch > self.max_batch_size:
@@ -279,26 +336,47 @@ class GR00TN17WS1Scheduler(Scheduler):
         if batch > 1 and self._has_mixed_attention_masks(tensors, batch_size=batch):
             tensors = self._compact_valid_tokens(tensors)
 
-        backbone_inputs, action_inputs = self.model.prepare_input(
-            tensors, device=self.device
-        )
+        return self.model.prepare_input(tensors, device=self.device)
+
+    def _run_setup_profile(
+        self,
+        request: GR00TN17Request,
+        *,
+        capture: bool,
+    ) -> torch.Tensor:
+        """Run one setup-only eager warmup or CUDA Graph capture profile."""
+        backbone_inputs, action_inputs = self._prepare_request(request)
+        force_eager_warmup = not capture
         backbone_output = self.backbone_runner.forward(
             backbone_inputs,
             force_eager_warmup=force_eager_warmup,
+            allow_cuda_graph_capture=capture,
         )
         backbone_warmed = self.backbone_runner.last_forward_used_eager_warmup
-        normalized_action = self.action_head_runner.forward(
+        return self.action_head_runner.forward(
             backbone_output,
             action_inputs,
             noise=request.noise,
             force_eager_warmup=force_eager_warmup or backbone_warmed,
+            allow_cuda_graph_capture=capture,
         )
-        if backbone_warmed or self.action_head_runner.last_forward_used_eager_warmup:
-            if self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).synchronize()
-            self.backbone_runner.reset_graphs()
-            self.action_head_runner.reset_graphs()
-        return normalized_action
+
+    @torch.no_grad()
+    def step(self, request: GR00TN17Request) -> torch.Tensor:
+        """Run backbone + action-head denoising; return the normalized action.
+
+        Returns the ``(B, action_horizon, max_action_dim)`` normalized action
+        chunk after applying any request ``action_mask``. The caller maps it
+        back to physical units via the processor's ``decode_action`` (which
+        needs the per-request ``raw_state``).
+        """
+        backbone_inputs, action_inputs = self._prepare_request(request)
+        backbone_output = self.backbone_runner.forward(backbone_inputs)
+        return self.action_head_runner.forward(
+            backbone_output,
+            action_inputs,
+            noise=request.noise,
+        )
 
     def close(self) -> None:
         self.backbone_runner.close()

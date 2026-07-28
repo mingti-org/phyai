@@ -86,7 +86,6 @@ class GR00TN17BackboneConfig(PretrainedConfig):
 
     model_name: str = "nvidia/Cosmos-Reason2-2B"
     qwen3vl: Qwen3VLConfig | None = field(default_factory=_default_gr00t_qwen3vl_config)
-    model_revision: str | None = None
     backbone_embedding_dim: int = 2048
     select_layer: int = 12
     load_bf16: bool = False
@@ -140,8 +139,8 @@ class GR00TN17DiTConfig(PretrainedConfig):
     norm_type: str = "ada_norm"
     norm_elementwise_affine: bool = False
     interleave_self_attention: bool = True
-    # Dense no-cache attention backend used inside GR00T's action head. Masked
-    # cross-attention compacts K/V by key mask before calling PhyAI Attention.
+    # Dense no-cache attention backend used inside GR00T's action head. The
+    # CUDA-graph path reuses backbone sequence buckets and applies masks in SDPA.
     attention_backend: str = "sdpa"
 
     def __post_init__(self) -> None:

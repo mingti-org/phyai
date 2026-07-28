@@ -26,13 +26,13 @@ actions.
 
 | Benchmark | PhyAI Avg Acc | Isaac-GR00T Avg Acc |
 | --- | ---: | ---: |
-| LIBERO demo, trajectories `0`-`4` | `0.987312` | `0.987152` |
+| LIBERO demo, trajectories `0`-`4` | `0.987320` | `0.987152` |
 
 The corresponding error values are:
 
 | Implementation | Avg MSE | Avg MAE | Avg Acc |
 | --- | ---: | ---: | ---: |
-| PhyAI | `0.001266` | `0.012688` | `0.987312` |
+| PhyAI | `0.001272` | `0.012680` | `0.987320` |
 | Isaac-GR00T | `0.001285` | `0.012848` | `0.987152` |
 
 ## Evaluation settings
@@ -78,6 +78,8 @@ uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
 
 Append `--online` to the first run only if the Cosmos-Reason2 tokenizer and
 preprocessor files are not yet cached.
+The built-in Cosmos-Reason2 processor does not require remote code. Only pass
+`--trust-remote-code` for a custom processor repository whose code you trust.
 
 The Isaac-GR00T values were computed from decoded actions generated with
 NVIDIA's official model and processor under the same settings. NVIDIA's

@@ -92,12 +92,23 @@ uv run --with pyzmq --with msgpack --with msgpack-numpy \
   --host 0.0.0.0 \
   --port 5556 \
   --max-batch-size 1 \
-  --capture-task \
-  "put both the alphabet soup and the tomato sauce in the basket" \
+  --capture-suite libero_10 \
   --seed 42
 ```
 
-如果本地尚未缓存 Cosmos-Reason2 文件，第一次运行时追加 `--online`。看到
+如果本地尚未缓存 Cosmos-Reason2 文件，第一次运行时追加 `--online`。
+内置processor不需要执行远程代码；只有在使用可信的自定义processor仓库时才传入
+`--trust-remote-code`。
+启用CUDA Graph时，`--max-batch-size`就是捕获Graph所用的batch，必须与
+客户端实际请求batch一致。此处客户端每次发送一个环境，因此两者都为`1`；
+使用官方客户端时，应将其设为与`--n-envs`相同的值。
+`--capture-suite libero_10`会在绑定端口前扫描全部十个任务，并按Backbone
+和Action Head的完整Graph结构对profile去重。这十条标准任务描述的结构
+相同，因此setup只对一条代表profile执行预热，两个阶段分别只捕获一张
+Graph；运行时只回放这些Graph。测试自定义固定任务子集时，将其替换为
+重复的`--capture-task "..."`；等价结构仍只捕获一次。该CUDA Graph路径中的
+Action Head使用SDPA；选择可选FlashInfer backend时，scheduler会同时关闭
+Backbone和Action Head的CUDA Graph，让完整请求统一走eager。看到
 `Server is ready and listening` 后，在另一个终端重新导出相同变量并运行：
 
 ```bash

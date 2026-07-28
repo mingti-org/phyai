@@ -11,7 +11,8 @@ dependencies. Run the adapter with an ephemeral uv overlay instead::
     uv run --with pyzmq --with msgpack --with msgpack-numpy \
         python benchmark/gr00t/libero_rollout_server.py \
         --checkpoint <gr00t-checkpoint-dir> \
-        --host 127.0.0.1 --port 5556 --max-batch-size 5
+        --host 127.0.0.1 --port 5556 --max-batch-size 5 \
+        --capture-suite libero_10
 
 Then point the unmodified official client at the same address::
 
@@ -19,7 +20,9 @@ Then point the unmodified official client at the same address::
         --policy-client-host 127.0.0.1 --policy-client-port 5556 \
         --n-envs 5 <other-rollout-options>
 
-``--max-batch-size`` must be at least the client's ``--n-envs`` value.
+With CUDA Graphs enabled, ``--max-batch-size`` must equal the client's actual
+batch size (``--n-envs`` for the official client). With ``--no-cuda-graph``, it
+is only an upper bound.
 Wait for the server's ``Server is ready`` log before starting the client; model
 loading and the setup profile intentionally finish before the socket is bound.
 """
@@ -38,6 +41,21 @@ import numpy as np
 
 
 logger = logging.getLogger("phyai.libero_rollout_server")
+
+LIBERO_10_CAPTURE_TASKS = (
+    "put both the alphabet soup and the tomato sauce in the basket",
+    "put both the cream cheese box and the butter in the basket",
+    "turn on the stove and put the moka pot on it",
+    "put the black bowl in the bottom drawer of the cabinet and close it",
+    "put the white mug on the left plate and put the yellow and white mug on "
+    "the right plate",
+    "pick up the book and place it in the back compartment of the caddy",
+    "put the white mug on the plate and put the chocolate pudding to the right "
+    "of the plate",
+    "put both the alphabet soup and the cream cheese box in the basket",
+    "put both moka pots on the stove",
+    "put the yellow and white mug in the microwave and close it",
+)
 
 
 def require_transport_modules():
@@ -295,8 +313,10 @@ class PhyAILiberoPolicy:
         if batch_size > self.max_batch_size:
             raise ValueError(
                 "Rollout request batch exceeds --max-batch-size: "
-                f"{batch_size} > {self.max_batch_size}. Set --max-batch-size "
-                "to at least rollout_policy.py's --n-envs value."
+                f"{batch_size} > {self.max_batch_size}. In CUDA Graph mode, "
+                "restart with --max-batch-size equal to the client's actual "
+                "request batch (--n-envs for rollout_policy.py). With "
+                "--no-cuda-graph, set it to at least the request batch."
             )
         tensors = {
             key: value.to(device=self.device)
@@ -425,7 +445,7 @@ def build_policy(args: argparse.Namespace) -> PhyAILiberoPolicy:
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.params_dtype]
     device = torch.device(args.device)
     loading_kwargs = {
-        "trust_remote_code": True,
+        "trust_remote_code": args.trust_remote_code,
         "local_files_only": not args.online,
     }
     model_config = load_config(checkpoint, GR00TN17Config)
@@ -433,23 +453,27 @@ def build_policy(args: argparse.Namespace) -> PhyAILiberoPolicy:
         checkpoint,
         embodiment_tag=args.embodiment_tag,
         model_name=(
-            args.backbone_model_name_or_path or model_config.backbone.model_name
+            args.processor_model_name_or_path or model_config.backbone.model_name
         ),
         transformers_loading_kwargs=loading_kwargs,
     )
-    capture_profiles = ()
-    if args.capture_task is not None:
-        capture_observation = make_capture_observation(
-            processor,
-            batch_size=args.max_batch_size,
-            image_size=args.capture_image_size,
-            task=args.capture_task,
+    capture_tasks = list(args.capture_task)
+    if args.capture_suite == "libero_10":
+        capture_tasks.extend(LIBERO_10_CAPTURE_TASKS)
+    capture_tasks = list(dict.fromkeys(capture_tasks))
+    capture_profiles = tuple(
+        GR00TN17Request(
+            tensors=processor.process_observation(
+                make_capture_observation(
+                    processor,
+                    batch_size=args.max_batch_size,
+                    image_size=args.capture_image_size,
+                    task=task,
+                )
+            ).tensors
         )
-        capture_profiles = (
-            GR00TN17Request(
-                tensors=processor.process_observation(capture_observation).tensors
-            ),
-        )
+        for task in capture_tasks
+    )
 
     engine = Engine(
         EngineArgs(
@@ -458,8 +482,6 @@ def build_policy(args: argparse.Namespace) -> PhyAILiberoPolicy:
                 checkpoint_dir=checkpoint,
                 max_batch_size=args.max_batch_size,
                 capture_profiles=capture_profiles,
-                backbone_model_name_or_path=args.backbone_model_name_or_path,
-                backbone_transformers_loading_kwargs=loading_kwargs,
             ),
             config=EngineConfig(
                 device=DeviceConfig(target=args.device, params_dtype=dtype),
@@ -489,26 +511,56 @@ def parse_args() -> argparse.Namespace:
         "--max-batch-size",
         type=int,
         default=8,
-        help="Must be >= the official client's --n-envs value (default: 8).",
+        help=(
+            "Batch size captured during CUDA Graph setup; it must equal the "
+            "client's actual request batch (--n-envs for the official client). "
+            "With --no-cuda-graph, this is only an upper bound (default: 8)."
+        ),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--params-dtype", choices=("bfloat16", "float32"), default="bfloat16"
     )
     parser.add_argument("--no-cuda-graph", action="store_true")
-    parser.add_argument("--backbone-model-name-or-path", default=None)
+    parser.add_argument(
+        "--processor-model-name-or-path",
+        default=None,
+        help=(
+            "Optional tokenizer/preprocessor path or Hugging Face repo id used "
+            "only by GR00TProcessor. Defaults to the model name stored in the "
+            "GR00T config."
+        ),
+    )
     parser.add_argument(
         "--online",
         action="store_true",
         help="Allow Hugging Face downloads (default: local files only).",
     )
     parser.add_argument(
-        "--capture-task",
-        default="pick up the object",
+        "--trust-remote-code",
+        action="store_true",
         help=(
-            "Representative task text captured before the server accepts clients "
-            "(default: 'pick up the object'). Use the rollout task text to avoid "
-            "a lazy first-request capture for that prompt structure."
+            "Allow Transformers to execute custom code from the processor model "
+            "repository. Only use this with a repository you trust."
+        ),
+    )
+    parser.add_argument(
+        "--capture-task",
+        action="append",
+        default=[],
+        help=(
+            "Task text scanned before the server accepts clients. Repeat this "
+            "option to cover every task structure; equivalent Graph structures "
+            "are captured only once."
+        ),
+    )
+    parser.add_argument(
+        "--capture-suite",
+        choices=("libero_10",),
+        default=None,
+        help=(
+            "Scan every task in the selected fixed LIBERO suite and capture "
+            "each unique Graph structure once."
         ),
     )
     parser.add_argument("--capture-image-size", type=int, default=256)
@@ -526,6 +578,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--port must be in [1, 65535].")
     if args.capture_image_size <= 0:
         parser.error("--capture-image-size must be positive.")
+    if not args.no_cuda_graph and args.capture_suite is None and not args.capture_task:
+        parser.error(
+            "CUDA Graph mode requires --capture-suite or at least one --capture-task."
+        )
     return args
 
 
@@ -535,6 +591,11 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.trust_remote_code:
+        logger.warning(
+            "--trust-remote-code allows execution of code from the processor "
+            "model repository."
+        )
     require_transport_modules()
     policy = build_policy(args)
     server: OfficialPolicyServer | None = None

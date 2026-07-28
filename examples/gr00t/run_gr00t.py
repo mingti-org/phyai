@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -143,18 +144,27 @@ def main() -> None:
         help="Run without CUDA graph capture.",
     )
     parser.add_argument(
-        "--backbone-model-name-or-path",
+        "--processor-model-name-or-path",
         type=str,
         default=None,
         help=(
-            "Optional Qwen3-VL backbone tokenizer/config path or HuggingFace repo id. "
-            "Defaults to the backbone model name stored in the GR00T config."
+            "Optional tokenizer/preprocessor path or Hugging Face repo id used "
+            "only by GR00TProcessor. Defaults to the model name stored in the "
+            "GR00T config."
         ),
     )
     parser.add_argument(
         "--online",
         action="store_true",
         help="Allow HuggingFace downloads (default: local_files_only).",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow Transformers to execute custom code from the processor model "
+            "repository. Only use this with a repository you trust."
+        ),
     )
     parser.add_argument(
         "--dump-dir",
@@ -199,12 +209,21 @@ def main() -> None:
         raise NotADirectoryError(
             f"--checkpoint must be a directory, got: {args.checkpoint}"
         )
+    if args.trust_remote_code:
+        warnings.warn(
+            "--trust-remote-code allows execution of code from the processor "
+            "model repository.",
+            stacklevel=1,
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.params_dtype]
     device = torch.device("cuda")
-    loading_kwargs = {"trust_remote_code": True, "local_files_only": not args.online}
+    loading_kwargs = {
+        "trust_remote_code": args.trust_remote_code,
+        "local_files_only": not args.online,
+    }
     use_cuda_graph = args.dump_dir is None and not args.no_cuda_graph
 
     # Lazy import keeps --help fast and the engine import free of the processor.
@@ -214,7 +233,7 @@ def main() -> None:
     processor = GR00TProcessor.from_pretrained(
         args.checkpoint,
         embodiment_tag=args.embodiment_tag,
-        model_name=args.backbone_model_name_or_path or cfg.backbone.model_name,
+        model_name=args.processor_model_name_or_path or cfg.backbone.model_name,
         transformers_loading_kwargs=loading_kwargs,
     )
     observation = make_synthetic_observation(
@@ -233,8 +252,6 @@ def main() -> None:
                 checkpoint_dir=args.checkpoint,
                 max_batch_size=args.batch_size,
                 capture_profiles=(capture_profile,),
-                backbone_model_name_or_path=args.backbone_model_name_or_path,
-                backbone_transformers_loading_kwargs=loading_kwargs,
             ),
             config=EngineConfig(
                 device=DeviceConfig(target="cuda", params_dtype=dtype),
