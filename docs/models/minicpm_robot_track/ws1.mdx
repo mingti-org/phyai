@@ -1,0 +1,241 @@
+---
+title: "MiniCPM-RobotTrack local deployment"
+description: "Run 32-frame initialization and single-frame waypoint inference with PhyAI."
+icon: "route"
+---
+
+# Overview
+
+Use this guide to run MiniCPM-RobotTrack through the PhyAI Engine. You provide
+32 RGB frames and a text instruction, and receive eight `[x, y, yaw]`
+waypoints. You run the example locally; it does not start a network service.
+
+```text
+32 RGB frames + instruction
+  -> PIL BICUBIC resize + tokenizer
+  -> DINOv3 + SigLIP
+  -> 31-frame coarse-token history + current-frame fine tokens
+  -> MiniCPM4 policy + trajectory head
+  -> 8 [x, y, yaw] waypoints
+```
+
+# Requirements
+
+- Linux with a CUDA-capable NVIDIA GPU
+- Python 3.12 or newer
+- [`uv`](https://docs.astral.sh/uv/)
+- A MiniCPM-RobotTrack checkpoint
+- Local DINOv3 and SigLIP checkpoints
+- A directory of RGB frames named in chronological order
+
+PhyAI does not distribute model weights. The integration follows the checkpoint
+and architecture published by
+[OpenBMB/MiniCPM-Robot](https://github.com/OpenBMB/MiniCPM-Robot/tree/main/MiniCPM-RobotTrack).
+
+# Install
+
+From the repository root, run:
+
+```bash
+uv sync
+```
+
+Use `uv run` for the commands below so they run in the workspace environment.
+
+## Jetson Orin with CUDA 12.6
+
+The main workspace still requires Python 3.12 or newer. If you use JetPack 6, the
+[Jetson AI Lab CUDA 12.6 index](https://pypi.jetson-ai-lab.io/jp6/cu126/torch/2.11.0)
+currently provides its PyTorch 2.11 wheel for CPython 3.10. That wheel contains
+the `sm_87` device code required by Orin. You can use the standalone project
+without changing the root `pyproject.toml`:
+
+```bash
+unset VIRTUAL_ENV
+uv sync \
+  --project examples/minicpm_robot_track/jetson-cu126 \
+  --python /usr/bin/python3.10
+
+uv build --package phyai-ext --wheel \
+  --out-dir .cache/jetson-cu126-wheels
+uv pip install --python 3.12 \
+  --target .cache/jetson-cu126-runtime \
+  --no-deps --reinstall \
+  .cache/jetson-cu126-wheels/phyai_ext-*.whl
+
+export PYTHONPATH="$PWD/.cache/jetson-cu126-runtime:$PWD/phyai/src:$PWD/phyai-kernel:$PWD/phyai-utils-tools/src"
+```
+
+`phyai-ext` builds a `py3-none-linux_aarch64` wheel, but its package metadata
+keeps the workspace's Python 3.12 requirement. The command above uses Python
+3.12 to unpack that wheel into an isolated target directory. Run RobotTrack
+with the standalone project's Python 3.10 interpreter:
+
+```bash
+examples/minicpm_robot_track/jetson-cu126/.venv/bin/python -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())'
+```
+
+You should see Torch `2.11.0`, CUDA `12.6`, and `sm_87`. This project
+is a Jetson runtime exception; it does not lower the repository's supported
+Python version.
+
+# Prepare the input
+
+The example sorts frame names by their embedded numbers and selects the latest
+32 frames. If the directory contains fewer than 32 frames, it left-pads the
+window with its earliest frame. The processor resizes every frame to `384x384`
+with PIL BICUBIC.
+
+| Request | Input | Purpose |
+| --- | --- | --- |
+| Complete window | 32 RGB frames | Create or replace a stream's visual history |
+| Incremental | 1 RGB frame | Advance an initialized stream by one frame |
+
+<Note>
+  The policy sequence length is fixed at 256 tokens. This is not the image
+  resolution; both vision towers receive `384x384` images.
+</Note>
+
+# Run one inference
+
+When you run the end-to-end example, it initializes the 32-frame window, sends
+one incremental frame, and checks that the returned waypoint tensor is finite
+with shape `(1, 8, 3)`.
+
+The vision runner loads DINOv3 and SigLIP checkpoints directly through PhyAI.
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark_e2e.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --dino-checkpoint /path/to/dinov3-vit-s16 \
+  --siglip-checkpoint /path/to/siglip-so400m-patch14-384 \
+  --vision-attention-backend sdpa \
+  --vision-norm-backend phyai-kernel \
+  --vision-dtype float16 \
+  --frames-dir /path/to/ordered/rgb/frames \
+  --instruction "Follow the person in the red shirt." \
+  --warmup 0 \
+  --iters 1 \
+  --cold-iters 1
+```
+
+When using the Jetson project above, replace `uv run python` with
+`examples/minicpm_robot_track/jetson-cu126/.venv/bin/python`.
+
+# How one request runs
+
+<Steps>
+  <Step title="Prepare images and text">
+    `MiniCPMRobotTrackProcessor` resizes RGB frames and compacts the instruction
+    tokens.
+  </Step>
+  <Step title="Encode the new visual input">
+    DINOv3 and SigLIP run through PhyAI. An incremental request encodes only the
+    new frame.
+  </Step>
+  <Step title="Update the stream history">
+    GridPool produces coarse history tokens and fine current-frame tokens. The
+    Engine retains 31 coarse frames for each `stream_id`.
+  </Step>
+  <Step title="Run the policy">
+    The MiniCPM4 policy and trajectory head return a float32 tensor with shape
+    `(1, 8, 3)`.
+  </Step>
+</Steps>
+
+# Streaming contract
+
+Start each stream with a 32-frame request. Set `frame_index` to the index of the
+final frame in that window. Then send one frame per request with consecutive
+indices.
+
+| Case | Engine behavior |
+| --- | --- |
+| New `stream_id` with 32 frames | Initializes the stream |
+| Existing `stream_id` with 32 frames | Replaces the complete history |
+| Next consecutive `frame_index` | Encodes one frame and advances the window |
+| Repeated latest `frame_index` | Reuses committed visual features |
+| Skipped or older index | Raises an error |
+| Unknown or evicted stream with one frame | Raises an error; send 32 frames again |
+
+Visual state is committed only after policy inference succeeds. The default
+cache retains eight streams and evicts the least recently used stream after it
+reaches capacity.
+
+# Benchmark
+
+Run 10 warmups and 50 timed requests to measure steady single-frame latency:
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark_e2e.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --dino-checkpoint /path/to/dinov3-vit-s16 \
+  --siglip-checkpoint /path/to/siglip-so400m-patch14-384 \
+  --frames-dir /path/to/ordered/rgb/frames \
+  --warmup 10 \
+  --iters 50 \
+  --cold-iters 1 \
+  --json-output /tmp/robottrack_phyai.json
+```
+
+The following measurements use the PhyAI policy and vision runner, the same
+processor and images, 10 warmups, and 50 timed requests.
+
+| Metric | P50 latency |
+| --- | ---: |
+| Vision Graph | 94.98 ms |
+| Policy Graph | 30.34 ms |
+| Engine | 126.40 ms |
+| Processor | 6.82 ms |
+| Raw RGB to waypoint | 133.92 ms |
+
+`Engine P50` starts after image resize and tokenization. The measurements do
+not include RPC, network transfer, camera age, or robot control. Treat them as
+results from one Orin setup and rerun the benchmark on the deployment device.
+
+If you already have visual tokens, use `benchmark.py` to measure only the fixed
+MiniCPM policy:
+
+```bash
+uv run python examples/minicpm_robot_track/benchmark.py \
+  --checkpoint /path/to/MiniCPM-RobotTrack \
+  --attention-backend flashinfer \
+  --linear-kernel auto \
+  --warmup 5 \
+  --iters 30
+```
+
+# PhyAI vision execution
+
+PhyAI loads the DINOv3 and SigLIP checkpoints and runs both towers in FP16.
+Attention uses PhyAI's SDPA path and LayerNorm uses `phyai-kernel`. The
+integration keeps the published layer counts, dimensions, token grids, and
+outputs unchanged.
+
+The policy and steady single-frame vision paths use separate CUDA Graphs. The
+32-frame initialization runs eagerly because its shape differs. Use
+`--no-vision-cuda-graph` to disable only the vision graph, or
+`--no-cuda-graph` to disable both graphs.
+
+# Verify
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q \
+  phyai-utils-tools/tests/test_minicpm_robot_track_processor.py
+
+uv run ruff check \
+  examples/minicpm_robot_track \
+  phyai-utils-tools/src/phyai_utils_tools/models/minicpm_robot_track \
+  phyai/src/phyai/models/minicpm_robot_track
+```
+
+Fixed-input numerical checks validate the integration, not closed-loop tracking
+quality. Evaluate the policy separately in RobotTrack or on the target robot.
+
+# Current limitations
+
+- The plugin supports one GPU and batch size 1.
+- Policy length is fixed at 256 tokens; vision input is fixed at `384x384`.
+- A stream must receive 32 frames before incremental requests.
+- The example does not measure transport or robot controller latency.

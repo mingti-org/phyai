@@ -1,0 +1,32 @@
+[project]
+name = "phyai-robottrack-jetson-cu126"
+version = "0.1.0"
+description = "Standalone MiniCPM-RobotTrack runtime dependencies for Jetson CUDA 12.6."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "apache-tvm-ffi==0.1.12",
+    "av>=14.0.0",
+    "flashinfer-python==0.6.12",
+    "huggingface-hub",
+    "numpy==2.2.6",
+    "packaging",
+    "pillow",
+    "safetensors==0.7.0",
+    "torch==2.11.0",
+    "torch-c-dlpack-ext==0.1.5",
+    "transformers==5.8.1",
+    "triton==3.6.0",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "jetson-cu126"
+url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
+explicit = true
+
+[tool.uv.sources]
+# Jetson Orin needs a PyTorch wheel containing sm_87 device code.
+torch = { index = "jetson-cu126" }
