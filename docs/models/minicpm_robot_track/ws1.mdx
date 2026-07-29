@@ -6,10 +6,9 @@ icon: "route"
 
 # Overview
 
-This guide runs MiniCPM-RobotTrack through the PhyAI Engine. The model accepts
-32 RGB frames and a text instruction, then returns eight `[x, y, yaw]`
-waypoints. The example covers local inference only and does not start a network
-service.
+Use this guide to run MiniCPM-RobotTrack through the PhyAI Engine. You provide
+32 RGB frames and a text instruction, and receive eight `[x, y, yaw]`
+waypoints. You run the example locally; it does not start a network service.
 
 ```text
 32 RGB frames + instruction
@@ -35,7 +34,7 @@ and architecture published by
 
 # Install
 
-From the repository root:
+From the repository root, run:
 
 ```bash
 uv sync
@@ -45,11 +44,11 @@ Use `uv run` for the commands below so they run in the workspace environment.
 
 ## Jetson Orin with CUDA 12.6
 
-The main workspace still requires Python 3.12 or newer. For JetPack 6, the
+The main workspace still requires Python 3.12 or newer. If you use JetPack 6, the
 [Jetson AI Lab CUDA 12.6 index](https://pypi.jetson-ai-lab.io/jp6/cu126/torch/2.11.0)
 currently provides its PyTorch 2.11 wheel for CPython 3.10. That wheel contains
-the `sm_87` device code required by Orin. Use the standalone project without
-changing the root `pyproject.toml`:
+the `sm_87` device code required by Orin. You can use the standalone project
+without changing the root `pyproject.toml`:
 
 ```bash
 unset VIRTUAL_ENV
@@ -70,14 +69,14 @@ export PYTHONPATH="$PWD/.cache/jetson-cu126-runtime:$PWD/phyai/src:$PWD/phyai-ke
 `phyai-ext` builds a `py3-none-linux_aarch64` wheel, but its package metadata
 keeps the workspace's Python 3.12 requirement. The command above uses Python
 3.12 to unpack that wheel into an isolated target directory. Run RobotTrack
-with the Python 3.10 interpreter from the standalone project:
+with the standalone project's Python 3.10 interpreter:
 
 ```bash
 examples/minicpm_robot_track/jetson-cu126/.venv/bin/python -c \
   'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())'
 ```
 
-The output should include Torch `2.11.0`, CUDA `12.6`, and `sm_87`. This project
+You should see Torch `2.11.0`, CUDA `12.6`, and `sm_87`. This project
 is a Jetson runtime exception; it does not lower the repository's supported
 Python version.
 
@@ -100,9 +99,9 @@ with PIL BICUBIC.
 
 # Run one inference
 
-The end-to-end example initializes the 32-frame window, sends one incremental
-frame, and checks that the returned waypoint tensor is finite with shape
-`(1, 8, 3)`.
+When you run the end-to-end example, it initializes the 32-frame window, sends
+one incremental frame, and checks that the returned waypoint tensor is finite
+with shape `(1, 8, 3)`.
 
 The vision runner loads DINOv3 and SigLIP checkpoints directly through PhyAI.
 
@@ -147,9 +146,9 @@ When using the Jetson project above, replace `uv run python` with
 
 # Streaming contract
 
-The first request for a stream must contain 32 frames. Set `frame_index` to the
-index of the final frame in that window. Later requests send one frame with
-consecutive indices.
+Start each stream with a 32-frame request. Set `frame_index` to the index of the
+final frame in that window. Then send one frame per request with consecutive
+indices.
 
 | Case | Engine behavior |
 | --- | --- |
@@ -166,7 +165,7 @@ reaches capacity.
 
 # Benchmark
 
-Use 10 warmups and 50 timed requests for steady single-frame latency:
+Run 10 warmups and 50 timed requests to measure steady single-frame latency:
 
 ```bash
 uv run python examples/minicpm_robot_track/benchmark_e2e.py \
@@ -195,8 +194,8 @@ processor and images, 10 warmups, and 50 timed requests.
 not include RPC, network transfer, camera age, or robot control. Treat them as
 results from one Orin setup and rerun the benchmark on the deployment device.
 
-Use `benchmark.py` when visual tokens are already available and only the fixed
-MiniCPM policy should be measured:
+If you already have visual tokens, use `benchmark.py` to measure only the fixed
+MiniCPM policy:
 
 ```bash
 uv run python examples/minicpm_robot_track/benchmark.py \

@@ -380,6 +380,8 @@ class MiniCPMRobotTrackVisionRunner(ModelRunner):
 
     def close(self) -> None:
         self.graph = None
+        self.dino = None
+        self.siglip = None
         self._phyai_encoder.close()
 
 

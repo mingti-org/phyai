@@ -133,7 +133,7 @@ def main() -> int:
         )
     config = load_config(args.checkpoint, MiniCPMRobotTrackConfig)
     tokenizer = AutoTokenizer.from_pretrained(
-        args.checkpoint, trust_remote_code=True, local_files_only=True
+        args.checkpoint, trust_remote_code=False, local_files_only=True
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

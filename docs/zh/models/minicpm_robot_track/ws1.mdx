@@ -6,9 +6,9 @@ icon: "route"
 
 # 概述
 
-本指南使用PhyAI Engine运行MiniCPM-RobotTrack。模型输入32帧RGB
-图像和一条文本指令，输出8个`[x, y, yaw]` waypoint。示例只包含
-本地推理，不启动网络服务。
+你可以按照本指南，通过PhyAI Engine运行MiniCPM-RobotTrack。你需要输入
+32帧RGB图像和一条文本指令，随后会得到8个`[x, y, yaw]` waypoint。
+整个示例在本地运行，不会启动网络服务。
 
 ```text
 32帧RGB + 文本指令
@@ -34,7 +34,7 @@ PhyAI不分发模型权重。接入遵循
 
 # 安装
 
-在仓库根目录执行：
+进入仓库根目录后，运行：
 
 ```bash
 uv sync
@@ -44,10 +44,10 @@ uv sync
 
 ## Jetson Orin与CUDA12.6
 
-主workspace仍要求Python 3.12或更高版本。Jetson AI Lab的
+主workspace仍要求Python 3.12或更高版本。如果你使用JetPack 6，Jetson AI Lab的
 [CUDA12.6索引](https://pypi.jetson-ai-lab.io/jp6/cu126/torch/2.11.0)
 目前为JetPack 6提供CPython 3.10版PyTorch 2.11 wheel，其中包含Orin需要的
-`sm_87`设备代码。使用示例目录中的独立project，不要修改根
+`sm_87`设备代码。你可以使用示例目录中的独立project，不需要修改根
 `pyproject.toml`：
 
 ```bash
@@ -75,7 +75,7 @@ examples/minicpm_robot_track/jetson-cu126/.venv/bin/python -c \
   'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())'
 ```
 
-预期输出包含Torch `2.11.0`、CUDA `12.6`和`sm_87`。这套project只用于
+你应该能看到Torch `2.11.0`、CUDA `12.6`和`sm_87`。这套project只用于
 Jetson运行时，不会降低仓库对外声明的Python版本。
 
 # 准备输入
@@ -96,8 +96,8 @@ resize到`384x384`。
 
 # 运行一次推理
 
-端到端示例会初始化32帧窗口，再提交一帧增量输入，并检查输出是
-有限值且shape为`(1, 8, 3)`。
+运行端到端示例后，你会先初始化32帧窗口，再提交一帧增量输入。
+脚本会检查输出是否为有限值，以及shape是否为`(1, 8, 3)`。
 
 视觉runner通过PhyAI直接加载DINOv3和SigLIP checkpoint。
 
@@ -139,8 +139,8 @@ uv run python examples/minicpm_robot_track/benchmark_e2e.py \
 
 # 滑动窗口约定
 
-stream的第一个请求必须包含32帧。`frame_index`是窗口最后一帧的序号。
-后续请求每次提交一帧，并使用连续序号。
+你必须用32帧请求初始化每个stream，并把`frame_index`设为窗口最后一帧的
+序号。后续请求每次提交一帧，并使用连续序号。
 
 | 情况 | Engine行为 |
 | --- | --- |
@@ -156,7 +156,7 @@ stream的第一个请求必须包含32帧。`frame_index`是窗口最后一帧�
 
 # Benchmark
 
-使用10次预热和50次计时测量稳态单帧时延：
+请用10次预热和50次计时测量稳态单帧时延：
 
 ```bash
 uv run python examples/minicpm_robot_track/benchmark_e2e.py \
@@ -185,8 +185,8 @@ uv run python examples/minicpm_robot_track/benchmark_e2e.py \
 网络传输、相机帧龄和机器人控制。这些数值来自一套Orin环境，部署时
 需要在目标设备重新测量。
 
-已经有coarse/fine视觉token时，使用`benchmark.py`只测固定MiniCPM
-policy：
+如果你已经有coarse/fine视觉token，可以使用`benchmark.py`只测固定
+MiniCPM policy：
 
 ```bash
 uv run python examples/minicpm_robot_track/benchmark.py \
