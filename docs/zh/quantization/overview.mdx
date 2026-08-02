@@ -1,0 +1,84 @@
+---
+title: "量化概述"
+description: "PhyAI 量化子系统的分层设计：从 checkpoint 配置到物理权重格式的四级流水线。"
+icon: "layer-group"
+---
+
+# 量化
+
+量化把权重和激活从 bf16 换成更低的精度（fp8、nvfp4 等）来存储和计算，省显存、提吞吐。难点不在于某一种格式怎么算，而在于同一个引擎要同时接住好几种来源不同、约定不同的量化 checkpoint，还要让模型代码基本不用改。
+
+PhyAI 把这件事拆成两层来管：
+
+- **语义层**：这个张量量化成什么。只描述 dtype、粒度、对称性这些数学属性，不碰 scale 布局、kernel、设备。
+- **物理层**：这个张量在显存里长什么样。dtype、scale 的形状和排布、加载后要不要做后处理，以及前向时走哪个 kernel。
+
+两层中间隔着一次显式的下降（lowering）。语义描述先在设备信息就位后被翻译成物理格式，再由物理格式去分配参数、挑选 kernel。这样加一种新框架的 config 解析，和加一种新的物理 kernel，改的是不同的文件，互不牵连。
+
+![量化的分层设计：config → plan → scheme 都是设备无关的语义，materialize 之后才落到物理格式](/images/quantization/layered-design.svg)
+
+一条线从左到右：config 被 importer 认成 `QuantPlan`，`QuantPlan` 按层名 `resolve` 出 `QuantScheme`，`materialize` 再把语义降成 `WeightSpec`。前三级都不碰硬件，只有 `materialize` 这一步把 SM 版本读进来，分界在 scheme 和 spec 之间。
+
+# 四级流水线
+
+上图的每一级，具体在做什么：
+
+| 阶段 | 输入 | 输出 | 代码位置 |
+| --- | --- | --- | --- |
+| 识别 | checkpoint 的量化 config | `QuantPlan` | `layers/quant/importers/` |
+| 匹配 | 层名 + 层的类 | `QuantScheme`（或跳过） | `layers/quant/plan.py` |
+| 下降 | `QuantScheme` + SM 版本 | `WeightSpec` | `layers/quant/materialize.py` |
+| 落地 | `WeightSpec` | 参数分配 + kernel 选择 | `layers/quant/{bf16,fp8,nvfp4}.py` |
+
+每一级都只认上一级的输出，不越级往回看。importer 只负责把五花八门的 config 收敛成一张规则表；规则表只负责按层名回答"这一层用哪个 scheme"；`materialize` 只负责把语义翻成物理，并在这里做和硬件相关的选择（比如 NVFP4 的 scale 布局要看 SM 版本）。
+
+# 举个例子：三个 key 怎么落地
+
+把上面 `QuantPlan → WeightSpec` 那一段放大来看。拿一个 fp8 checkpoint，它的 plan 只有两条规则：`lm_head` 跳过，其余走 fp8。三个权重前缀过一遍这张规则表，落到不同的物理格式。
+
+![一个 QuantPlan 如何解析三个 checkpoint 权重 key](/images/quantization/resolve-example.svg)
+
+`qkv_proj` 和 `gate_up_proj` 没被单独点名，落到 `default`，拿到 `Fp8Spec`：权重按 `fp8_e4m3` 存，再配一列 fp32 的 `weight_scale`（per-channel，每个输出通道一个），激活在运行时按 token 动态量化。`lm_head` 命中第一条 skip 规则，`scheme` 是 `None`，于是保持 bf16——只有一个 `weight`，没有 scale。规则自上而下匹配，命中即停，剩下的一律走 `default`。
+
+# 一个量化 checkpoint 怎么跑起来
+
+模型入口已经接好了量化的加载，所以跑一个量化 checkpoint 和跑普通 checkpoint 用的是同一套代码。以 pi0.5 为例：
+
+```python
+from pathlib import Path
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+import torch
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(checkpoint_dir=Path("/path/to/quantized_pi05")),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+        ),
+    )
+)
+```
+
+入口在构造模型时会读 checkpoint 的量化 config，构建出对应的 `QuantPlan`，并把它设为当前生效的计划：
+
+```python
+with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
+    self.model = PI05Model(config, ...)
+```
+
+如果 checkpoint 没有量化 config，`load_quant_plan` 返回 `None`，模型退回默认的 bf16，行为和以前完全一致。换句话说，接量化不需要模型侧写任何分支。这套加载已经接进 pi0、pi0.5 和 cosmos3 的各个入口。
+
+# 当前支持范围
+
+config 识别侧目前认三种框架：
+
+| 框架 | 来源文件 | 识别标志 |
+| --- | --- | --- |
+| HF 扁平 fp8 | `config.json` 的 `quantization_config` | `quant_method == "fp8"` |
+| compressed-tensors（llm-compressor） | `config.json` 的 `quantization_config` | `quant_method == "compressed-tensors"` |
+| NVIDIA ModelOpt | `hf_quant_config.json` 或内联 | `quant_algo` 字段存在 |
+
+想知道具体怎么配、怎么手写规则，看[配置与使用](/zh/quantization/configuration)。想改物理格式或加新框架，看[内部机制与扩展](/zh/quantization/internals)。

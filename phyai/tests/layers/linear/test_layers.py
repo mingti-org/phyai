@@ -403,6 +403,26 @@ def test_replicated_linear_attaches(fake_mesh):
     assert layer.bias.hf_keys == [("block.fc.bias", None)]
 
 
+def test_replicated_linear_nvfp4_loader_quantizes_bf16_weight(fake_mesh):
+    fake_mesh()
+    _init_default_dispatcher()
+    layer = L.ReplicatedLinear(
+        in_features=16,
+        out_features=8,
+        bias=False,
+        spec=L.Nvfp4Spec(scale_layout="linear"),
+        prefix="block.fc",
+    )
+
+    disk = torch.ones(8, 16, dtype=torch.bfloat16)
+    layer.weight.weight_loader(layer.weight, disk, None)
+    assert layer._nvfp4_pending_weight.shape == disk.shape
+    layer.post_load()
+    assert layer.weight.shape == (8, 8)
+    assert layer.weight.dtype == torch.uint8
+    assert layer._nvfp4_pending_weight is None
+
+
 def test_column_parallel_attaches_tp2_rank1(fake_mesh):
     fake_mesh(sizes={"tp": 2}, ranks={"tp": 1})
     _init_default_dispatcher()
@@ -502,7 +522,16 @@ def test_init_force_env_overrides(fake_mesh, monkeypatch):
         (86, ["bf16"]),  # Ampere A10/A40 — the reported failure
         (89, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Ada
         (90, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Hopper
-        (100, ["bf16", "fp8_per_tensor", "fp8_per_channel", "fp8_block_128_128"]),
+        (
+            100,
+            [
+                "bf16",
+                "fp8_per_tensor",
+                "fp8_per_channel",
+                "fp8_block_128_128",
+                "nvfp4_block_16_128x4",
+            ],
+        ),
     ],
 )
 def test_supported_specs_for_sm(sm, expected):

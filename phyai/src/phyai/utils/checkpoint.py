@@ -4,8 +4,8 @@ A "checkpoint" in phyai follows the same on-disk layout as a
 ``transformers`` snapshot: one folder containing
 
 * ``config.json`` — the model's architecture/geometry,
-* one or more ``*.safetensors`` shards, optionally indexed by
-  ``model.safetensors.index.json``.
+* safetensors shards, optionally indexed by
+  ``model.safetensors.index.json``, or PyTorch weight files.
 
 This module covers the filesystem side of that layout:
 
@@ -14,13 +14,15 @@ This module covers the filesystem side of that layout:
   rather than a path that exists on disk.
 * :func:`find_safetensors` — list the safetensors shards in a folder,
   honouring ``model.safetensors.index.json`` when present.
+* :func:`find_checkpoint_files` — choose one supported weight format from a
+  checkpoint folder, preferring safetensors over PyTorch files.
 * :func:`load_config` — parse ``config.json`` into a
   :class:`~phyai.models.configuration.PretrainedConfig` subclass.
 
 Actually loading tensors into an :class:`nn.Module` is the job of
 :func:`phyai.weights.load_pretrained`, which accepts a checkpoint folder
-directly and reuses :func:`find_safetensors` internally — call sites do
-not need to expand the folder themselves.
+directly and reuses :func:`find_checkpoint_files` internally — call sites
+do not need to expand the folder themselves.
 """
 
 from __future__ import annotations
@@ -40,6 +42,19 @@ T = TypeVar("T", bound="PretrainedConfig")
 _SAFETENSORS_SINGLE = "model.safetensors"
 _SAFETENSORS_INDEX = "model.safetensors.index.json"
 _DEFAULT_CONFIG_FILENAME = "config.json"
+_PYTORCH_SUFFIXES = (".bin", ".pt", ".pth")
+_INFERENCE_EXCLUDED_FILENAMES = frozenset(
+    {
+        "training_args.bin",
+        "optimizer.bin",
+        "optimizer.pt",
+        "optimizer.pth",
+        "scheduler.pt",
+        "scheduler.pth",
+        "scaler.pt",
+        "scaler.pth",
+    }
+)
 
 
 def _ensure_dir(folder: Path) -> Path:
@@ -49,7 +64,7 @@ def _ensure_dir(folder: Path) -> Path:
     if not folder.is_dir():
         raise NotADirectoryError(
             f"expected a checkpoint folder, got a file path: {folder}. "
-            f"Pass the folder containing config.json + safetensors shard(s)."
+            f"Pass the folder containing config.json and model weight files."
         )
     return folder
 
@@ -147,6 +162,35 @@ def find_safetensors(folder: str | Path) -> list[Path]:
     )
 
 
+def find_checkpoint_files(folder: str | Path) -> list[Path]:
+    """Choose model weight files from a checkpoint folder.
+
+    The first available format wins, in this order: safetensors, ``.bin``,
+    ``.pt``, and ``.pth``. PyTorch training-only files are excluded from the
+    directory scan. A safetensors index remains authoritative and raises if a
+    referenced shard is missing rather than silently falling back to another
+    format.
+    """
+    folder = _ensure_dir(folder)
+
+    if (folder / _SAFETENSORS_INDEX).is_file() or any(folder.glob("*.safetensors")):
+        return find_safetensors(folder)
+
+    for suffix in _PYTORCH_SUFFIXES:
+        candidates = [
+            path.resolve()
+            for path in sorted(folder.glob(f"*{suffix}"))
+            if path.is_file() and path.name not in _INFERENCE_EXCLUDED_FILENAMES
+        ]
+        if candidates:
+            return candidates
+
+    raise FileNotFoundError(
+        f"no supported model weight files found in {folder}: expected "
+        "safetensors shards or PyTorch '*.bin', '*.pt', or '*.pth' files."
+    )
+
+
 def load_config(
     folder: str | Path,
     config_cls: type[T],
@@ -174,4 +218,9 @@ def load_config(
     return config_cls.from_json(config_path)
 
 
-__all__ = ["find_safetensors", "load_config", "resolve_checkpoint"]
+__all__ = [
+    "find_checkpoint_files",
+    "find_safetensors",
+    "load_config",
+    "resolve_checkpoint",
+]

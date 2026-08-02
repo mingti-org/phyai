@@ -1,8 +1,8 @@
 """Shared attention enums.
 
 `AttnMode` and `AttnLayout` describe the per-step staging and Q/K/V
-tensor layout. They are shared verbatim across the three attention
-stacks (`attention/`, `ar/`, `diffusion/`) — the per-stack
+tensor layout. They are shared verbatim across the four attention
+stacks (`attention/`, `ar/`, `diffusion/`, `gdn/`) — the per-stack
 `AttnMetadata` / `AttnCtx` reference them directly so a backend can
 key its kernel selection off `mode` / `layout` without coupling to a
 sibling stack.

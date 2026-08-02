@@ -14,8 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.layers.linear.backend import Granularity, KernelProbe
-from phyai.layers.linear.backends.torch import TorchKernel, _expand_block_scale
-from phyai.layers.linear.spec import Bf16Spec, Fp8Spec
+from phyai.layers.linear.backends.torch import (
+    TorchKernel,
+    _expand_block_scale,
+    _unpack_e2m1,
+)
+from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, Nvfp4Spec
 from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import Mode
 
@@ -96,6 +100,12 @@ def test_torch_can_handle_fp8_rejects_unaligned_K():
 def test_torch_can_handle_unknown_spec_rejects():
     k = TorchKernel()
     assert not k.can_handle(_probe("awq"))
+
+
+def test_torch_can_handle_nvfp4_linear_reference():
+    k = TorchKernel()
+    assert k.can_handle(_probe("nvfp4_block_16_linear", sm=0, N=8, K=16))
+    assert not k.can_handle(_probe("nvfp4_block_16_128x4", sm=100, N=128, K=128))
 
 
 def test_torch_supports_capture():
@@ -240,3 +250,47 @@ def test_torch_fp8_block_reference_numeric():
     # Dequant weight = 2.0 everywhere ⇒ y = (2.0 * K) broadcast
     expected = torch.full((4, N), 2.0 * K, dtype=torch.bfloat16)
     torch.testing.assert_close(y, expected, atol=0.5, rtol=0.01)
+
+
+# ---------------------------------------------------------------------------
+# nvfp4 reference path — dequant + F.linear
+# ---------------------------------------------------------------------------
+
+
+def test_unpack_e2m1_values():
+    packed = torch.tensor([[0x21, 0xB7]], dtype=torch.uint8)
+    out = _unpack_e2m1(packed)
+    expected = torch.tensor([[0.5, 1.0, 6.0, -1.5]], dtype=torch.float32)
+    torch.testing.assert_close(out, expected)
+
+
+def test_torch_nvfp4_reference_numeric():
+    N, K = 2, 16
+    spec = Nvfp4Spec(scale_layout="linear")
+    layer = _build_layer(spec, N=N, K=K, device="cpu")
+    # Low nibble then high nibble: both 0x2 encode E2M1 value 1.0.
+    layer.weight.data = torch.full((N, K // 2), 0x22, dtype=torch.uint8)
+    layer.weight_scale.data = torch.ones(N, K // 16, dtype=torch.float8_e4m3fn)
+    layer.weight_global_scale.data.fill_(2.0)
+
+    x = torch.ones(3, K, dtype=torch.bfloat16)
+    y = TorchKernel().apply(layer, x, None)
+    expected = torch.full((3, N), 2.0 * K, dtype=torch.bfloat16)
+    torch.testing.assert_close(y, expected, atol=0.5, rtol=0.01)
+
+
+def test_torch_nvfp4_linear_quantized_random_accuracy():
+    torch.manual_seed(0)
+    N, K = 64, 128
+    spec = Nvfp4Spec(scale_layout="linear")
+    layer = _build_layer(spec, N=N, K=K, device="cpu")
+
+    weight = torch.randn(N, K, dtype=torch.bfloat16)
+    spec.quantize_loaded_weight(layer, weight)
+
+    x = torch.randn(8, K, dtype=torch.bfloat16)
+    y = TorchKernel().apply(layer, x, None)
+    ref = F.linear(x, weight)
+
+    rel_err = (y.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-8)
+    assert rel_err < 0.1, f"NVFP4 linear-layout rel_err={rel_err.item():.4f}"

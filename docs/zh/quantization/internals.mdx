@@ -1,0 +1,138 @@
+---
+title: "内部机制与扩展"
+description: "量化的数据模型、物理 spec 的细节，以及怎么加一种新框架或新精度。"
+icon: "screwdriver-wrench"
+---
+
+这一页面向要改量化系统本身的人：语义 IR 长什么样、物理 spec 各自怎么分配和加载、前向怎么按 spec 选 kernel，以及扩展的两个入口。
+
+# 语义 IR：QuantScheme
+
+`QuantScheme`（`layers/quant/scheme.py`）是纯语义，不带任何 scale 布局、kernel 或设备决策。一层的量化决定就是一个 `QuantScheme`：
+
+```python
+@dataclass(frozen=True)
+class QuantScheme:
+    weight: TensorQuant
+    input: TensorQuant | None = None   # None = weight-only（如 W4A16）
+    online: bool = False
+```
+
+权重和激活用同一个 `TensorQuant` 描述，所以 `input=None` 干净地表示"只量化权重"。`TensorQuant` 的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `dtype` | `QDType` 枚举：`FP8_E4M3` / `NVFP4` / `INT8` / `INT4` / `BF16`（哨兵，表示不量化）等 |
+| `granularity` | scale 粒度：`PER_TENSOR` / `PER_CHANNEL` / `BLOCK` |
+| `symmetric` | 对称量化 |
+| `dynamic` | 只对激活有意义，`True` 表示 scale 在运行时算 |
+| `micro_scaled` | 标记块内微缩放格式（NVFP4/MXFP4：块内低精度 scale + 外层全局 scale） |
+| `block_shape` | block 粒度权重的块形状 |
+
+这一层刻意什么都不决定，就是为了让 config 解析先落地。importer 只要拼出 `QuantScheme`，不用管目标硬件有没有对应 kernel。
+
+# 从语义到物理：materialize
+
+`materialize(scheme, sm)`（`layers/quant/materialize.py`）把语义降成物理 `WeightSpec`，也是唯一读硬件信息的地方：
+
+```python
+def materialize(scheme: QuantScheme, sm: int) -> object:
+    w = scheme.weight
+    if w.dtype is QDType.BF16:
+        return Bf16Spec()
+    if w.dtype is QDType.FP8_E4M3:
+        return Fp8Spec(granularity=w.granularity, block_shape=w.block_shape)
+    if w.dtype is QDType.NVFP4:
+        layout = "128x4" if sm >= 100 else "linear"
+        return Nvfp4Spec(scale_layout=layout)
+    raise NotImplementedError(f"materialize: unsupported weight dtype {w.dtype!r}")
+```
+
+# 物理层：WeightSpec
+
+`WeightSpec`（`layers/quant/base.py`）是个 Protocol，和具体 op（linear、embedding、MoE）无关。它只认 `AllocationRequest`，一个"在哪、多大"的数据包，由层按自己的 shape 约定填好递进来：
+
+```python
+class WeightSpec(Protocol):
+    spec_id: str
+    weight_dtype: torch.dtype
+    def allocate(self, layer, request: AllocationRequest) -> None: ...
+    def process_after_loading(self, layer) -> None: ...
+```
+
+`spec` 在 `layer` 上注册 `weight` 和需要的 scale 参数，但不写 `input_size_per_partition` 这种 op 专属的字段——那是层的活。三个具体 spec：
+
+### Bf16Spec
+
+最简单的一个：分配一个 `nn.Parameter`，没有 scale。它不带 `granularity` 也不带 `needs_act_quant`，因为 bf16 不是量化格式。`weight_dtype` 只是提示，真正的 dtype 来自 `request.params_dtype`，所以想要 fp16 不用新写一个 spec。
+
+### Fp8Spec
+
+权重是 `torch.float8_e4m3fn`，scale 粒度三选一：
+
+- `PER_TENSOR`：每个逻辑矩阵一个标量 + 一个静态激活 scale。加载后 `process_after_loading` 把它铺成 per-channel，让 kernel 看到统一的 scale 布局。
+- `PER_CHANNEL`：每个输出行一个权重 scale；激活按 token（rowwise）在运行时量化。
+- `BLOCK`：权重 scale 是 `(out // block_n, in // block_k)`；激活按 block-K 粒度的 per-token 量化。
+
+它同时满足 `LinearActivationQuant`（`layers/quant/linear.py`），通过 `quantize_activation` 在 matmul 前把激活量化成 `ActivationView`。`needs_act_quant=True`，kernel 用 `isinstance(spec, LinearActivationQuant)` 判断要不要走这条路。
+
+### Nvfp4Spec
+
+NVFP4 一个字节存两个 E2M1 值，所以逻辑上的 `(N, K)` 权重实际存成 `(N, K // 2)`；每 16 个值沿 K 方向共享一个 FP8-E4M3 的块 scale，外加一个 fp32 全局 scale。两种 scale 布局：
+
+| 布局 | 形状 | 用途 |
+| --- | --- | --- |
+| `linear` | `(N, K // 16)` | 参考实现、CPU 小测试 |
+| `128x4` | 补齐到 `(ceil(N,128), ceil(K//16,4))` | Blackwell GEMM |
+
+它比另外两个 spec 多做一件事：从高精度 checkpoint 现场量化。`load_weight` 发现进来的是 bf16/fp16/fp32 权重时，先存进 `_nvfp4_pending_weight`；`process_after_loading` 再调 `quantize_loaded_weight` 打包。`128x4` 布局的量化走 FlashInfer 的 `nvfp4_quantize`，需要 CUDA。
+
+# 前向：spec_id 决定 kernel
+
+层不自己写 fp8 / cutlass / marlin 的分支。`LinearBase.forward` 把 `spec.spec_id` 交给 dispatcher，由它选 kernel：
+
+```python
+kernel = get_linear_dispatcher().select(
+    spec_id=self.spec.spec_id,
+    M=_M_of(x), N=self.out_features, K=self.in_features,
+    in_dtype=x.dtype, out_dtype=self.params_dtype,
+)
+```
+
+dispatcher（`layers/linear/dispatch.py`）的缓存 key 是 `(spec_id, M_bucket, N, K, in_dtype, out_dtype, sm, mode)`，所以 decode（M 小）和 prefill（M 大）能落到不同 kernel。各 spec 的 `spec_id`：
+
+| spec | spec_id 示例 |
+| --- | --- |
+| `Bf16Spec` | `bf16` |
+| `Fp8Spec` | `fp8_per_channel` · `fp8_per_tensor` · `fp8_block_128_128` |
+| `Nvfp4Spec` | `nvfp4_block_16_128x4` · `nvfp4_block_16_linear` |
+
+# 扩展
+
+系统留了两个扩展入口，对应不同的改动。
+
+<Steps>
+  <Step title="加一种新框架：写一个 importer">
+    实现 `detect` 和 `build_plan`（`layers/quant/importers/base.py` 的 `QuantImporter` Protocol），把它加进 `registry.py` 的 `DEFAULT_IMPORTERS`：
+
+    ```python
+    class MyImporter:
+        name = "my-framework"
+
+        def detect(self, src: ConfigSources) -> bool:
+            cfg = src.hf_quant_config
+            return bool(cfg) and cfg.get("quant_method") == "my-framework"
+
+        def build_plan(self, src: ConfigSources) -> QuantPlan:
+            ...  # 把 config 翻成 Rule + QuantScheme
+            return QuantPlan(rules=(...), default=...)
+    ```
+
+    只碰 config 解析，语义层和物理层都不用动。
+  </Step>
+  <Step title="加一种新精度：写一个 spec + 接 materialize">
+    先在 `QDType` 里加类型（多半已经有了），然后实现一个满足 `WeightSpec` 的 spec：`allocate` 分配权重和 scale，`spec_id` 给出唯一标识，需要的话实现 `process_after_loading` 和激活量化钩子。再在 `materialize` 里把对应的 `QDType` 接到这个 spec，最后为它的 `spec_id` 注册一个 `LinearKernel`。
+  </Step>
+</Steps>
+
+两个入口互不牵连：加框架不需要碰 kernel，加精度不需要碰 config 解析。

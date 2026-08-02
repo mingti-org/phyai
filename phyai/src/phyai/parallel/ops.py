@@ -31,6 +31,38 @@ def _name(m: "str | Mesh") -> str:
     return m if isinstance(m, str) else m.name
 
 
+# ``ReduceOp`` cannot cross the ``torch.library.custom_op`` boundary (only plain
+# ints / tensors / strings are allowed), so the user-facing wrappers serialize it
+# to ``int(op)`` and the custom-op body reconstructs it here. On torch 2.11
+# ``dist.ReduceOp(some_int)`` raises ``TypeError`` (the constructor only accepts a
+# ``RedOpType`` enum, not an int), and a freshly built ``ReduceOp`` does not hash-
+# equal the canonical ``ReduceOp.SUM`` members that the pynccl backend's lookup
+# table is keyed on. Resolving through the canonical members keyed by their int
+# value sidesteps both problems: the returned object IS the singleton member, so
+# it works for ``dist.all_reduce(op=...)`` and for pynccl's identity dict lookup.
+_REDUCE_OP_BY_INT: dict[int, dist.ReduceOp] = {
+    int(member): member
+    for member in (
+        dist.ReduceOp.SUM,
+        dist.ReduceOp.PRODUCT,
+        dist.ReduceOp.MIN,
+        dist.ReduceOp.MAX,
+        dist.ReduceOp.AVG,
+    )
+}
+
+
+def _reduce_op_from_int(reduce_op: int) -> dist.ReduceOp:
+    """Resolve a serialized ``int(op)`` back to its canonical ``ReduceOp`` member."""
+    try:
+        return _REDUCE_OP_BY_INT[reduce_op]
+    except KeyError as e:
+        raise ValueError(
+            f"unsupported ReduceOp code {reduce_op!r}; expected one of "
+            f"{sorted(_REDUCE_OP_BY_INT)}."
+        ) from e
+
+
 def _execute(
     *,
     op: Op,
@@ -88,7 +120,7 @@ def _all_reduce_op(
         tensor=x,
         output=output,
         extra_key=(reduce_op,),
-        reduce_op=dist.ReduceOp(reduce_op),
+        reduce_op=_reduce_op_from_int(reduce_op),
     )
 
 
@@ -192,7 +224,7 @@ def _reduce_scatter_op(
         output=output,
         extra_key=(dim, reduce_op),
         dim=dim,
-        reduce_op=dist.ReduceOp(reduce_op),
+        reduce_op=_reduce_op_from_int(reduce_op),
     )
 
 

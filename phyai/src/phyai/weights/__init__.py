@@ -14,15 +14,20 @@ Every parameter-bearing layer attaches two attributes to its
   loader does not raise when the HF source is absent. Used for quant
   scales that are only present in quantised checkpoints.
 
-The whole loader chain is :func:`load_pretrained` — open every
-safetensors file, walk keys, dispatch via the per-param loader, and
-finally walk modules calling ``post_load(self)`` for any spec-driven
+The whole loader chain is :func:`load_pretrained` — select safetensors or
+PyTorch checkpoint files, walk their keys, dispatch via the per-param loader,
+and finally walk modules calling ``post_load(self)`` for any spec-driven
 fixups (fp8 scale fanning, etc.).
 """
 
 from __future__ import annotations
 
-from phyai.weights.loader import LoadReport, load_pretrained
+from phyai.weights.loader import (
+    LoadReport,
+    checkpoint_format,
+    iter_checkpoint_tensors,
+    load_pretrained,
+)
 from phyai.weights.shards import (
     WeightLoader,
     _Leg,
@@ -37,7 +42,9 @@ __all__ = [
     "LoadReport",
     "WeightLoader",
     "_Leg",
+    "checkpoint_format",
     "fused",
+    "iter_checkpoint_tensors",
     "load_pretrained",
     "replicated",
     "sharded",

@@ -1,0 +1,275 @@
+---
+title: "多卡运行 Cosmos3 Policy"
+description: "scheduler_wn_cosmos3_policy 使用指南"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano-Policy-DROID"
+  icon="C"
+  rows={{
+    "模型类型": "Action / Policy",
+    "权重": <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID</a>,
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3PolicyWNScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3_policy_wn</code>,
+    "源码": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">scheduler_wn_cosmos3_policy.py</code>,
+    "并行轴": ["tp", "cfg"],
+    "支持模式": ["policy", "forward_dynamics", "inverse_dynamics"],
+    "采样器": "UniPC",
+  }}
+/>
+
+# 概述
+
+Cosmos3-Nano-Policy-DROID 是 Cosmos3 系列里的 policy model。Cosmos3 本身是面向 Physical AI 的 omnimodal world model；policy 版本接收语言指令和 DROID 机器人平台的视觉 observation，生成用于 manipulation 和 control 的 robot action trajectory。
+
+本页讲的是 Cosmos3 policy 的多卡路径，也就是 `cosmos3_policy_wn` plugin。它覆盖 `policy`、`forward_dynamics` 和 `inverse_dynamics` 三种 mode：视频 latent 和 action latent 在同一个 denoise loop 里推进，最终返回 action；如果开启 `decode_video=True`，还会返回 rollout video。
+
+PhyAI 目前在这条路径上支持两类并行：policy transformer 沿 `tp` 轴做 tensor parallel；当 `cfg=2` 且 `guidance_scale > 1` 时，cond / uncond 两个 CFG branch 会被分到两个 TP group 上并行运行。rollout video 的 VAE decode 也会按 rank 做空间 tile 切分，并用 halo overlap 合并边界。
+
+# Mode 与输出
+
+三种 mode 的 clean / noisy 规则如下：
+
+| Mode | Clean video | Clean action | 生成目标 |
+| --- | --- | --- | --- |
+| `policy` | 默认第 0 个 latent frame，或 `cond_frame_indexes` 指定的帧 | 无 | action chunk，可选 rollout video |
+| `forward_dynamics` | 默认第 0 个 latent frame，或 `cond_frame_indexes` 指定的帧 | `cond_action` 全部动作步 | rollout video |
+| `inverse_dynamics` | 默认所有 video latent frame，或 `cond_frame_indexes` 指定的帧 | 无 | 解释 observation transition 的 action chunk |
+
+输出始终包含 action。`decode_video=True` 时，plugin 会额外返回 video latent 和 decoded pixels。
+
+| Key | Shape / 类型 | 说明 |
+| --- | --- | --- |
+| `action` | `[B, action_chunk, raw_action_dim]` | padding tail 已经裁掉 |
+| `video` | `[B, C, t_lat, h_lat, w_lat]` | rollout / denoised video latent |
+| `pixels` | `[B, 3, T, H, W]`，可选 | `decode_video=True` 且 checkpoint 有 VAE 时返回 |
+
+Cosmos3 policy 内部 action 宽度默认是 `action_dim=64`。真实机器人动作宽度由 `raw_action_dim` 决定，scheduler 会在输出前裁掉 padding tail。
+
+# 并行拓扑
+
+下面用 `TP=4`、`CFG=2`、`world_size=8` 作为例子。rank 0-3 是 cond branch 的一个 TP group，rank 4-7 是 uncond branch 的另一个 TP group。每个 denoise step 里，同一 branch 的 4 个 TP rank 会一起跑 transformer forward，不是流水顺序。
+
+![Cosmos3 WN TP=4 CFG=2 的 8 卡并行拓扑](/images/models/cosmos/tp4-cfg2-topology.svg)
+
+`P.all_gather(axis="cfg")` 使用 engine 初始化时创建的 parallel mesh。`ParallelConfig(world_size=cfg_size * tp_size, cfg_size=cfg_size, tp_size=tp_size)` 会把 rank 映射成 `(cfg_rank, tp_rank)`；沿 `cfg` 轴 gather 时，只收集相同 `tp_rank`、不同 `cfg_rank` 的 rank。这样每个 TP 分片都能拿到 cond / uncond velocity，再在本地完成 CFG combine。
+
+VAE 的 8 卡切分示意如下，`cfg` 作为 outer axis，`tp` 作为 inner axis：
+
+![Cosmos3 WAN VAE 8 卡空间切分示意](/images/models/cosmos/vae8-tile-split.svg)
+
+# 运行路径
+
+<Steps>
+  <Step title="准备权重和输入">
+    准备一份 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a> checkpoint。如果需要输出 rollout video，checkpoint 里还需要 `vae/`。
+
+    ```text
+    /path/to/Cosmos3-Nano-Policy-DROID/
+      transformer/
+      text_tokenizer/
+      scheduler/
+      vae/             # decode_video=True 时需要
+    ```
+
+    `policy` 和 `inverse_dynamics` 可以输入 observation image 或 video；`forward_dynamics` 还需要 action JSON。
+  </Step>
+
+  <Step title="构造多卡 Policy Engine">
+    插件名是 `"cosmos3_policy_wn"`。`torchrun --nproc_per_node` 必须等于 `cfg_size * tp_size`。
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import (
+        DeviceConfig,
+        EngineConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
+    from phyai.models.cosmos3.main_cosmos3_policy_wn import Cosmos3PolicyWNArgs
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+    local_rank = 0
+    cfg_size = 1
+    tp_size = 4
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_policy_wn",
+            plugin_args=Cosmos3PolicyWNArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=None,
+                decode_video=True,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(
+                    target=f"cuda:{local_rank}",
+                    params_dtype=torch.bfloat16,
+                ),
+                parallel=ParallelConfig(
+                    world_size=cfg_size * tp_size,
+                    cfg_size=cfg_size,
+                    tp_size=tp_size,
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+  </Step>
+
+  <Step title="构造输入处理器">
+    `Cosmos3PolicyProcessor` 负责 observation resize/pad、prompt tokenization、domain id、action padding 和输出后处理。
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device=f"cuda:{local_rank}",
+        params_dtype=torch.bfloat16,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    ```
+  </Step>
+
+  <Step title="构造 Request">
+    `Cosmos3ActionRequest` 不包含并行信息。并行拓扑来自 engine config；request 只描述这次 policy 请求。
+
+    ```python
+    from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+
+    device = f"cuda:{local_rank}"
+    dtype = torch.bfloat16
+
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to(device),
+        text_mask=processed.text_mask.to(device),
+        neg_text_ids=processed.neg_text_ids.to(device),
+        neg_text_mask=processed.neg_text_mask.to(device),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
+        cond_action=(
+            processed.cond_action.to(device=device, dtype=dtype)
+            if processed.cond_action is not None
+            else None
+        ),
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+    ```
+  </Step>
+
+  <Step title="所有 rank 同时运行">
+    每个 rank 都必须调用 `engine.step(request)`。scheduler 内部会在 `tp` 和 `cfg` 轴上触发 collective，不能只让 rank 0 运行。
+
+    ```python
+    result = engine.step(request)
+    ```
+  </Step>
+
+  <Step title="只在 rank 0 保存结果">
+    示例脚本只让 rank 0 做 postprocess、action JSON 和 mp4 写入，避免多个进程写同一个文件。
+
+    ```python
+    if local_rank == 0:
+        output = processor.postprocess(result)
+        action = output["action"]
+        pixels = output.get("pixels")
+    ```
+  </Step>
+</Steps>
+
+# 运行示例
+
+TP-only 的 4 卡 policy 推理：
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_policy_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --out .cache/cosmos3_policy_wn
+```
+
+CFG parallel + TP 的 8 卡 policy 推理：
+
+```bash
+torchrun --nproc_per_node=8 examples/cosmos3/run_cosmos3_policy_wn.py \
+    --cfg 2 \
+    --tp 4 \
+    --guidance-scale 4.0 \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --out .cache/cosmos3_policy_wn
+```
+
+Forward dynamics 需要传入 action 文件：
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_policy_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot pushes the object forward" \
+    --domain-name droid_lerobot \
+    --mode forward_dynamics \
+    --action-file action.json \
+    --out .cache/cosmos3_forward_wn
+```
+
+Inverse dynamics 通常传 observation video，并指定 clean latent frame：
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_policy_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --video obs.mp4 \
+    --prompt "robot moves the cup to the right" \
+    --domain-name droid_lerobot \
+    --mode inverse_dynamics \
+    --condition-frames 0,1 \
+    --out .cache/cosmos3_inverse_wn
+```
+
+`--nproc_per_node` 必须等于 `--cfg * --tp`。Policy 示例默认 `guidance_scale=1.0`，这时 `cfg=2` 没有收益；只有把 `--guidance-scale` 设到大于 1，CFG parallel 才有意义。
+
+# 实现注意
+
+- `decode_video=True` 需要 checkpoint 里有 `vae/`；否则只能返回 action 和 video latent。
+- `forward_dynamics` 必须提供 `cond_action`，processor 会负责把原始 action pad 到 `action_dim`。
+- 这条路径仍然是一次处理一个 request 的示例/基线路径，不是 continuous batching scheduler。

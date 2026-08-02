@@ -11,6 +11,7 @@ dependencies = [
     "safetensors",
     "torchvision",
     "flashinfer-python==v0.6.12",
+    "flash-linear-attention>=0.5.1",
     "transformers==5.8.1",
     "huggingface-hub",
     "tqdm",

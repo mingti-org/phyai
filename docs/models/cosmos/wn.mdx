@@ -1,0 +1,235 @@
+---
+title: "Multi-GPU Cosmos3 Generation Mode"
+description: "Guide to scheduler_wn_cosmos3"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano / Cosmos3-Super"
+  icon="C"
+  rows={{
+    "Model Type": "World Foundation Model",
+    "Weights": <div className="flex flex-col gap-1.5"><a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano</a><a href="https://huggingface.co/nvidia/Cosmos3-Super" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Super</a></div>,
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3T2VWNScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3_wn</code>,
+    "Source": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">scheduler_wn_cosmos3.py</code>,
+    "Parallel Axes": ["tp", "cfg"],
+    "Supported Paths": ["T2V", "I2V", "T2AV", "I2AV"],
+    "Sampler": "UniPC",
+  }}
+/>
+
+# Overview
+
+Cosmos3 is an omnimodal world model for Physical AI. It can generate video, image, audio, action, and related outputs from combinations of text, image, video, audio, and action-trajectory inputs, making it useful for world generation, future prediction, action reasoning, and embodied policy learning.
+
+This page covers the multi-GPU Cosmos3 generation path, exposed through the `cosmos3_wn` plugin. It supports T2V/I2V/T2AV/I2AV: video latent and optional sound latent advance through the same denoising loop, then VAE / AVAE decode them into media that can be saved.
+
+PhyAI currently supports two kinds of parallelism in this path. Transformer forward runs with tensor parallelism on the `tp` axis. When `cfg=2` and `guidance_scale > 1`, the cond and uncond CFG branches run in parallel on two TP groups. Video VAE decode is also split into spatial tiles across ranks, with halo overlap used to stitch tile boundaries.
+
+# Parallel topology
+
+The example below uses `TP=4`, `CFG=2`, and `world_size=8`. The eight GPUs are split into two CFG groups: rank 0-3 form the TP group for the cond branch, and rank 4-7 form the TP group for the uncond branch. Before each denoising step finishes, the two branch velocities are all-gathered along the `cfg` axis, and each rank applies CFG combine locally.
+
+![Cosmos3 WN TP=4 CFG=2 eight-GPU parallel topology](/images/models/cosmos/tp4-cfg2-topology.svg)
+
+`cfg=2` only helps when `guidance_scale > 1`. Otherwise, the scheduler prints a warning: the uncond branch still receives ranks and does work, but CFG is effectively off. Cosmos3 has exactly two CFG branches, cond and uncond, so the example script restricts `--cfg` to `1` or `2`.
+
+# Decode and output
+
+`Cosmos3T2VWNScheduler.step()` only generates latent output. After the scheduler returns, `Cosmos3WNEntry.step()` calls decode:
+
+| Request type | Scheduler output | Entry output |
+| --- | --- | --- |
+| T2V/I2V | `video` latent, shape `[1, C, t, h, w]` | pixels, shape `[B, 3, T, H, W]`, range `[0, 1]` |
+| T2AV/I2AV | `{"video": video_latent, "sound": sound_latent}` | `{"video": pixels, "sound": waveform, "sample_rate": int}` |
+
+Video decode uses `Cosmos3VAERunner.decode()`. When the parallel world is larger than 1, the runner uses WAN VAE parallel decode: it assigns spatial tiles to ranks, decodes each tile with halo overlap, then blends and stitches the final image. Audio decode uses `Cosmos3SoundVAERunner.decode()`.
+
+The VAE eight-GPU split is shown below, with `cfg` as the outer axis and `tp` as the inner axis:
+
+![Cosmos3 WAN VAE eight-GPU spatial split](/images/models/cosmos/vae8-tile-split.svg)
+
+# Run path
+
+<Steps>
+  <Step title="Prepare weights and topology">
+    Prepare a <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer">Cosmos3-Nano</a> or <a href="https://huggingface.co/nvidia/Cosmos3-Super" target="_blank" rel="noreferrer">Cosmos3-Super</a> checkpoint. The WN path still needs the transformer, VAE, and text tokenizer. T2AV also needs `sound_tokenizer`.
+
+    ```text
+    /path/to/Cosmos3-Nano/
+      transformer/
+      vae/
+      text_tokenizer/
+      sound_tokenizer/   # required for T2AV
+      scheduler/
+    ```
+
+    The multi-GPU topology is determined by `cfg_size * tp_size`. At launch time, `torchrun --nproc_per_node` must match that product.
+  </Step>
+
+  <Step title="Construct the multi-GPU engine">
+    The plugin name is `"cosmos3_wn"`. Set `world_size`, `cfg_size`, and `tp_size` explicitly in `ParallelConfig`. During engine initialization, PhyAI creates the mesh first, then lets transformer parallel layers shard along the `tp` axis.
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import (
+        DeviceConfig,
+        EngineConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
+    from phyai.models.cosmos3.main_cosmos3_wn import Cosmos3WNArgs
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano"
+    local_rank = 0
+    cfg_size = 1
+    tp_size = 4
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_wn",
+            plugin_args=Cosmos3WNArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=False,
+                load_sound=None,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(
+                    target=f"cuda:{local_rank}",
+                    params_dtype=torch.bfloat16,
+                ),
+                parallel=ParallelConfig(
+                    world_size=cfg_size * tp_size,
+                    cfg_size=cfg_size,
+                    tp_size=tp_size,
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    The example script reads `local_rank` from `LOCAL_RANK` and checks that `WORLD_SIZE == cfg_size * tp_size`.
+  </Step>
+
+  <Step title="Tokenize the prompt">
+    The scheduler does not run the tokenizer. As in the single-GPU generation path, both positive and negative prompts are converted to tensors by `Cosmos3Processor`.
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=24.0,
+        num_frames=189,
+        height=720,
+        width=1280,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=f"cuda:{local_rank}",
+    )
+    ```
+  </Step>
+
+  <Step title="Build the request">
+    `Cosmos3T2VRequest` does not carry parallel topology. Parallelism belongs to the engine config; the request only describes the text condition, latent grid, sampling parameters, and optional audio length for this generation.
+
+    ```python
+    import math
+
+    from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+
+    num_frames = 189
+    height = 720
+    width = 1280
+    fps = 24.0
+    with_sound = False
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+    ```
+  </Step>
+
+  <Step title="Run all ranks together">
+    Every rank must call `engine.step(request)`. The scheduler triggers collectives on the `tp` and `cfg` axes, so rank 0 cannot run alone.
+
+    ```python
+    result = engine.step(request)
+    ```
+
+    T2V/I2V returns pixels. T2AV/I2AV returns `{"video", "sound", "sample_rate"}`. The results are identical on all ranks.
+  </Step>
+
+  <Step title="Save media only on rank 0">
+    The WN example only lets rank 0 postprocess and write mp4 output, so multiple processes do not write the same file.
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3GenerationPostProcessor
+
+    if local_rank == 0:
+        postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+        media = postprocessor.postprocess(result)
+        postprocessor.save_mp4(media, ".cache/cosmos3_t2v_wn.mp4")
+    ```
+  </Step>
+</Steps>
+
+# Run examples
+
+TP-only four-GPU T2V:
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --out .cache/cosmos3_t2v_wn
+```
+
+Eight-GPU T2V with CFG parallel + TP:
+
+```bash
+torchrun --nproc_per_node=8 examples/cosmos3/run_cosmos3_wn.py \
+    --cfg 2 \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --guidance-scale 6.0 \
+    --out .cache/cosmos3_t2v_wn
+```
+
+T2AV with audio:
+
+```bash
+torchrun --nproc_per_node=4 examples/cosmos3/run_cosmos3_wn.py \
+    --tp 4 \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "ocean waves crashing on rocks" \
+    --sound \
+    --out .cache/cosmos3_t2av_wn
+```
+
+`--nproc_per_node` must equal `--cfg * --tp`. Cosmos3-Nano has 32 attention heads and 8 KV heads, so the example script recommends `--tp` values of `1`, `2`, `4`, or `8`.
+
+# Implementation notes
+
+- This path is still a single-request example / baseline path. It is not a continuous batching scheduler.

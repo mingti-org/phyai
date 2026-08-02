@@ -1,0 +1,140 @@
+---
+title: "Internals and extension"
+description: "The quantization data model, the details of each physical spec, and how to add a new framework or a new precision."
+icon: "screwdriver-wrench"
+---
+
+This page is for people changing the quantization system itself: what the semantic IR looks like, how each physical spec allocates and loads, how the forward pass picks a kernel by spec, and the two extension points.
+
+# The semantic IR: QuantScheme
+
+`QuantScheme` (`layers/quant/scheme.py`) is pure semantics. It carries no scale layout, kernel, or device decision. A layer's quantization decision is exactly one `QuantScheme`:
+
+```python
+@dataclass(frozen=True)
+class QuantScheme:
+    weight: TensorQuant
+    input: TensorQuant | None = None   # None = weight-only (e.g. W4A16)
+    online: bool = False
+```
+
+Weight and activation are described by the same `TensorQuant`, so `input=None` cleanly means weight-only. The fields of `TensorQuant`:
+
+| Field | Meaning |
+| --- | --- |
+| `dtype` | the `QDType` enum: `FP8_E4M3` / `NVFP4` / `INT8` / `INT4` / `BF16` (a sentinel for "not quantized") and more |
+| `granularity` | scale granularity: `PER_TENSOR` / `PER_CHANNEL` / `BLOCK` |
+| `symmetric` | symmetric quantization |
+| `dynamic` | meaningful only for activations; `True` means the scale is computed at runtime |
+| `micro_scaled` | marks block-microscaled formats (NVFP4/MXFP4: an in-block low-precision scale plus an outer global scale) |
+| `block_shape` | the block shape for block-granularity weights |
+
+This layer decides nothing on purpose, so that config parsing can land first. An importer only has to build a `QuantScheme`; it does not care whether the target hardware has a matching kernel.
+
+# From semantics to physical: materialize
+
+`materialize(scheme, sm)` (`layers/quant/materialize.py`) lowers semantics into a physical `WeightSpec`, and it is the only place that reads hardware information:
+
+```python
+def materialize(scheme: QuantScheme, sm: int) -> object:
+    w = scheme.weight
+    if w.dtype is QDType.BF16:
+        return Bf16Spec()
+    if w.dtype is QDType.FP8_E4M3:
+        return Fp8Spec(granularity=w.granularity, block_shape=w.block_shape)
+    if w.dtype is QDType.NVFP4:
+        layout = "128x4" if sm >= 100 else "linear"
+        return Nvfp4Spec(scale_layout=layout)
+    raise NotImplementedError(f"materialize: unsupported weight dtype {w.dtype!r}")
+```
+
+NVFP4's scale layout is chosen here by SM version: `sm >= 100` (Blackwell) uses the `128x4` layout that FlashInfer wants, otherwise the reference `linear` layout. Types defined in `QDType` but not wired here (int8 / int4 / mxfp4 / fp8_e5m2) raise `NotImplementedError`.
+
+# The physical layer: WeightSpec
+
+`WeightSpec` (`layers/quant/base.py`) is a Protocol, independent of the op (linear, embedding, MoE). It only sees an `AllocationRequest`, a "where and how big" packet the layer fills from its own shape conventions and hands over:
+
+```python
+class WeightSpec(Protocol):
+    spec_id: str
+    weight_dtype: torch.dtype
+    def allocate(self, layer, request: AllocationRequest) -> None: ...
+    def process_after_loading(self, layer) -> None: ...
+```
+
+A `spec` registers `weight` and any scale parameters on the `layer`, but does not write op-specific fields like `input_size_per_partition`; that is the layer's job. The three concrete specs:
+
+### Bf16Spec
+
+The simplest one: it allocates a single `nn.Parameter` and no scale. It carries neither `granularity` nor `needs_act_quant`, because bf16 is not a quant format. `weight_dtype` is only a hint; the real dtype comes from `request.params_dtype`, so fp16 needs no new spec.
+
+### Fp8Spec
+
+The weight is `torch.float8_e4m3fn`, with one of three scale granularities:
+
+- `PER_TENSOR`: one scalar per logical matrix plus one static activation scale. After loading, `process_after_loading` fans it out to per-channel so kernels see a uniform scale layout.
+- `PER_CHANNEL`: one weight scale per output row; the activation is quantized per token (rowwise) at runtime.
+- `BLOCK`: the weight scale is `(out // block_n, in // block_k)`; the activation is quantized per token at block-K granularity.
+
+It also satisfies `LinearActivationQuant` (`layers/quant/linear.py`), quantizing the activation into an `ActivationView` through `quantize_activation` before the matmul. With `needs_act_quant=True`, a kernel uses `isinstance(spec, LinearActivationQuant)` to decide whether to take this path.
+
+### Nvfp4Spec
+
+NVFP4 packs two E2M1 values per byte, so the logical `(N, K)` weight is stored as `(N, K // 2)`; every 16 values along K share one FP8-E4M3 block scale, plus one fp32 global scale. Two scale layouts:
+
+| Layout | Shape | Use |
+| --- | --- | --- |
+| `linear` | `(N, K // 16)` | reference path, small CPU tests |
+| `128x4` | padded to `(ceil(N,128), ceil(K//16,4))` | Blackwell GEMM |
+
+It does one thing the other two specs do not: quantize from a high-precision checkpoint on the fly. When `load_weight` sees an incoming bf16/fp16/fp32 weight, it stashes it in `_nvfp4_pending_weight`; `process_after_loading` then calls `quantize_loaded_weight` to pack it. The `128x4` layout quantizes through FlashInfer's `nvfp4_quantize`, which needs CUDA.
+
+# The forward pass: spec_id picks the kernel
+
+Layers do not write fp8 / cutlass / marlin branches themselves. `LinearBase.forward` hands `spec.spec_id` to the dispatcher, which picks a kernel:
+
+```python
+kernel = get_linear_dispatcher().select(
+    spec_id=self.spec.spec_id,
+    M=_M_of(x), N=self.out_features, K=self.in_features,
+    in_dtype=x.dtype, out_dtype=self.params_dtype,
+)
+```
+
+The dispatcher (`layers/linear/dispatch.py`) keys its cache on `(spec_id, M_bucket, N, K, in_dtype, out_dtype, sm, mode)`, so decode (small M) and prefill (large M) can land on different kernels. Each spec's `spec_id`:
+
+| spec | example spec_id |
+| --- | --- |
+| `Bf16Spec` | `bf16` |
+| `Fp8Spec` | `fp8_per_channel` · `fp8_per_tensor` · `fp8_block_128_128` |
+| `Nvfp4Spec` | `nvfp4_block_16_128x4` · `nvfp4_block_16_linear` |
+
+# Extension
+
+The system leaves two extension points, one per kind of change.
+
+<Steps>
+  <Step title="Add a framework: write an importer">
+    Implement `detect` and `build_plan` (the `QuantImporter` Protocol in `layers/quant/importers/base.py`), then add it to `DEFAULT_IMPORTERS` in `registry.py`:
+
+    ```python
+    class MyImporter:
+        name = "my-framework"
+
+        def detect(self, src: ConfigSources) -> bool:
+            cfg = src.hf_quant_config
+            return bool(cfg) and cfg.get("quant_method") == "my-framework"
+
+        def build_plan(self, src: ConfigSources) -> QuantPlan:
+            ...  # translate the config into Rule + QuantScheme
+            return QuantPlan(rules=(...), default=...)
+    ```
+
+    This touches config parsing only; the semantic and physical layers stay untouched.
+  </Step>
+  <Step title="Add a precision: write a spec and wire materialize">
+    First add the type to `QDType` (it is probably already there), then implement a spec satisfying `WeightSpec`: `allocate` for the weight and scales, `spec_id` for a unique id, and `process_after_loading` plus the activation-quant hook if needed. Then wire the matching `QDType` to that spec in `materialize`, and finally register a `LinearKernel` for its `spec_id`.
+  </Step>
+</Steps>
+
+The two points stay independent: adding a framework needs no kernel work, and adding a precision needs no config parsing.

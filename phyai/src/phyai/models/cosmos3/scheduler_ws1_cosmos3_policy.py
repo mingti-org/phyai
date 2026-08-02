@@ -121,11 +121,17 @@ class Cosmos3PolicyScheduler(Scheduler):
     ) -> dict[str, torch.Tensor]:
         """Joint video+action denoising for the three action modes.
 
-        Returns ``{"action": [1, chunk, raw_action_dim], "video": [1, C, t, h, w]}``
+        Returns ``{"action": [B, chunk, raw_action_dim], "video": [B, C, t, h, w]}``
         (video = rollout latents). When ``decode_video`` and a VAE is present, also adds
-        ``"pixels": [1, 3, T, H, W]`` in ``[0, 1]``. Video and action share the timestep;
+        ``"pixels": [B, 3, T, H, W]`` in ``[0, 1]``. Video and action share the timestep;
         each is stepped by its own UniPC solver and its clean frames are re-imposed every
         step.
+
+        Batch ``B`` is read from ``request.text_ids.shape[0]`` and applies to every
+        per-sample tensor (``cond_video_latents`` / ``cond_action`` / the text pairs);
+        the prompt, observation grid, embodiment ``domain_id`` and ``action_chunk`` are
+        shared across the batch (``encode_condition`` requires identical real text
+        lengths within a batch). ``B=1`` is bit-identical to the single-request path.
         """
         if not self._ready:
             raise RuntimeError("call setup() before step().")
@@ -152,7 +158,10 @@ class Cosmos3PolicyScheduler(Scheduler):
             request.action_dim,
             request.raw_action_dim,
         )
-        domain = torch.tensor([request.domain_id], device=dev, dtype=torch.long)
+        # Batch size from the (required) text tensor; every per-sample tensor shares
+        # it. B=1 reproduces the single-request path exactly.
+        batch = request.text_ids.shape[0]
+        domain = torch.full((batch,), request.domain_id, device=dev, dtype=torch.long)
 
         # Clean (conditioned) vs noised (generated) per mode. ``cond_frame_indexes``
         # overrides the per-mode default (e.g. [0,1] for a video observation).
@@ -165,18 +174,19 @@ class Cosmos3PolicyScheduler(Scheduler):
         action_clean = request.mode == "forward_dynamics"
 
         # Initial noise uses a fresh ``np.random.RandomState(seed)`` per modality
-        # (video and action each reseeded with the same seed). The leading batch-1
-        # axis is row-major over the per-sample draw. Kept identical to
-        # ``Cosmos3T2VScheduler.step_action`` so the two paths stay comparable.
+        # (video and action each reseeded with the same seed). The leading batch
+        # axis is row-major over the per-sample draw, so each sample gets distinct
+        # noise. Kept identical to ``Cosmos3T2VScheduler.step_action`` so the two
+        # paths stay comparable.
         seed = int(request.seed)
         video = torch.from_numpy(
             np.random.RandomState(seed)
-            .standard_normal((1, self.latent_channel, t_lat, h_lat, w_lat))
+            .standard_normal((batch, self.latent_channel, t_lat, h_lat, w_lat))
             .astype("float32")
         ).to(dev, dt)
         action = torch.from_numpy(
             np.random.RandomState(seed)
-            .standard_normal((1, chunk, ad))
+            .standard_normal((batch, chunk, ad))
             .astype("float32")
         ).to(dev, dt)
         action[:, :, raw:] = 0.0  # zero the pad tail beyond the embodiment's dim
@@ -195,12 +205,12 @@ class Cosmos3PolicyScheduler(Scheduler):
             action = cond_action.clone()
             action[:, :, raw:] = 0.0
 
-        video_mask = torch.ones(1, t_lat, dtype=torch.bool, device=dev)
+        video_mask = torch.ones(batch, t_lat, dtype=torch.bool, device=dev)
         video_mask[:, video_clean] = False
         action_mask = (
-            torch.zeros(1, chunk, dtype=torch.bool, device=dev)
+            torch.zeros(batch, chunk, dtype=torch.bool, device=dev)
             if action_clean
-            else torch.ones(1, chunk, dtype=torch.bool, device=dev)
+            else torch.ones(batch, chunk, dtype=torch.bool, device=dev)
         )
 
         text_ids, text_mask = request.text_ids.to(dev), request.text_mask.to(dev)

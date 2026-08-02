@@ -58,14 +58,22 @@ def init_dist(
             return False
 
         backend = "nccl" if device_type == "cuda" else "gloo"
+        # Honour a launcher (torchrun / torchelastic) when it has populated the
+        # rendezvous env: each process then has its OWN rank / local_rank. Falling
+        # back to rank 0 / world_size only covers the single-process spin-up case
+        # (one process creating the whole group). Reading RANK here is essential —
+        # hardcoding rank=0 makes every torchrun process claim rank 0 and the NCCL
+        # rendezvous deadlocks on the first collective.
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", "0")
-        dist.init_process_group(backend, rank=0, world_size=world_size)
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
         if backend == "nccl":
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+            torch.cuda.set_device(local_rank)
         return True
 
     actual = dist.get_world_size()

@@ -1,0 +1,201 @@
+---
+title: "PI0 对齐与基准测试协议"
+description: "复现 PhyAI 与 LeRobot 的 PI0 数值对齐、延迟和 LIBERO 评测"
+icon: "gauge"
+---
+
+# 测试范围
+
+对齐应沿着推理链逐步收窄。先固定输入和噪声，比较最终 action。结果若有偏差，就用原来的 payload 继续做逐层 dump；确认数值路径一致后，才进入延迟和环境成功率测试。
+
+| 测量 | 入口 | 报告结果 |
+| --- | --- | --- |
+| Action 对齐 | `benchmark/pi0/compare_pi0_lerobot_live.py` | 相同输入和噪声下的 action chunk 误差 |
+| 逐层对齐 | `benchmark/pi0/dump_compare_pi0_lerobot.py` | 首个发生偏差的模型阶段 |
+| 运行时评测 | Engine benchmark 或 LIBERO eval | 模型延迟或环境成功率 |
+
+<Warning>
+  Action 对齐只比较确定性 payload 下的模型输出。LIBERO 成功率还会受到模拟器重置、预处理、环境 step 和 action 执行的影响，不能用其中一个替代另一个。
+</Warning>
+
+# 实验设置
+
+所有命令都从 `/phyai_workspace` 启动，以固定路径和依赖。运行前先确认两个 checkpoint 和 tokenizer 已经保存在本地：
+
+```bash
+ls /data/share/pi0_base
+ls /data/share/pi0_libero_finetuned_v044
+ls /data/share/paligemma-3b-pt-224
+```
+
+测量延迟前，先确认目标 GPU 空闲，并为所有对比运行绑定同一张卡：
+
+```bash
+nvidia-smi
+export CUDA_VISIBLE_DEVICES=0
+```
+
+绑定后，CUDA 会把这张卡重新编号为逻辑 `cuda:0`。这里的 benchmark 和 compare 工具都沿用这个编号。
+
+# Action 对齐
+
+Action 对齐先排除输入本身造成的差异。Live compare 从当前环境或 `--lerobot-root` 加载 LeRobot，再把同一份输入、prompt token 和 denoising noise 交给 PhyAI 与 LeRobot，只让两套模型实现成为变量。
+
+```bash
+cd /phyai_workspace
+mkdir -p pt outputs
+
+uv run python benchmark/pi0/compare_pi0_lerobot_live.py \
+  --checkpoint /data/share/pi0_base \
+  --lerobot-root /phyai_workspace/lerobot-main \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --language-inputs tokenizer \
+  --dtype bfloat16 \
+  --vision-dtype float32 \
+  --phyai-attn-backend flashinfer \
+  --num-steps 10 \
+  --batch-size 1 \
+  --n-warmup 3 \
+  --n-timed 10 \
+  --save-output pt/pi0_bf16_payload.pt
+```
+
+若当前环境已经能导入 LeRobot，可以省略 `--lerobot-root`。想把 tokenization 排除在对比之外，则使用 `--language-inputs fixed`。模型路径固定为 `bfloat16` 和 FlashInfer；`--vision-dtype float32` 只通过 `PI0Args.vision_params_dtype` 改变 PhyAI 的 vision tower。
+
+记录这些 JSON 字段：
+
+| 字段 | 定义 |
+| --- | --- |
+| `metrics.allclose` | 是否满足设定的 `rtol` 和 `atol` |
+| `metrics.max_abs` | 最大 action 绝对误差 |
+| `metrics.mean_abs` | 平均 action 绝对误差 |
+| `metrics.rmse` | Action 均方根误差 |
+| `metrics.cosine` | 展平后 action chunk 的余弦相似度 |
+| `timing_ms.lerobot_predict_action_chunk.mean` | LeRobot 模型路径平均延迟 |
+| `timing_ms.phyai_engine_step.mean` | PhyAI `Engine.step` 平均延迟 |
+
+LeRobot 的计时范围是 `predict_action_chunk`，不是 `select_action`。命中 action queue 时不会生成新的 action chunk，因此不应算作一次模型推理。Tokenization 也在计时开始前完成。
+
+# 逐层诊断
+
+如果最终 action 出现偏差，不要重新生成输入。`--save-output` 会把处理后的 batch、prompt tensor、共享噪声、参考 action、两侧输出及其差值写入同一个 `.pt` 文件。Dump 工具复用这份文件，在单进程中继续比较两个运行时：
+
+```bash
+cd /phyai_workspace
+
+uv run python benchmark/pi0/dump_compare_pi0_lerobot.py \
+  --checkpoint /data/share/pi0_base \
+  --pt pt/pi0_bf16_payload.pt \
+  --lerobot-root /phyai_workspace/lerobot-main \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --device cuda \
+  --dtype bfloat16 \
+  --vision-dtype float32 \
+  --phyai-attn-backend flashinfer \
+  --num-steps 10 \
+  --include-layers \
+  --out pt/pi0_bf16_combined_dump.pt
+```
+
+输出包含这些阶段：
+
+| Key | 模型阶段 |
+| --- | --- |
+| `img_emb`, `lang_emb`, `prefix_embs` | 图像、语言及打包后的 prefix embedding |
+| `prefix_hidden` | Final norm 后的 prefix 输出 |
+| `x_t_step0`, `state_emb`, `action_time_emb` | Expert 输入 |
+| `v_t_stepN`, `x_t_after_stepN` | Denoising velocity 和 Euler 更新后的状态 |
+| `actions` | 最终 action chunk |
+| `prefix_layer{i}`, `expert_step{s}_layer{i}` | 启用 `--include-layers` 时的逐层输出 |
+
+每个阶段都会报告余弦相似度、绝对误差、RMSE 和 tensor norm。首个低于 `--threshold` 的 cosine 值会被标为 `FIRST DIVERGENCE`。
+
+<Note>
+  当 rank 相同的 tensor 长度不同时，`[shape-clipped]` 表示工具把它们裁到共同的最小 shape。通常是因为 LeRobot 保留 padding 后的语言长度，而 PhyAI dump 只保存有效 prefix。最终 action 和 denoising step tensor 仍应保持相同 shape。
+</Note>
+
+# Engine 延迟
+
+数值路径对齐后，再用 CUDA graph replay 单独测量 PhyAI scheduler：
+
+```bash
+cd /phyai_workspace
+
+uv run python benchmark/bench_n_batch_ws1_pi0.py \
+  --checkpoint /data/share/pi0_base \
+  --batch-sizes 1 2 4 \
+  --dtype bf16 \
+  --vision-dtype float32 \
+  --fixed-noise \
+  --n-warmup 5 \
+  --n-timed 30 \
+  --result-file outputs/pi0_ws1_latency.jsonl
+```
+
+计时范围从 `Engine.step` 开始，到 action chunk 返回为止，其中包含 vision runner、language prefix runner、expert denoising loop 和 CUDA graph replay。Tokenization 与环境 step 留在计时范围之外。
+
+# LIBERO 评测
+
+LIBERO 会把模拟器、预处理和 action 执行一并纳入结果。这里使用 LIBERO finetuned checkpoint；base checkpoint 仍只用于数值对齐。
+
+LeRobot：
+
+```bash
+cd /phyai_workspace/lerobot-main
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+LEROBOT_PALIGEMMA_TOKENIZER_PATH=/data/share/paligemma-3b-pt-224 \
+uv run lerobot-eval \
+  --policy.path=/data/share/pi0_libero_finetuned_v044 \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --eval.max_episodes_rendered=0 \
+  --env.max_parallel_tasks=1 \
+  --policy.device=cuda
+```
+
+PhyAI：
+
+```bash
+cd /phyai_workspace
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+uv run python examples/pi0/run_libero_pi0.py \
+  --checkpoint /data/share/pi0_libero_finetuned_v044 \
+  --lerobot-root /phyai_workspace/lerobot-main \
+  --tokenizer-name /data/share/paligemma-3b-pt-224 \
+  --task libero_object \
+  --n-episodes 10 \
+  --no-video \
+  --output-dir outputs/eval/pi0_phyai_libero_object
+```
+
+不传 `--task-ids` 时，脚本会依次评测 suite 中的全部 task。`libero_object` 每个 task 运行 10 个 episode，总计 100 个。正式评测前可先加上 `--task-ids "[0]" --n-episodes 1`，确认整条链路能够跑通。
+
+# 报告要求
+
+报告结果时应保留完整的运行条件。数值对齐和延迟报告需要记录 GPU、visible device、checkpoint、输入模式、dtype、batch size、CUDA graph 状态、`num_steps`、warmup 次数、计时次数和 PhyAI vision dtype，并注明是否把预处理或 tokenization 算入计时。
+
+LIBERO 报告还需写明 suite、episode 数量和视频设置。`pc_success` 沿用 LeRobot 的口径，取值范围是 0 到 100。
+
+# 排查
+
+| 现象 | 检查项 |
+| --- | --- |
+| LeRobot 尝试下载 `google/paligemma-3b-pt-224` | 设置 `--tokenizer-name /data/share/paligemma-3b-pt-224` 或 `LEROBOT_PALIGEMMA_TOKENIZER_PATH` |
+| 对比命令拒绝 dtype 或 backend | 使用 `bfloat16` 和 `--phyai-attn-backend flashinfer`；PI0 paged stack 不提供 FP32、eager 或 SDPA 路径 |
+| Prefix 行显示 `[shape-clipped]` | 以 `actions` 和 denoising step 行判断最终对齐结果 |
+| 从 `img_emb` 开始偏差 | 检查图像归一化、相机数量和相机顺序 |
+| 从 `v_t_step0` 后开始偏差 | 检查 timestep、noise、action padding 和 attention backend |
+| LIBERO 缺少 XML asset | 确认 `~/.libero/config.yaml` 指向 `/data/share/libero-assets` |
+| 延迟波动较大 | 使用 `nvidia-smi` 检查其他 GPU workload |

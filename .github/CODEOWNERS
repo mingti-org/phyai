@@ -1,0 +1,38 @@
+# Repository configuration and automation
+/CODEOWNERS @chenghuaWang
+/.github/ @chenghuaWang
+/.devcontainer/ @chenghuaWang
+/pyproject.toml @chenghuaWang
+
+# Workspace packages
+/phyai/ @chenghuaWang
+/phyai/src/phyai/models/pi0/ @sunduojin
+/phyai/src/phyai/models/pi05/ @chenghuaWang
+/phyai/src/phyai/models/cosmos3/ @chenghuaWang
+/phyai-kernel/ @chenghuaWang
+/phyai-ext/ @chenghuaWang
+/phyai-model-optimizer/ @chenghuaWang
+/phyai-utils-tools/ @chenghuaWang
+
+# Documentation, examples, benchmarks, and tooling
+/docs/ @chenghuaWang
+/docs/models/pi0/ @sunduojin
+/docs/zh/models/pi0/ @sunduojin
+/docs/models/pi05/ @chenghuaWang
+/docs/zh/models/pi05/ @chenghuaWang
+/docs/images/models/pi05/ @chenghuaWang
+/docs/models/cosmos/ @chenghuaWang
+/docs/zh/models/cosmos/ @chenghuaWang
+/docs/images/models/cosmos/ @chenghuaWang
+/examples/ @chenghuaWang
+/examples/pi0/ @sunduojin
+/examples/pi05/ @chenghuaWang
+/examples/cosmos3/ @chenghuaWang
+/benchmark/ @chenghuaWang
+/benchmark/bench_n_batch_ws1_pi0.py @sunduojin
+/benchmark/bench_n_batch_ws1_pi05.py @chenghuaWang
+/benchmark/pi05/ @chenghuaWang
+/benchmark/cosmos3_policy/ @chenghuaWang
+/scripts/ @chenghuaWang
+/docker/ @chenghuaWang
+/third_party/ @chenghuaWang

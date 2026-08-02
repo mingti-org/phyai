@@ -17,6 +17,10 @@ from phyai.layers.linear.registry import register_linear_kernel
 
 
 _FP8_E4M3_AMAX = 448.0
+_E2M1_VALUES = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    dtype=torch.float32,
+)
 
 
 def _expand_block_scale(
@@ -29,6 +33,40 @@ def _expand_block_scale(
     N, K = weight_shape
     expanded = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     return expanded[:N, :K]
+
+
+def _unpack_e2m1(weight: torch.Tensor) -> torch.Tensor:
+    """Unpack ``(N, K//2)`` E2M1 bytes into a float32 ``(N, K)`` tensor."""
+    packed = weight.view(torch.uint8)
+    codes = torch.empty(
+        packed.shape[0],
+        packed.shape[1] * 2,
+        dtype=torch.uint8,
+        device=packed.device,
+    )
+    codes[:, 0::2] = packed & 0x0F
+    codes[:, 1::2] = (packed >> 4) & 0x0F
+    lut = _E2M1_VALUES.to(packed.device)
+    return lut[codes.long()]
+
+
+def _linear_nvfp4_scale(
+    scale: torch.Tensor,
+    weight_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Return the logical ``(N, K//16)`` scale view from a padded scale tensor."""
+    N, K_half = weight_shape
+    k_blocks = (K_half * 2) // 16
+    return scale[:N, :k_blocks]
+
+
+def _dequant_nvfp4_weight(layer: torch.nn.Module) -> torch.Tensor:
+    """Dequantise packed NVFP4 weight to float32 for the reference path."""
+    fp4 = _unpack_e2m1(layer.weight)
+    scale = _linear_nvfp4_scale(layer.weight_scale, tuple(layer.weight.shape)).float()
+    scale = scale.repeat_interleave(16, dim=1)
+    global_scale = layer.weight_global_scale.float().reshape(())
+    return fp4 * scale * global_scale
 
 
 @register_linear_kernel()
@@ -53,6 +91,8 @@ class TorchKernel:
             if probe.K % 16 != 0 or probe.N % 16 != 0:
                 return False
             return True
+        if probe.spec_id == "nvfp4_block_16_linear":
+            return True
         return False
 
     def apply(
@@ -71,6 +111,8 @@ class TorchKernel:
             return self._fp8_per_channel(layer, x, bias)
         if spec.spec_id.startswith("fp8_block_"):
             return self._fp8_block(layer, x, bias)
+        if spec.spec_id == "nvfp4_block_16_linear":
+            return self._nvfp4_reference(layer, x, bias)
 
         raise RuntimeError(f"TorchKernel got unhandled spec_id={spec.spec_id!r}")
 
@@ -95,11 +137,11 @@ class TorchKernel:
         # per-channel shape (N,); broadcast it as (1, N).
         w_scale = layer.weight_scale
         if w_scale.ndim == 1:
-            w_scale = w_scale.reshape(1, -1)
-        # Static per-tensor input scale is scalar (1,).
+            w_scale = w_scale.reshape(1, -1).contiguous()
+        # Static per-tensor input scale with shape (M, 1).
         a_scale = layer.input_scale
         if a_scale.ndim == 1 and a_scale.numel() == 1:
-            a_scale = a_scale.reshape(1, 1)
+            a_scale = a_scale.view(1, 1).expand(x_2d.shape[0], 1).contiguous()
         out = torch._scaled_mm(
             x_2d,
             layer.weight.t(),
@@ -148,4 +190,14 @@ class TorchKernel:
             tuple(layer.weight.shape),
             spec.block_shape,
         ).to(x.dtype)
+        return F.linear(x, w, bias)
+
+    def _nvfp4_reference(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Reference dequant + F.linear path. Correct but not fast."""
+        w = _dequant_nvfp4_weight(layer).to(x.dtype)
         return F.linear(x, w, bias)

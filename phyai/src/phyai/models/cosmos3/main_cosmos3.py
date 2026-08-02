@@ -11,6 +11,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
+from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
     cosmos3_avae_weight_remap,
@@ -99,9 +100,10 @@ class Cosmos3Entry(Entry):
         # The engine already ran P.init (mesh) + L.init (linear dispatcher) before
         # setup(), so the model constructors below find the dispatcher ready — no
         # register_mesh shim like the standalone example scripts need.
-        self.transformer = Cosmos3Transformer(
-            config, params_dtype=dtype, device=device
-        ).eval()
+        with use_quant_plan(load_quant_plan(ckpt / "transformer")):
+            self.transformer = Cosmos3Transformer(
+                config, params_dtype=dtype, device=device
+            ).eval()
         load_pretrained(
             self.transformer,
             ckpt / "transformer",

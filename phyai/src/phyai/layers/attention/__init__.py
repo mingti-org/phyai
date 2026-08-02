@@ -64,6 +64,23 @@ from phyai.layers.attention.diffusion import (
     register_backend as register_diffusion_backend,
 )
 from phyai.layers.attention.enums import AttnLayout, AttnMode
+from phyai.layers.attention.gdn import (
+    FlaGatedDeltaNetBackend,
+    FlaGatedDeltaNetPlan,
+    FlashInferGatedDeltaNetBackend,
+    FlashInferGatedDeltaNetPlan,
+    GatedDeltaNet,
+    GatedDeltaNetBackend,
+    GatedDeltaNetCtx,
+    GatedDeltaNetLayerProto,
+    GatedDeltaNetMetadata,
+    GatedDeltaNetPlanHandle,
+)
+from phyai.layers.attention.gdn import (
+    get_backend_factory as get_gdn_backend_factory,
+)
+from phyai.layers.attention.gdn import list_backends as list_gdn_backends
+from phyai.layers.attention.gdn import register_backend as register_gdn_backend
 from phyai.layers.attention.utils import (
     get_global_fi_workspace,
     register_global_fi_workspace,
@@ -76,6 +93,7 @@ __all__ = [
     "Attention",
     "ARAttention",
     "DiffusionAttention",
+    "GatedDeltaNet",
     # === Shared enums ===
     "AttnLayout",
     "AttnMode",
@@ -116,6 +134,19 @@ __all__ = [
     "get_diffusion_backend_factory",
     "list_diffusion_backends",
     "register_diffusion_backend",
+    # === gdn/ stack ===
+    "GatedDeltaNetBackend",
+    "GatedDeltaNetCtx",
+    "GatedDeltaNetLayerProto",
+    "GatedDeltaNetMetadata",
+    "GatedDeltaNetPlanHandle",
+    "FlaGatedDeltaNetBackend",
+    "FlaGatedDeltaNetPlan",
+    "FlashInferGatedDeltaNetBackend",
+    "FlashInferGatedDeltaNetPlan",
+    "get_gdn_backend_factory",
+    "list_gdn_backends",
+    "register_gdn_backend",
     # === Workspace ===
     "get_global_fi_workspace",
     "register_global_fi_workspace",

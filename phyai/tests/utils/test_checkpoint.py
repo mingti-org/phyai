@@ -12,6 +12,7 @@ import torch
 
 from phyai.models.configuration import PretrainedConfig
 from phyai.utils.checkpoint import (
+    find_checkpoint_files,
     find_safetensors,
     load_config,
     resolve_checkpoint,
@@ -143,6 +144,67 @@ def test_find_safetensors_accepts_str(tmp_path: Path):
     (tmp_path / "model.safetensors").write_bytes(b"")
     out = find_safetensors(str(tmp_path))
     assert len(out) == 1
+
+
+def test_find_checkpoint_files_prefers_canonical_safetensors(tmp_path: Path):
+    (tmp_path / "model.safetensors").write_bytes(b"")
+    (tmp_path / "extra.safetensors").write_bytes(b"")
+    (tmp_path / "pytorch_model.bin").write_bytes(b"")
+
+    out = find_checkpoint_files(tmp_path)
+
+    assert [path.name for path in out] == ["model.safetensors"]
+
+
+def test_find_checkpoint_files_prefers_first_pytorch_format(tmp_path: Path):
+    (tmp_path / "model.pth").write_bytes(b"")
+    (tmp_path / "model.pt").write_bytes(b"")
+    (tmp_path / "model.bin").write_bytes(b"")
+
+    out = find_checkpoint_files(tmp_path)
+
+    assert [path.name for path in out] == ["model.bin"]
+
+
+def test_find_checkpoint_files_collects_selected_format_shards(tmp_path: Path):
+    (tmp_path / "weights-00002-of-00002.pth").write_bytes(b"")
+    (tmp_path / "weights-00001-of-00002.pth").write_bytes(b"")
+
+    out = find_checkpoint_files(tmp_path)
+
+    assert [path.name for path in out] == [
+        "weights-00001-of-00002.pth",
+        "weights-00002-of-00002.pth",
+    ]
+    assert all(path.is_absolute() for path in out)
+
+
+def test_find_checkpoint_files_ignores_training_state(tmp_path: Path):
+    (tmp_path / "training_args.bin").write_bytes(b"")
+    (tmp_path / "optimizer.bin").write_bytes(b"")
+    (tmp_path / "scheduler.pt").write_bytes(b"")
+    (tmp_path / "model.pt").write_bytes(b"")
+
+    out = find_checkpoint_files(tmp_path)
+
+    assert [path.name for path in out] == ["model.pt"]
+
+
+def test_find_checkpoint_files_safetensors_index_is_authoritative(tmp_path: Path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"x": "missing.safetensors"}})
+    )
+    (tmp_path / "model.pth").write_bytes(b"")
+
+    with pytest.raises(FileNotFoundError, match="missing.safetensors"):
+        find_checkpoint_files(tmp_path)
+
+
+def test_find_checkpoint_files_no_model_weights_raises(tmp_path: Path):
+    (tmp_path / "optimizer.pth").write_bytes(b"")
+
+    with pytest.raises(FileNotFoundError, match="no supported model weight files"):
+        find_checkpoint_files(tmp_path)
 
 
 # --------------------------------------------------------------------------- #

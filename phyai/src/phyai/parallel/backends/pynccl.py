@@ -311,10 +311,24 @@ class PyNCCLBackend:
         Eager construction sidesteps the lazy-init-during-capture trap
         that PyTorch's ProcessGroupNCCL also exhibits — pre-warming
         keeps NCCL's one-time side effects out of the recorded graph.
+
+        Size-1 axes are skipped. Every collective short-circuits at
+        ``axis_size <= 1`` (see :mod:`phyai.parallel.ops`), so such an axis
+        never needs a comm. Skipping it also avoids a ``dist.new_group``
+        deadlock: ``_build_cpu_group_for`` would have each rank create a
+        *single-member* group containing only itself (e.g. rank 0 ->
+        ``new_group([0])``, rank 1 -> ``new_group([1])``), but ``new_group``
+        is a global collective that requires every rank to request the same
+        groups in the same order — disjoint singletons hang. The 5-axis
+        engine mesh (``dp/ep/sp/cp`` at size 1, only ``tp`` > 1) hit this.
+        The skip is consistent across ranks because ``axis_size`` is the
+        mesh dimension width, identical on every rank.
         """
         if self._nccl is None:
             self._nccl = NCCLLibrary(self._library_path)
         for axis in axes:
+            if mesh.axis_size(axis) <= 1:
+                continue
             key = (mesh.name, axis)
             if key in self._comms:
                 continue
@@ -356,13 +370,22 @@ def _build_cpu_group_for(device_group: ProcessGroup) -> ProcessGroup:
     """Return (or create) a gloo group with the same ranks as
     ``device_group``. Used solely for unique_id bootstrap.
 
-    Subgroup creation in PyTorch is a global collective: all ranks must
-    call it. This is fine because ``PyNCCLBackend.attach`` is itself
-    called collectively from ``phyai.parallel.init``.
+    ``use_local_synchronization=True`` is essential here: by default
+    ``new_group`` ends with a *world*-wide barrier, so every rank must issue
+    the identical sequence of ``new_group`` calls or it deadlocks. With more
+    than one parallel axis the per-axis subgroups are DISJOINT and differ by
+    rank (e.g. the cfg axis groups ranks ``[0,4]`` on rank 0 but ``[1,5]`` on
+    rank 1) — those are different ``new_group`` calls that would never rendezvous
+    under the global barrier. Local synchronization makes each subgroup barrier
+    only within its own members, so disjoint subgroups are created concurrently
+    (non-member ranks don't join). ``attach`` is still called collectively, so
+    every rank creates exactly its own subgroup per axis.
     """
     ranks = tuple(dist.get_process_group_ranks(device_group))
     if ranks in _cpu_group_cache:
         return _cpu_group_cache[ranks]
-    pg = dist.new_group(ranks=list(ranks), backend="gloo")
+    pg = dist.new_group(
+        ranks=list(ranks), backend="gloo", use_local_synchronization=True
+    )
     _cpu_group_cache[ranks] = pg
     return pg

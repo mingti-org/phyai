@@ -1,7 +1,7 @@
 """Back-compat shim — the spec abstraction has moved to :mod:`phyai.layers.quant`.
 
 Existing imports such as
-``from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, ActivationView``
+``from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, Nvfp4Spec, ActivationView``
 keep working; new code should import from :mod:`phyai.layers.quant`.
 """
 
@@ -13,6 +13,7 @@ from phyai.layers.quant import (
     Bf16Spec,
     Fp8Spec,
     LinearActivationQuant,
+    Nvfp4Spec,
     WeightSpec,
 )
 from phyai.layers.quant.fp8 import _convert_to_channelwise
@@ -22,6 +23,7 @@ __all__ = [
     "AllocationRequest",
     "Bf16Spec",
     "Fp8Spec",
+    "Nvfp4Spec",
     "LinearActivationQuant",
     "WeightSpec",
     "_convert_to_channelwise",
