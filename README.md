@@ -12,7 +12,7 @@
   <a href="https://github.com/mingti-org/phyai"><img alt="GitHub" src="https://img.shields.io/badge/github-mingti--org%2Fphyai-181717?logo=github"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/mingti-org/phyai.svg"></a>
   <a href="https://github.com/mingti-org/phyai/issues"><img alt="open issues" src="https://img.shields.io/github/issues-raw/mingti-org/phyai"></a>
-  <a href="https://membodied.github.io/phyai/simple/"><img alt="Nightly" src="https://img.shields.io/badge/nightly-packages-60A5FA"></a>
+  <a href="https://mingti-org.github.io/phyai/simple/"><img alt="Nightly" src="https://img.shields.io/badge/nightly-packages-60A5FA"></a>
 </p>
 
 ----
@@ -36,10 +36,10 @@ models that run in interactive systems.
 
 ## Key Features
 
-- Runs on NVIDIA Jetson edge devices
-- Scales to GPU clusters with DP, TP, and CFG parallelism
-- Uses high-performance kernels from FlashInfer and Humming
-- Supports W4A8 (NVFP4, MXFP4, INT4), W8A8, and W8A16 quantization (PR under review)
+- 🚀 Runs on NVIDIA Jetson edge devices
+- 🚀 Scales to GPU clusters with DP, TP, and CFG parallelism
+- 🚀 Uses high-performance kernels from FlashInfer and Humming
+- 🤗 Supports W4A8 (NVFP4, MXFP4, INT4), W8A8, and W8A16 quantization (PR under review)
 
 ## Supported Models
 
