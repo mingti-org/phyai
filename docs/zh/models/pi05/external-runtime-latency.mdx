@@ -1,196 +1,218 @@
 ---
-title: "PI0.5 外部 Runtime 延迟测试"
-description: "使用 FlashRT、realtime-vla 和 vla.cpp 跑 PI0.5 latency benchmark"
+title: "PI0.5 延迟测试"
+description: "复现 PhyAI 原生 PI0.5 延迟，并按需运行外部 runtime 对比"
 icon: "timer"
 ---
 
 # 概述
 
-这篇文档说明如何配置并运行 `benchmark/pi05/` 下的三个外部 PI0.5 latency wrapper。
+PI0.5 延迟测试以 PhyAI 原生脚本为主：
 
-这些 wrapper 不使用 PhyAI engine 做推理。每个脚本会直接调用对应 runtime，同时复用 PhyAI 的通用 benchmark runner 来做 warmup、计时和 JSONL 输出。
+```text
+benchmark/bench_n_batch_ws1_pi05.py
+```
 
-| 脚本 | Runtime | 计时调用 |
-| --- | --- | --- |
-| `bench_flashrt_pi05.py` | FlashRT | `Pi05TorchFrontendRtx.infer(obs)` |
-| `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward(...)` |
-| `bench_vlacpp_pi05_client.py` | vla.cpp | 向运行中的 `vla-server` 发一次 ZMQ 请求 |
+脚本使用 `pi05` plugin 构造 PhyAI `Engine`，生成合成输入，完成预热后统计 steady-state `Engine.step(request)` 延迟。它只用于性能测试，不评估 LIBERO 准确率。
 
-这些脚本会生成 synthetic image 和 state 输入，只用于 latency 测试，不用于 LIBERO accuracy 评测。
+FlashRT、realtime-vla 和 vla.cpp 放在文档末尾，作为可选对比路径。
 
-# 通用环境
+# PhyAI 测了什么
 
-需要一个能 import PhyAI、PyTorch 和通用 benchmark runner 的 Python 环境。
+| 项目 | 说明 |
+| --- | --- |
+| 计时调用 | 一次 `Engine.step(request)` |
+| 输入 | 合成图像和单 token 合成 prompt |
+| 包含 | 视觉塔、LLM prefix、10 次 Euler expert step、scheduler 逻辑和 action 输出 |
+| 不包含 | 环境安装、checkpoint 加载、Engine 构造、CUDA Graph capture、request 构造和 warmup |
+| GPU 计时 | 每一步使用 CUDA event，并在读取结果前同步 CUDA |
+| 输出 | 每个 batch size 写一行 JSONL |
+
+request 在计时前直接创建在 GPU 上。因此，图像解码、tokenization、仿真通信和 CPU 到 GPU 的预处理不在这项 latency 里。
+
+# 配置环境
+
+从仓库源码安装：
 
 ```bash
-cd <PHYAI_REPO>
-python -c "import torch; import phyai; import benchmark.bench_n_batch"
+git clone https://github.com/MEmbodied/phyai.git
+cd phyai
+uv sync
+```
+
+确认当前环境可以导入 PhyAI 并识别 GPU：
+
+```bash
+uv run python -c "import torch, phyai; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name(0))"
 nvidia-smi
 ```
 
-对比不同 runtime 时，下面这些设置要对齐：
+每次实验都应记录代码版本和 GPU 状态：
 
-| 项 | 设置 |
+```bash
+git rev-parse HEAD
+nvidia-smi --query-gpu=name,driver_version,memory.used,utilization.gpu --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+确认 GPU 和 CPU 空闲后再运行正式测试。
+
+# 准备 checkpoint
+
+`--checkpoint` 必须指向一个目录，至少包含：
+
+```text
+<PI05_CHECKPOINT>/
+  config.json
+  model.safetensors
+```
+
+分片 checkpoint 可以使用 `model.safetensors.index.json` 和对应的 shard 文件。
+
+运行前检查：
+
+```bash
+test -f <PI05_CHECKPOINT>/config.json
+test -f <PI05_CHECKPOINT>/model.safetensors || \
+  test -f <PI05_CHECKPOINT>/model.safetensors.index.json
+```
+
+action chunk size 和 denoise step 数来自 `config.json`。标准 PI0.5 配置是 `chunk_size=50`、`num_inference_steps=10`，PhyAI benchmark 没有单独的 `--chunk-size` 参数。
+
+对比不同 runtime 时，应使用同一 PI0.5 checkpoint family。某个 runtime 如果需要转换格式，转换前的权重来源仍应相同。
+
+# 运行 PhyAI BF16 latency
+
+下面是推荐的单 batch、双相机 LIBERO shape 测试命令：
+
+```bash
+cd <PHYAI_REPO>
+mkdir -p results
+
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_bs1.jsonl
+```
+
+这条命令对应的设置如下：
+
+| 参数 | 设置 |
 | --- | --- |
+| Engine 精度 | BF16 |
+| 视觉塔精度 | BF16 |
 | Batch size | 1 |
-| Camera streams | 2 |
-| Chunk size | 50 |
-| Prompt | 各 runtime 使用相同 prompt 文本 |
-| Warmup / timed iterations | 各 runtime 使用相同次数 |
-| Precision | 按 runtime 的实际精度路径标注结果 |
+| 相机数 | 2 |
+| Action chunk | 从 checkpoint 读取，通常为 50 |
+| Euler steps | 从 checkpoint 读取，通常为 10 |
+| CUDA Graph | CUDA 环境下默认开启 |
+| Prompt shape | 单个合成 token |
+| Warmup / timed iterations | 100 / 100 |
 
-下面的命令都使用占位路径：
+如果用户没有显式覆盖，PI0.5 plugin 还会应用模型配置中的推荐 runtime 参数。提交结果时应记录所有 `PHYAI_*` 环境变量，因为它们可能改变 attention backend 或 workspace 设置。
 
-| 占位符 | 含义 |
-| --- | --- |
-| `<PHYAI_REPO>` | 包含 `benchmark/pi05/` 的 PhyAI 仓库 |
-| `<FLASHRT_REPO>` | FlashRT 仓库 |
-| `<REALTIME_VLA_REPO>` | realtime-vla 仓库 |
-| `<VLACPP_REPO>` | vla.cpp 仓库 |
-| `<VLA_SERVER>` | 编译后的 vla.cpp `vla-server` 二进制文件 |
-| `<PI05_CHECKPOINT>` | PI0.5 safetensors checkpoint 目录或文件 |
-| `<PI05_GGUF>` | vla.cpp 使用的 PI0.5 GGUF 文件 |
-| `<MM_PROJ_GGUF>` | vla.cpp multimodal projector GGUF 文件 |
-| `<TOKENIZER_DIR>` | 本地 tokenizer 目录 |
-| `<LIBERO_STATS_JSON>` | LIBERO `meta/stats.json`，包含 `observation.state.q01/q99` |
+## 三相机 PI0.5 base shape
 
-# FlashRT
-
-先按 FlashRT 官方仓库说明安装，然后把仓库路径暴露给 wrapper。
+公开的 `pi05_base` 默认使用三路相机。只修改 `--num-images` 和结果名称：
 
 ```bash
-export FLASHRT_ROOT=<FLASHRT_REPO>
-cd <PHYAI_REPO>
-python -c "import sys; sys.path.insert(0, '$FLASHRT_ROOT'); from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx; print(Pi05TorchFrontendRtx)"
-```
-
-运行 latency：
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_flashrt_pi05.py \
-  --flashrt-root <FLASHRT_REPO> \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
   --checkpoint <PI05_CHECKPOINT> \
-  --precision bf16 \
-  --num-views 2 \
-  --chunk-size 50 \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 3 \
   --batch-sizes 1 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/flashrt_pi05.jsonl
+  --run-name pi05_bf16_views3_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views3_bs1.jsonl
 ```
 
-说明：
+双相机和三相机的工作量不同，不能放在同一行直接比较。
 
-| 项 | 说明 |
-| --- | --- |
-| Chunk size | wrapper 直接使用 FlashRT 的 `Pi05TorchFrontendRtx` API，因为 `chunk_size` 是 frontend 构造参数 |
-| Denoise steps | 不要用 `load_model(..., num_steps=50)` 设置 action chunk size；FlashRT 里的 `num_steps` 表示 denoise steps |
-| Precision | `--precision bf16` 使用 FlashRT 的 forced-BF16 PI0.5 RTX 路径；`--precision fp8_bf16` 是单独的 FP8/BF16 优化结果 |
+## 视觉塔 FP32 对齐组
 
-# realtime-vla
-
-先按 realtime-vla 官方仓库说明安装。wrapper 可以直接加载转换后的 `.pt` / `.pth` checkpoint。如果传入 PI0.5 safetensors checkpoint，还需要提供 FlashRT 路径，用它的 PI0.5 转换 helper。
+如果对比对象的视觉塔无法使用 BF16，可以保持 language/expert 为 BF16，只把 SigLIP 和 projector 改为 FP32：
 
 ```bash
-export REALTIME_VLA_ROOT=<REALTIME_VLA_REPO>
-export FLASHRT_ROOT=<FLASHRT_REPO>
-cd <PHYAI_REPO>
-python -c "import sys; sys.path.insert(0, '$REALTIME_VLA_ROOT'); from pi05_infer import Pi05Inference; print(Pi05Inference)"
-```
-
-运行 latency：
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_realtime_vla_pi05.py \
-  --realtime-vla-root <REALTIME_VLA_REPO> \
-  --flashrt-root <FLASHRT_REPO> \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
   --checkpoint <PI05_CHECKPOINT> \
-  --num-views 2 \
-  --chunk-size 50 \
-  --prompt-len 16 \
+  --dtype bf16 \
+  --vision-dtype float32 \
+  --num-images 2 \
   --batch-sizes 1 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/realtime_vla_pi05.jsonl
+  --run-name pi05_bf16_vision_fp32_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_vision_fp32_views2_bs1.jsonl
 ```
 
-说明：
+这组结果应标为“BF16 language/expert + FP32 vision”，不能写成全 BF16。
 
-| 项 | 说明 |
-| --- | --- |
-| Precision | wrapper 使用 BF16 synthetic inputs |
-| Pickle checkpoint | `.pkl` / `.pickle` 文件只有在可信时才加 `--trust-pickle-checkpoint` |
-| Prompt embedding | 如果 checkpoint 没有 `language_embeds`，wrapper 会为 latency-only 测试创建 synthetic prompt embedding |
+## Batch size sweep
 
-# vla.cpp
-
-vla.cpp 是 server/client 流程。先用 CUDA 编译 `vla-server`，然后在一个 shell 启动 server，在另一个 shell 运行 Python client。
-
-基础检查：
+需要测试 batch scaling 时，在其他设置不变的情况下使用一条命令：
 
 ```bash
-test -x <VLA_SERVER>
-test -f <PI05_GGUF>
-test -f <MM_PROJ_GGUF>
-test -f <TOKENIZER_DIR>/tokenizer.json
-test -f <LIBERO_STATS_JSON>
-```
-
-启动 server：
-
-```bash
-<VLA_SERVER> \
-  --bind tcp://127.0.0.1:5555 \
-  --timing-detail phase \
-  <MM_PROJ_GGUF> \
-  <PI05_GGUF>
-```
-
-运行 latency client：
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_vlacpp_pi05_client.py \
-  --vlacpp-root <VLACPP_REPO> \
-  --addr tcp://127.0.0.1:5555 \
-  --arch pi05 \
-  --tokenizer <TOKENIZER_DIR> \
-  --stats-json <LIBERO_STATS_JSON> \
-  --num-views 2 \
-  --chunk-size 50 \
-  --batch-sizes 1 \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 2 4 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/vlacpp_pi05.jsonl
+  --run-name pi05_bf16_views2_batch_sweep \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_batch_sweep.jsonl
 ```
 
-说明：
+脚本会为每个 batch size 重新构造 Engine，使 `max_batch_size`、scheduler buffer 和 CUDA Graph 与该行结果一致。
 
-| 项 | 说明 |
-| --- | --- |
-| 模型格式 | vla.cpp 需要 GGUF 文件；safetensors checkpoint 不够 |
-| 本地文件 | tokenizer 和 stats 建议都用本地文件，避免测试时触发网络或 HuggingFace 权限问题 |
-| Stats 格式 | PI0.5 下 vla.cpp 需要 lerobot 风格的 `meta/stats.json`；OpenPI 风格的 `norm_stats.json` 不是同一种格式 |
-| 详细计时 | 如果 server 返回 phase timing，wrapper 会写入 `extras.server_phase_latency_ms` |
+# 查看结果
 
-# 计时口径
+结果文件采用追加写入。新的实验应使用新的文件名；如果要复用旧文件名，应先明确处理旧结果，避免把两次实验混在一起。
 
-| Runtime | 计时范围 |
-| --- | --- |
-| FlashRT | 对 steady-state `Pi05TorchFrontendRtx.infer(obs)` 计 wall time；不包含 prompt setup、calibration 和第一次 graph-building 调用 |
-| realtime-vla | 用 CUDA event 计一次 `Pi05Inference.forward(...)` |
-| vla.cpp | 计一次 ZMQ 请求的 client wall time；如果 response 里有 server phase timing，会一并记录 |
+每行 JSONL 包含：
 
-# 常见问题
+- `latency_ms_mean`、`latency_ms_median`、`latency_ms_p50`
+- `latency_ms_p90`、`latency_ms_p99`
+- `latency_ms_stdev`、`latency_ms_min`、`latency_ms_max`
+- `throughput_samples_per_s`
+- batch size、warmup 次数、timed 次数、dtype、device 和 CUDA Graph 状态
 
-| 现象 | 检查方式 |
-| --- | --- |
-| `No module named flash_rt` | 传 `--flashrt-root` 或设置 `FLASHRT_ROOT` |
-| `No module named pi05_infer` | 传 `--realtime-vla-root` 或设置 `REALTIME_VLA_ROOT` |
-| realtime-vla safetensors 转换失败 | 同时传 `--flashrt-root`，并确认 FlashRT import 正常 |
-| vla.cpp client 连不上 | 确认 server 已 ready，且 client `--addr` 和 server `--bind` 一致 |
-| vla.cpp tokenizer 触发下载或鉴权 | 使用本地 tokenizer 目录 |
-| GPU 架构编译报错 | 检查 CUDA、PyTorch CUDA、driver 和目标 GPU 的 build flags |
-| latency 明显偏慢 | 看 `nvidia-smi`，排除 GPU 占用；JIT/warmup 后重新跑 |
+查看最新一行：
+
+```bash
+tail -n 1 results/phyai_pi05_bf16_views2_bs1.jsonl | python -m json.tool
+```
+
+一份可比较的结果至少要保留：完整命令、Git commit、checkpoint 标识、GPU 与 driver、精度、相机数、batch size、warmup 次数、timed 次数和 CUDA Graph 开关。
+
+# 可选外部 runtime
+
+下面三个 wrapper 复用 PhyAI 的 warmup 和结果格式，但推理过程不经过 PhyAI Engine。运行前需要按各自官方仓库配置好对应环境。
+
+| Runtime | 脚本 | 计时范围 | 模型格式 |
+| --- | --- | --- | --- |
+| FlashRT | `benchmark/pi05/bench_flashrt_pi05.py` | steady-state `Pi05TorchFrontendRtx.infer(obs)` wall time | PI0.5 safetensors |
+| realtime-vla | `benchmark/pi05/bench_realtime_vla_pi05.py` | 一次 `Pi05Inference.forward(...)` | 转换后的 checkpoint 或 PI0.5 safetensors |
+| vla.cpp | `benchmark/pi05/bench_vlacpp_pi05_client.py` | 一次 client ZMQ 请求，server phase 另行记录 | PI0.5 GGUF 和 multimodal projector |
+
+通过 `--help` 查看每个 runtime 的必要参数：
+
+```bash
+uv run python benchmark/pi05/bench_flashrt_pi05.py --help
+uv run python benchmark/pi05/bench_realtime_vla_pi05.py --help
+uv run python benchmark/pi05/bench_vlacpp_pi05_client.py --help
+```
+
+做横向对比时，需要对齐 checkpoint 来源、batch size、相机数、action chunk size、prompt shape、warmup、timed iterations 和 runtime 实际精度。如果模型格式或计时边界不同，应把结果单独标注。

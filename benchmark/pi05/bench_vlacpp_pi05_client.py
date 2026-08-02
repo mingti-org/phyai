@@ -35,8 +35,8 @@ import torch
 
 _BENCHMARK_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_BENCHMARK_DIR))
-import bench_n_batch as bnb
-from phyai.utils.profile import (
+import bench_n_batch as bnb  # noqa: E402
+from phyai.utils.profile import (  # noqa: E402
     add_profile_cli_args,
     install_profiler,
     profile_config_from_args,
@@ -121,11 +121,6 @@ def make_setup_fn(args: argparse.Namespace):
         phase_summary: dict[str, Any] = {}
         call_count = 0
 
-        def update_phase_summary() -> None:
-            phase_summary.clear()
-            for key, values in phase_samples.items():
-                phase_summary[key] = summarize(values)
-
         def step() -> None:
             nonlocal call_count
             client.get_action(obs)
@@ -146,9 +141,11 @@ def make_setup_fn(args: argparse.Namespace):
             phase_samples["server_denoise_latency_ms"].append(
                 float(r.latency_ms_denoise)
             )
-            update_phase_summary()
 
         def teardown() -> None:
+            phase_summary.clear()
+            for key, values in phase_samples.items():
+                phase_summary[key] = summarize(values)
             sock = getattr(client, "sock", None)
             if sock is not None:
                 sock.close(linger=0)
@@ -158,8 +155,8 @@ def make_setup_fn(args: argparse.Namespace):
             step_callable=step,
             teardown_callable=teardown,
         )
-        # Attach dynamic summary for extras_fn. The runner copies the dict after
-        # timed steps finish, so it records the final server phase statistics.
+        # The runner writes JSONL after teardown, so the final summary is available
+        # without adding percentile calculations to the timed step.
         spec.vlacpp_phase_summary = phase_summary  # type: ignore[attr-defined]
         return spec
 
