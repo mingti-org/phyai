@@ -111,23 +111,30 @@ test -d "$TOKENIZER_IN_CONTAINER"
 
 # 启动 PhyAI policy server
 
-在一个终端里启动 PI0.5 LIBERO policy server：
+`phyai.policies.pi05_libero` 只是 PhyAI policy adapter，不是 CLI server。WebSocket server 需要通过 `vla-evaluation-harness` 的 server 入口启动：
 
 ```bash
-cd "$PHYAI_ROOT"
+cd "$VLA_ROOT"
 source .venv/bin/activate
 
-python -m phyai.policies.pi05_libero \
-  --checkpoint-dir "$PHYAI_CKPT_IN_CONTAINER" \
-  --tokenizer-path "$TOKENIZER_IN_CONTAINER" \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --chunk-size 10 \
-  --num-images 2 \
-  --dtype bf16
+export PYTHONPATH="$PHYAI_ROOT/phyai/src:$PHYAI_ROOT/phyai-kernel:$PHYAI_ROOT/phyai-utils-tools/src:$VLA_ROOT/src"
+export PHYAI_TOKENIZER_PATH="$TOKENIZER_IN_CONTAINER"
+export PHYAI_CAMERA_MODE=two_camera
+
+python -m vla_eval.model_servers.phyai \
+  --checkpoint_path "$PHYAI_CKPT_IN_CONTAINER" \
+  --device cuda:0 \
+  --params_dtype bfloat16 \
+  --attn_backend flashinfer \
+  --norm_backend phyai-kernel \
+  --linear_backend flashinfer \
+  --flashinfer_workspace_bytes 536870912 \
+  --chunk_size 10 \
+  --host 0.0.0.0 \
+  --port 8000
 ```
 
-server 启动后保持运行。第一次请求通常会触发初始化和图捕获，不建议把这部分算进 benchmark latency。
+server 启动后保持运行。日志出现 `ws://0.0.0.0:8000` 开始监听后，再启动 smoke test；第一次请求通常会触发初始化和图捕获。
 
 # 跑 smoke test
 

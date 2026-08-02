@@ -111,23 +111,30 @@ test -d "$TOKENIZER_IN_CONTAINER"
 
 # Start the Policy Server
 
-Start the PI0.5 LIBERO policy server in one terminal:
+`phyai.policies.pi05_libero` provides the PhyAI policy adapter, but it is not a CLI server. Start the WebSocket server through the `vla-evaluation-harness` server entry point:
 
 ```bash
-cd "$PHYAI_ROOT"
+cd "$VLA_ROOT"
 source .venv/bin/activate
 
-python -m phyai.policies.pi05_libero \
-  --checkpoint-dir "$PHYAI_CKPT_IN_CONTAINER" \
-  --tokenizer-path "$TOKENIZER_IN_CONTAINER" \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --chunk-size 10 \
-  --num-images 2 \
-  --dtype bf16
+export PYTHONPATH="$PHYAI_ROOT/phyai/src:$PHYAI_ROOT/phyai-kernel:$PHYAI_ROOT/phyai-utils-tools/src:$VLA_ROOT/src"
+export PHYAI_TOKENIZER_PATH="$TOKENIZER_IN_CONTAINER"
+export PHYAI_CAMERA_MODE=two_camera
+
+python -m vla_eval.model_servers.phyai \
+  --checkpoint_path "$PHYAI_CKPT_IN_CONTAINER" \
+  --device cuda:0 \
+  --params_dtype bfloat16 \
+  --attn_backend flashinfer \
+  --norm_backend phyai-kernel \
+  --linear_backend flashinfer \
+  --flashinfer_workspace_bytes 536870912 \
+  --chunk_size 10 \
+  --host 0.0.0.0 \
+  --port 8000
 ```
 
-Keep the server running. The first request usually triggers initialization and graph capture, so do not include it in benchmark latency.
+Keep the server running. Wait until the log shows that the server is listening on `ws://0.0.0.0:8000`; the first request usually triggers initialization and graph capture.
 
 # Smoke Test
 
