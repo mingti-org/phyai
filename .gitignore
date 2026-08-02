@@ -107,6 +107,9 @@ skills-lock.json
 # profile
 .profile/
 .memory/
+.auto_research/
+profile/
 
 # For some OpenCode agents
 docs/compose/
+.mimocode/
