@@ -43,6 +43,32 @@ icon: "list-checks"
 
 `paligemma-3b-pt-224` 可能需要 HuggingFace 权限。更稳的做法是从已有权限的机器同步到本机。
 
+# 固定源码版本
+
+本复现流程使用以下两个 PR 中的不可变提交：
+
+| 仓库 | Pull request | 提交 |
+| --- | --- | --- |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`c5a9044`](https://github.com/rebecca26358/phyai/commit/c5a904493b74b29a9126a11caaa72ebd51385169) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`0b2fadb`](https://github.com/rebecca26358/vla-evaluation-harness/commit/0b2fadb3f4b30ad9e2591537120171d9cccee86d) |
+
+检出对应版本：
+
+```bash
+export PHYAI_ROOT=${PHYAI_ROOT:-$HOME/phyai}
+export VLA_ROOT=${VLA_ROOT:-$HOME/vla-evaluation-harness}
+
+git clone https://github.com/rebecca26358/phyai.git "$PHYAI_ROOT"
+git -C "$PHYAI_ROOT" checkout c5a904493b74b29a9126a11caaa72ebd51385169
+
+git clone https://github.com/rebecca26358/vla-evaluation-harness.git "$VLA_ROOT"
+git -C "$VLA_ROOT" checkout 0b2fadb3f4b30ad9e2591537120171d9cccee86d
+```
+
+这个 VLA 版本包含 `src/vla_eval/model_servers/phyai.py` 和
+`configs/model_servers/phyai/libero.yaml`。server 脚本的 PEP 723
+依赖元数据也固定到了同一个 PhyAI 提交。
+
 # 设置路径
 
 先在目标机器上设置路径。下面只用占位路径，按实际机器改即可。
@@ -59,7 +85,7 @@ export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
 export PHYAI_CKPT_IN_CONTAINER=/data/share/pi05_libero_phyai_converted
 export TOKENIZER_IN_CONTAINER=/data/share/paligemma-3b-pt-224
 
-export LIBERO_IMAGE=ghcr.io/allenai/vla-evaluation-harness/libero:latest
+export PHYAI_IMAGE=nvcr.io/nvidia/pytorch:25.12-py3
 ```
 
 检查模型目录：
@@ -69,26 +95,19 @@ test -d "$PHYAI_CKPT_HOST"
 test -d "$TOKENIZER_HOST"
 ```
 
-# 准备 Python 环境
+# 准备评测环境
 
-在 PhyAI 仓库里创建并同步环境：
-
-```bash
-cd "$PHYAI_ROOT"
-uv sync --group cu130 --extra libero
-source .venv/bin/activate
-```
-
-做一次最小导入检查：
+在宿主机同步 VLA 评测环境。这个命令可用于干净 checkout；PhyAI 并没有定义 `cu130` 或 `libero` 依赖组。
 
 ```bash
-python -c "import torch; import phyai; print(torch.__version__, torch.cuda.get_device_name(0))"
-python -c "from phyai.policies.pi05_libero import PI05LiberoPolicy; print(PI05LiberoPolicy)"
+cd "$VLA_ROOT"
+uv sync
 ```
 
-# 准备 LIBERO 容器
+# 准备 PhyAI 运行容器
 
-拉取或构建 `vla-evaluation-harness` 的 LIBERO 镜像。镜像准备好后，启动容器：
+在 PhyAI 使用的 CUDA 13 镜像中运行 policy server。评测器会根据 benchmark
+配置另行启动 LIBERO 仿真镜像。
 
 ```bash
 docker run --gpus all -it --rm \
@@ -96,45 +115,39 @@ docker run --gpus all -it --rm \
   --ipc=host \
   --network=host \
   -v "$PHYAI_ROOT:$PHYAI_ROOT" \
+  -v "$VLA_ROOT:$VLA_ROOT" \
   -v "$MODEL_ROOT:/data/share" \
-  "$LIBERO_IMAGE" \
+  "$PHYAI_IMAGE" \
   bash
 ```
 
-进入容器后，确认能看到代码和模型：
+进入容器后，同步两个干净 checkout，并检查模型路径：
 
 ```bash
-test -d "$PHYAI_ROOT"
+cd "$PHYAI_ROOT"
+uv sync
+
+cd "$VLA_ROOT"
+uv sync
+
 test -d "$PHYAI_CKPT_IN_CONTAINER"
 test -d "$TOKENIZER_IN_CONTAINER"
 ```
 
 # 启动 PhyAI policy server
 
-`phyai.policies.pi05_libero` 只是 PhyAI policy adapter，不是 CLI server。WebSocket server 需要通过 `vla-evaluation-harness` 的 server 入口启动：
+`phyai.policies.pi05_libero` 只是 policy adapter，不是 CLI server。通过 VLA PR #111 新增的配置启动 WebSocket server：
 
 ```bash
 cd "$VLA_ROOT"
-source .venv/bin/activate
 
-export PYTHONPATH="$PHYAI_ROOT/phyai/src:$PHYAI_ROOT/phyai-kernel:$PHYAI_ROOT/phyai-utils-tools/src:$VLA_ROOT/src"
+export PHYAI_CHECKPOINT_PATH="$PHYAI_CKPT_IN_CONTAINER"
 export PHYAI_TOKENIZER_PATH="$TOKENIZER_IN_CONTAINER"
-export PHYAI_CAMERA_MODE=two_camera
 
-python -m vla_eval.model_servers.phyai \
-  --checkpoint_path "$PHYAI_CKPT_IN_CONTAINER" \
-  --device cuda:0 \
-  --params_dtype bfloat16 \
-  --attn_backend flashinfer \
-  --norm_backend phyai-kernel \
-  --linear_backend flashinfer \
-  --flashinfer_workspace_bytes 536870912 \
-  --chunk_size 10 \
-  --host 0.0.0.0 \
-  --port 8000
+uv run vla-eval serve --config configs/model_servers/phyai/libero.yaml
 ```
 
-server 启动后保持运行。日志出现 `ws://0.0.0.0:8000` 开始监听后，再启动 smoke test；第一次请求通常会触发初始化和图捕获。
+保持 server 运行，评测器会连接 `ws://localhost:8000`。
 
 # 跑 smoke test
 
@@ -143,13 +156,7 @@ server 启动后保持运行。日志出现 `ws://0.0.0.0:8000` 开始监听后�
 ```bash
 cd "$VLA_ROOT"
 
-python -m experiments.robot.libero.run_libero_eval \
-  --benchmark libero_spatial \
-  --policy-host 127.0.0.1 \
-  --policy-port 8000 \
-  --num-trials-per-task 1 \
-  --max-steps 20 \
-  --result-dir results/pi05_libero_smoke
+uv run vla-eval run --config configs/benchmarks/libero/smoke_test.yaml
 ```
 
 如果 smoke test 失败，先不要跑完整四套任务。优先检查 server 日志、端口、模型路径和 tokenizer 路径。
@@ -161,13 +168,8 @@ python -m experiments.robot.libero.run_libero_eval \
 ```bash
 cd "$VLA_ROOT"
 
-for suite in libero_spatial libero_object libero_goal libero_10; do
-  python -m experiments.robot.libero.run_libero_eval \
-    --benchmark "$suite" \
-    --policy-host 127.0.0.1 \
-    --policy-port 8000 \
-    --num-trials-per-task 50 \
-    --result-dir "results/pi05_${suite}"
+for suite in spatial object goal 10; do
+  uv run vla-eval run --config "configs/benchmarks/libero/${suite}.yaml"
 done
 ```
 
