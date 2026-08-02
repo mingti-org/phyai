@@ -620,8 +620,7 @@ def _processor_stats(norm_stats_path: Path) -> dict[str, "torch.Tensor"]:
     required = {"state", "actions"}
     if not required.issubset(raw):
         raise ValueError(
-            f"{norm_stats_path} must contain norm_stats.state and "
-            "norm_stats.actions"
+            f"{norm_stats_path} must contain norm_stats.state and " "norm_stats.actions"
         )
 
     tensors: dict[str, torch.Tensor] = {}

@@ -49,7 +49,7 @@ This reproduction uses immutable commits from two linked pull requests:
 
 | Repository | Pull request | Commit |
 | --- | --- | --- |
-| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`5fc3288`](https://github.com/rebecca26358/phyai/commit/5fc3288dcd8fe1de0a3859a28cfa7036e42217d8) |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`3a9a28b`](https://github.com/rebecca26358/phyai/commit/3a9a28b21aa53627a07c3be9fcb86e6adb1b4ae8) |
 | `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`8bb9009`](https://github.com/rebecca26358/vla-evaluation-harness/commit/8bb90099c719ee8d151497c6636e76a9da5d5c6f) |
 
 Check out those exact revisions:
@@ -59,7 +59,7 @@ export PHYAI_ROOT=${PHYAI_ROOT:-$HOME/phyai}
 export VLA_ROOT=${VLA_ROOT:-$HOME/vla-evaluation-harness}
 
 git clone https://github.com/rebecca26358/phyai.git "$PHYAI_ROOT"
-git -C "$PHYAI_ROOT" checkout 5fc3288dcd8fe1de0a3859a28cfa7036e42217d8
+git -C "$PHYAI_ROOT" checkout 3a9a28b21aa53627a07c3be9fcb86e6adb1b4ae8
 
 git clone https://github.com/rebecca26358/vla-evaluation-harness.git "$VLA_ROOT"
 git -C "$VLA_ROOT" checkout 8bb90099c719ee8d151497c6636e76a9da5d5c6f
@@ -68,7 +68,7 @@ git -C "$VLA_ROOT" checkout 8bb90099c719ee8d151497c6636e76a9da5d5c6f
 The VLA revision contains `src/vla_eval/model_servers/phyai.py`,
 `src/vla_eval/model_servers/phyai_wn.py`, and
 `configs/model_servers/phyai/libero.yaml`. Its PEP 723 metadata pins the policy
-implementation commit [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e95665fae38e7d13a737922398eaadb4db24669), an ancestor of the PhyAI checkout above. The later PhyAI commits add documentation and tests without changing the policy implementation.
+implementation commit [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e95665fae38e7d13a737922398eaadb4db24669), an ancestor of the PhyAI checkout above. The later PhyAI commits add documentation, tests, and the checkpoint converter without changing the policy implementation.
 
 # Download and Convert the Checkpoint
 
