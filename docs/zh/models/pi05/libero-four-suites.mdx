@@ -37,8 +37,8 @@ icon: "list-checks"
 | --- | --- |
 | PhyAI 仓库 | 包含 PI0.5 policy 和 benchmark 脚本 |
 | `vla-evaluation-harness` | LIBERO 仿真评测框架 |
-| PI0.5 LIBERO checkpoint | 已转换成 PhyAI 可加载格式 |
-| `paligemma-3b-pt-224` | PI0.5 使用的 tokenizer / processor |
+| PI0.5 LIBERO checkpoint | OpenPI 官方发布的 `pi05_libero` checkpoint，需转换为 PhyAI 可加载格式 |
+| [`google/paligemma-3b-pt-224`](https://huggingface.co/google/paligemma-3b-pt-224) | PI0.5 使用的 tokenizer / processor |
 | Docker + NVIDIA Container Toolkit | 用来启动 LIBERO 仿真容器 |
 
 `paligemma-3b-pt-224` 可能需要 HuggingFace 权限。更稳的做法是从已有权限的机器同步到本机。
@@ -70,6 +70,43 @@ git -C "$VLA_ROOT" checkout 8bb90099c719ee8d151497c6636e76a9da5d5c6f
 `configs/model_servers/phyai/libero.yaml`。其 PEP 723 元数据固定到 policy
 实现提交 [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e95665fae38e7d13a737922398eaadb4db24669)，它是上面 PhyAI checkout 的祖先；后续 PhyAI 提交只增加文档和测试，没有修改 policy 实现。
 
+# 下载并转换 checkpoint
+
+OpenPI 官方在
+[`gs://openpi-assets/checkpoints/pi05_libero`](https://github.com/Physical-Intelligence/openpi/blob/main/examples/libero/README.md)
+发布 LIBERO checkpoint。先把 checkpoint 和 tokenizer 下载到 `MODEL_ROOT`：
+
+```bash
+export MODEL_ROOT=${MODEL_ROOT:-$HOME/phyai_models}
+export OPENPI_CKPT_HOST=$MODEL_ROOT/pi05_libero
+export PHYAI_CKPT_HOST=$MODEL_ROOT/pi05_libero_phyai_converted
+export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
+
+mkdir -p "$MODEL_ROOT"
+gcloud storage rsync --recursive \
+  gs://openpi-assets/checkpoints/pi05_libero \
+  "$OPENPI_CKPT_HOST"
+
+uvx --from huggingface_hub hf download \
+  google/paligemma-3b-pt-224 \
+  --local-dir "$TOKENIZER_HOST"
+```
+
+下载 PaliGemma 前需要在 Hugging Face 接受模型条款并完成登录。接着把 OpenPI
+Orbax checkpoint 转成 `PI05LiberoPolicy` 可读取的 safetensors 和 processor 文件：
+
+```bash
+cd "$PHYAI_ROOT"
+uv run tools/convert_openpi_pi05_to_phyai.py \
+  --checkpoint "$OPENPI_CKPT_HOST" \
+  --write \
+  --out "$PHYAI_CKPT_HOST/model.safetensors"
+```
+
+转换脚本通过 PEP 723 固定依赖版本。它从官方 checkpoint 读取 normalization
+stats，并在 `model.safetensors` 同级目录生成 `config.json`、两份 processor JSON
+和对应的 safetensors sidecar。
+
 # 设置路径
 
 先在目标机器上设置路径。下面只用占位路径，按实际机器改即可。
@@ -80,6 +117,7 @@ export VLA_ROOT=$HOME/vla-evaluation-harness
 export MODEL_ROOT=$HOME/phyai_models
 export PHYAI_CONTAINER=phyai_libero_eval
 
+export OPENPI_CKPT_HOST=$MODEL_ROOT/pi05_libero
 export PHYAI_CKPT_HOST=$MODEL_ROOT/pi05_libero_phyai_converted
 export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
 
@@ -92,7 +130,11 @@ export PHYAI_IMAGE=nvcr.io/nvidia/pytorch:25.12-py3
 检查模型目录：
 
 ```bash
-test -d "$PHYAI_CKPT_HOST"
+test -d "$OPENPI_CKPT_HOST"
+test -f "$PHYAI_CKPT_HOST/model.safetensors"
+test -f "$PHYAI_CKPT_HOST/config.json"
+test -f "$PHYAI_CKPT_HOST/policy_preprocessor.json"
+test -f "$PHYAI_CKPT_HOST/policy_postprocessor.json"
 test -d "$TOKENIZER_HOST"
 ```
 
