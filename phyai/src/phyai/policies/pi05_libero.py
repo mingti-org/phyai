@@ -13,10 +13,17 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from phyai.engine import Engine, EngineArgs
-from phyai.engine_config import BackendConfig, DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.engine_config import (
+    BackendConfig,
+    DeviceConfig,
+    EngineConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
 from phyai.env import envs
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
+from phyai.models.pi05.main_pi05_wn import PI05WNArgs
 from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
 from phyai_utils_tools.models.pi05 import PI05_DEFAULT_TOKENIZER_NAME, PI05Processor
 from phyai_utils_tools.processing.transition import IMAGES, STATE, TASK
@@ -63,11 +70,17 @@ class PI05LiberoPolicy:
         tokenizer_name: str | None = None,
         camera_mode: str | None = None,
         chunk_size: int | None = None,
+        engine_plugin: str = "pi05",
+        world_size: int = 1,
+        dp_size: int = 1,
     ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.device = device
         self.params_dtype = params_dtype
         self.max_batch_size = int(max_batch_size)
+        self.engine_plugin = engine_plugin
+        self.world_size = int(world_size)
+        self.dp_size = int(dp_size)
         self.config = self._read_config()
         self._engine_config = self._resolve_engine_config(chunk_size)
         self.image_size = self._resolve_image_size(self.config)
@@ -106,23 +119,45 @@ class PI05LiberoPolicy:
             device=device,
             params_dtype=params_dtype,
         )
+        if self.engine_plugin == "pi05":
+            plugin_args = PI05Args(
+                checkpoint_dir=self.checkpoint_dir,
+                config=self._engine_config,
+                max_batch_size=self.max_batch_size,
+                weight_remap=_lerobot_pi05_weight_remap,
+                inputs_image_shape=[
+                    [self.image_size, self.image_size, 3] for _ in self.camera_names
+                ],
+            )
+            parallel = ParallelConfig()
+        elif self.engine_plugin == "pi05_wn":
+            plugin_args = PI05WNArgs(
+                checkpoint_dir=self.checkpoint_dir,
+                config=self._engine_config,
+                max_batch_size=self.max_batch_size,
+                weight_remap=_lerobot_pi05_weight_remap,
+                inputs_image_shape=[
+                    [self.image_size, self.image_size, 3] for _ in self.camera_names
+                ],
+            )
+            parallel = ParallelConfig(
+                world_size=self.world_size,
+                dp_size=self.dp_size,
+                tp_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported engine_plugin={self.engine_plugin!r}.")
+
         self.engine = Engine(
             EngineArgs(
-                plugin="pi05",
-                plugin_args=PI05Args(
-                    checkpoint_dir=self.checkpoint_dir,
-                    config=self._engine_config,
-                    max_batch_size=self.max_batch_size,
-                    weight_remap=_lerobot_pi05_weight_remap,
-                    inputs_image_shape=[
-                        [self.image_size, self.image_size, 3] for _ in self.camera_names
-                    ],
-                ),
+                plugin=self.engine_plugin,
+                plugin_args=plugin_args,
                 config=EngineConfig(
                     backends=BackendConfig(
                         attn=attn_backend, norm=norm_backend, linear=linear_backend
                     ),
                     device=DeviceConfig(target=device, params_dtype=params_dtype),
+                    parallel=parallel,
                     runtime=RuntimeConfig(
                         use_cuda_graph=use_cuda_graph,
                         flashinfer_workspace_bytes=flashinfer_workspace_bytes,
@@ -442,7 +477,25 @@ class PI05LiberoPolicy:
     def infer(
         self, obs: dict[str, Any], *, noise: torch.Tensor | np.ndarray | None = None
     ) -> dict[str, np.ndarray]:
-        request_kwargs = self.observation_to_request_inputs(obs)
+        return self.infer_batch([obs], noise=noise)
+
+    def infer_batch(
+        self,
+        obs_batch: list[dict[str, Any]],
+        *,
+        noise: torch.Tensor | np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        if not obs_batch:
+            return {
+                "actions": np.empty(
+                    (0, self.chunk_size, self.action_dim), dtype=np.float32
+                )
+            }
+        request_items = [self.observation_to_request_inputs(obs) for obs in obs_batch]
+        request_kwargs = {
+            key: torch.cat([item[key] for item in request_items], dim=0)
+            for key in ("pixel_values", "input_ids", "lang_lens")
+        }
         if noise is not None:
             request_kwargs["noise"] = torch.as_tensor(noise, device=self.device)
         request = PI05Request(**request_kwargs)
@@ -450,6 +503,29 @@ class PI05LiberoPolicy:
             raw_actions = self.engine.step(request)
         actions = self._postprocess_actions(raw_actions)
         return {"actions": actions}
+
+    def infer_distributed_worker(self) -> None:
+        """Participate in one ``pi05_wn`` step on a non-router rank."""
+        request = PI05Request(
+            pixel_values=torch.empty(
+                1,
+                len(self.camera_names),
+                3,
+                self.image_size,
+                self.image_size,
+                device=self.device,
+                dtype=self.params_dtype,
+            ),
+            input_ids=torch.empty(
+                1,
+                int(self.config.get("tokenizer_max_length", 200)),
+                device=self.device,
+                dtype=torch.int64,
+            ),
+            lang_lens=torch.empty(1, device=self.device, dtype=torch.int64),
+        )
+        with torch.inference_mode():
+            self.engine.step(request)
 
     def close(self) -> None:
         self.engine.close()
