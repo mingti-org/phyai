@@ -135,6 +135,19 @@ test -d "$PHYAI_CKPT_IN_CONTAINER"
 test -d "$TOKENIZER_IN_CONTAINER"
 ```
 
+# Validate the Policy Adapter
+
+Run the lightweight policy tests inside the PhyAI runtime container:
+
+```bash
+cd "$PHYAI_ROOT"
+uv run pytest phyai/tests/policies/test_pi05_libero.py -q
+```
+
+The expected result is `3 passed`. These tests cover the default single-GPU
+configuration, single-observation inference, and batched input concatenation.
+They do not load a checkpoint or execute CUDA model inference.
+
 # Start the Policy Server
 
 `phyai.policies.pi05_libero` is a policy adapter, not a CLI server. Start the WebSocket server through the VLA config added by PR #111:
@@ -157,7 +170,11 @@ In another terminal, run a short check to confirm that the evaluator can reach t
 ```bash
 cd "$VLA_ROOT"
 
-uv run vla-eval run --config configs/benchmarks/libero/smoke_test.yaml
+uv run vla-eval run \
+  --config configs/benchmarks/libero/smoke_test.yaml \
+  --server-url ws://localhost:8000 \
+  --dev \
+  --yes
 ```
 
 If the smoke test fails, stop there and check the server log, port, checkpoint path, and tokenizer path first.
@@ -170,7 +187,11 @@ After confirming that the GPU is idle, run the full evaluation. Save each suite 
 cd "$VLA_ROOT"
 
 for suite in spatial object goal 10; do
-  uv run vla-eval run --config "configs/benchmarks/libero/${suite}.yaml"
+  uv run vla-eval run \
+    --config "configs/benchmarks/libero/${suite}.yaml" \
+    --server-url ws://localhost:8000 \
+    --dev \
+    --yes
 done
 ```
 

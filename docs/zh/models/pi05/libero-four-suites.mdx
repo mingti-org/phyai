@@ -135,6 +135,18 @@ test -d "$PHYAI_CKPT_IN_CONTAINER"
 test -d "$TOKENIZER_IN_CONTAINER"
 ```
 
+# 验证 policy adapter
+
+在 PhyAI 运行容器内执行轻量 policy 测试：
+
+```bash
+cd "$PHYAI_ROOT"
+uv run pytest phyai/tests/policies/test_pi05_libero.py -q
+```
+
+预期结果为 `3 passed`。这些测试覆盖默认单卡配置、单条 observation 推理和
+batch 输入拼接，不会加载 checkpoint，也不会执行 CUDA 模型推理。
+
 # 启动 PhyAI policy server
 
 `phyai.policies.pi05_libero` 只是 policy adapter，不是 CLI server。通过 VLA PR #111 新增的配置启动 WebSocket server：
@@ -157,7 +169,11 @@ uv run vla-eval serve --config configs/model_servers/phyai/libero.yaml
 ```bash
 cd "$VLA_ROOT"
 
-uv run vla-eval run --config configs/benchmarks/libero/smoke_test.yaml
+uv run vla-eval run \
+  --config configs/benchmarks/libero/smoke_test.yaml \
+  --server-url ws://localhost:8000 \
+  --dev \
+  --yes
 ```
 
 如果 smoke test 失败，先不要跑完整四套任务。优先检查 server 日志、端口、模型路径和 tokenizer 路径。
@@ -170,7 +186,11 @@ uv run vla-eval run --config configs/benchmarks/libero/smoke_test.yaml
 cd "$VLA_ROOT"
 
 for suite in spatial object goal 10; do
-  uv run vla-eval run --config "configs/benchmarks/libero/${suite}.yaml"
+  uv run vla-eval run \
+    --config "configs/benchmarks/libero/${suite}.yaml" \
+    --server-url ws://localhost:8000 \
+    --dev \
+    --yes
 done
 ```
 
