@@ -1,0 +1,162 @@
+---
+title: "PI0.5 Eight-GPU Inference"
+description: "Run the PhyAI pi0.5 WN policy with 8-GPU data parallel inference and concurrent LIBERO clients"
+icon: "server"
+---
+
+# Overview
+
+This page explains how to reproduce 8-GPU data-parallel inference for the PhyAI `pi05_wn` policy while running multiple LIBERO clients at the same time.
+
+The current demo uses `chunk_size=1`. Each request returns one action, so the client sends a request at every environment step.
+
+# Reference Environment
+
+| Item | Configuration |
+| --- | --- |
+| OS | Ubuntu 22.04 LTS |
+| GPU | 8 x NVIDIA H20, about 96 GB per GPU |
+| CPU / memory | 192 cores / about 1.8 TiB |
+| Containers | Docker, with both server and LIBERO running in containers |
+| Session | `tmux` keeps the server alive |
+
+Other machines can use the same flow. You need 8 idle CUDA GPUs, Docker, `tmux`, the PI0.5 LIBERO checkpoint, and an offline tokenizer. Different GPU models mainly change latency.
+
+# Paths
+
+Set these paths for your machine:
+
+```bash
+export WORKSPACE="$HOME/vla_workplace"
+export PHYAI_ROOT="$WORKSPACE/phyai"
+export VLA_ROOT="$WORKSPACE/vla-evaluation-harness"
+export MODEL_ROOT="$WORKSPACE/phyai_models"
+```
+
+Check the required files before starting:
+
+```bash
+ls "$MODEL_ROOT/pi05_libero_phyai_converted"
+ls "$MODEL_ROOT/paligemma-3b-pt-224"
+ls "$PHYAI_ROOT/.venv/bin/torchrun"
+ls "$VLA_ROOT/.venv/bin/vla-eval"
+
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
+ss -ltnp | grep 8000 || echo "8000 free"
+```
+
+Keep `paligemma-3b-pt-224` local. The scripts run in offline mode, so tokenizer download should not happen during the run.
+
+# Execution Flow
+
+```text
+32 LIBERO simulation processes
+  -> connect to the rank0 WebSocket server at ws://127.0.0.1:8000
+  -> rank0 collects requests until MAX_BATCH_SIZE is reached or MAX_WAIT_TIME expires
+  -> 8-GPU DP: scatter -> each GPU runs its batch slice -> gather
+  -> server returns actions
+  -> each simulation writes one JSON result
+```
+
+Demo parameters:
+
+| Item | Value |
+| --- | --- |
+| Number of GPUs | 8 |
+| `max_batch_size` | 32, B=4 per GPU |
+| `chunk_size` | 1 |
+| `max_wait_time` | 0.02 |
+| dtype | bfloat16 |
+
+CUDA graph uses a fixed shape. Requests below the full batch size are padded, so a partial batch is not proportionally faster.
+
+# Start the 8-GPU Server
+
+Start the server inside a Docker container. The container must mount `PHYAI_ROOT`, `VLA_ROOT`, and `MODEL_ROOT`. The core command is:
+
+```bash
+export PHYAI_TOKENIZER_PATH=/data/share/paligemma-3b-pt-224
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+torchrun --nproc_per_node=8 --master_port=29619 \
+  -m vla_eval.model_servers.phyai_wn \
+  --checkpoint_path /data/share/pi05_libero_phyai_converted \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --chunk_size 1 \
+  --max_batch_size 32 \
+  --max_wait_time 0.02 \
+  --use_cuda_graph \
+  --params_dtype bfloat16 \
+  --attn_backend flashinfer \
+  --norm_backend phyai-kernel \
+  --linear_backend flashinfer
+```
+
+The first start usually takes 1 to 3 minutes for CUDA graph capture. Check readiness with:
+
+```bash
+curl -sS http://127.0.0.1:8000/config
+```
+
+The response should include `max_batch_size=32`. If the server is running inside `tmux`, inspect logs with:
+
+```bash
+tmux attach -t <server_session>
+# detach: Ctrl-b, then d
+```
+
+# Start LIBERO Clients
+
+Start 32 LIBERO clients: 4 suites, 8 shards per suite, all connected to the same server.
+
+```bash
+for suite in spatial object goal libero_10; do
+  for shard_id in 0 1 2 3 4 5 6 7; do
+    env NO_PROXY="*" no_proxy="*" \
+      "$VLA_ROOT/.venv/bin/vla-eval" run \
+        --config "<suite yaml>" \
+        --server-url ws://127.0.0.1:8000 \
+        --output-dir "<result dir>/$suite" \
+        --dev --yes \
+        --shard-id "$shard_id" \
+        --num-shards 8 &
+  done
+done
+wait
+```
+
+Replace `<suite yaml>` with the matching LIBERO config file. Each result directory should contain JSON output after the run.
+
+# Change Parameters
+
+| Goal | Change |
+| --- | --- |
+| Change chunk size | Set server `--chunk_size N` |
+| Run batch16 | Set `--max_batch_size 16` and start only 16 clients |
+| Change port | Update server `--port`, client `--server-url`, and result directory together |
+
+Run batch16 and batch32 with separate server launches. Do not switch batch size inside one `torchrun` process.
+
+Reference pure-model `Engine.step` latency: batch16 is about 60 ms, and batch32 is about 97 ms. This measures model inference only, not LIBERO end-to-end wait time.
+
+# Cleanup
+
+After evaluation, stop the server and confirm that GPU memory is released:
+
+```bash
+tmux kill-session -t <server_session>
+docker rm -f <server_container> 2>/dev/null || true
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits
+```
+
+# Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Setup hangs | Offline tokenizer, `master_port`, same-name containers, and GPU memory usage |
+| `:8000/config` fails | Wait for graph capture, or inspect the server log |
+| Shards cannot connect | Host networking, `ws://127.0.0.1:8000`, and `NO_PROXY="*"` |
+| Partial results | Check the logs under the corresponding result directory |
+| FlashInfer / CUDA conflicts | Prefer Docker and avoid mixing host CUDA libraries |

@@ -1,0 +1,196 @@
+---
+title: "PI0.5 External Runtime Latency"
+description: "Run PI0.5 latency benchmarks for FlashRT, realtime-vla, and vla.cpp"
+icon: "timer"
+---
+
+# Overview
+
+This page explains how to set up and run the three external PI0.5 latency wrappers under `benchmark/pi05/`.
+
+These wrappers do not use the PhyAI engine for inference. Each wrapper calls the target runtime directly, while reusing PhyAI's common benchmark runner for warmup, timing, and JSONL output.
+
+| Script | Runtime | Timed call |
+| --- | --- | --- |
+| `bench_flashrt_pi05.py` | FlashRT | `Pi05TorchFrontendRtx.infer(obs)` |
+| `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward(...)` |
+| `bench_vlacpp_pi05_client.py` | vla.cpp | One ZMQ request to a running `vla-server` |
+
+The wrappers generate synthetic image and state inputs. Use them for latency-only measurements, not LIBERO accuracy evaluation.
+
+# Common Setup
+
+Use a Python environment that can import PhyAI, PyTorch, and the common benchmark runner.
+
+```bash
+cd <PHYAI_REPO>
+python -c "import torch; import phyai; import benchmark.bench_n_batch"
+nvidia-smi
+```
+
+Keep these settings aligned when comparing runtimes:
+
+| Item | Setting |
+| --- | --- |
+| Batch size | 1 |
+| Camera streams | 2 |
+| Chunk size | 50 |
+| Prompt | Same prompt text across runs |
+| Warmup / timed iterations | Same values across runs |
+| Precision | Label each row by the runtime's real precision path |
+
+Use your own paths for these placeholders:
+
+| Placeholder | Meaning |
+| --- | --- |
+| `<PHYAI_REPO>` | PhyAI checkout containing `benchmark/pi05/` |
+| `<FLASHRT_REPO>` | FlashRT checkout |
+| `<REALTIME_VLA_REPO>` | realtime-vla checkout |
+| `<VLACPP_REPO>` | vla.cpp checkout |
+| `<VLA_SERVER>` | Compiled vla.cpp `vla-server` binary |
+| `<PI05_CHECKPOINT>` | PI0.5 safetensors checkpoint directory or file |
+| `<PI05_GGUF>` | PI0.5 GGUF file for vla.cpp |
+| `<MM_PROJ_GGUF>` | vla.cpp multimodal projector GGUF |
+| `<TOKENIZER_DIR>` | Local tokenizer directory |
+| `<LIBERO_STATS_JSON>` | LIBERO `meta/stats.json` with `observation.state.q01/q99` |
+
+# FlashRT
+
+Install FlashRT from its official repository, then make the checkout visible to the wrapper.
+
+```bash
+export FLASHRT_ROOT=<FLASHRT_REPO>
+cd <PHYAI_REPO>
+python -c "import sys; sys.path.insert(0, '$FLASHRT_ROOT'); from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx; print(Pi05TorchFrontendRtx)"
+```
+
+Run latency:
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_flashrt_pi05.py \
+  --flashrt-root <FLASHRT_REPO> \
+  --checkpoint <PI05_CHECKPOINT> \
+  --precision bf16 \
+  --num-views 2 \
+  --chunk-size 50 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/flashrt_pi05.jsonl
+```
+
+Notes:
+
+| Item | Note |
+| --- | --- |
+| Chunk size | The wrapper uses FlashRT's direct `Pi05TorchFrontendRtx` API because `chunk_size` is a frontend constructor argument |
+| Denoise steps | Do not use `load_model(..., num_steps=50)` to set action chunk size; in FlashRT, `num_steps` means denoise steps |
+| Precision | `--precision bf16` uses FlashRT's forced-BF16 PI0.5 RTX path; `--precision fp8_bf16` is a separate optimized FP8/BF16 result |
+
+# realtime-vla
+
+Install realtime-vla from its official repository. The wrapper can load a converted `.pt` / `.pth` checkpoint directly. If you pass a PI0.5 safetensors checkpoint, also provide FlashRT so the wrapper can reuse FlashRT's conversion helper.
+
+```bash
+export REALTIME_VLA_ROOT=<REALTIME_VLA_REPO>
+export FLASHRT_ROOT=<FLASHRT_REPO>
+cd <PHYAI_REPO>
+python -c "import sys; sys.path.insert(0, '$REALTIME_VLA_ROOT'); from pi05_infer import Pi05Inference; print(Pi05Inference)"
+```
+
+Run latency:
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_realtime_vla_pi05.py \
+  --realtime-vla-root <REALTIME_VLA_REPO> \
+  --flashrt-root <FLASHRT_REPO> \
+  --checkpoint <PI05_CHECKPOINT> \
+  --num-views 2 \
+  --chunk-size 50 \
+  --prompt-len 16 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/realtime_vla_pi05.jsonl
+```
+
+Notes:
+
+| Item | Note |
+| --- | --- |
+| Precision | The wrapper uses BF16 synthetic inputs |
+| Pickle checkpoints | For `.pkl` / `.pickle`, add `--trust-pickle-checkpoint` only for trusted files |
+| Prompt embedding | If the checkpoint does not contain `language_embeds`, the wrapper creates a synthetic prompt embedding for latency-only runs |
+
+# vla.cpp
+
+vla.cpp uses a server/client flow. Build `vla-server` with CUDA enabled, then start the server in one shell and run the Python client in another.
+
+Basic checks:
+
+```bash
+test -x <VLA_SERVER>
+test -f <PI05_GGUF>
+test -f <MM_PROJ_GGUF>
+test -f <TOKENIZER_DIR>/tokenizer.json
+test -f <LIBERO_STATS_JSON>
+```
+
+Start server:
+
+```bash
+<VLA_SERVER> \
+  --bind tcp://127.0.0.1:5555 \
+  --timing-detail phase \
+  <MM_PROJ_GGUF> \
+  <PI05_GGUF>
+```
+
+Run latency client:
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_vlacpp_pi05_client.py \
+  --vlacpp-root <VLACPP_REPO> \
+  --addr tcp://127.0.0.1:5555 \
+  --arch pi05 \
+  --tokenizer <TOKENIZER_DIR> \
+  --stats-json <LIBERO_STATS_JSON> \
+  --num-views 2 \
+  --chunk-size 50 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/vlacpp_pi05.jsonl
+```
+
+Notes:
+
+| Item | Note |
+| --- | --- |
+| Model format | vla.cpp needs GGUF files; a safetensors checkpoint is not enough |
+| Local files | Prefer local tokenizer and stats files to avoid network or HuggingFace auth issues |
+| Stats format | For PI0.5, vla.cpp expects lerobot-style `meta/stats.json`; OpenPI-style `norm_stats.json` is not the same format |
+| Timing detail | If the server returns phase timing, the wrapper writes it under `extras.server_phase_latency_ms` |
+
+# Timing Scope
+
+| Runtime | Timing scope |
+| --- | --- |
+| FlashRT | Wall time around steady-state `Pi05TorchFrontendRtx.infer(obs)`, after prompt setup, calibration, and the first graph-building call |
+| realtime-vla | CUDA-event time around one `Pi05Inference.forward(...)` call |
+| vla.cpp | Client wall time for one ZMQ request; server phase timing is copied from the response when available |
+
+# Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `No module named flash_rt` | Pass `--flashrt-root` or set `FLASHRT_ROOT` |
+| `No module named pi05_infer` | Pass `--realtime-vla-root` or set `REALTIME_VLA_ROOT` |
+| realtime-vla safetensors conversion fails | Also pass `--flashrt-root`; verify the FlashRT import works |
+| vla.cpp client cannot connect | Confirm the server is ready and client `--addr` matches server `--bind` |
+| vla.cpp tokenizer downloads or asks for auth | Use a local tokenizer directory |
+| GPU architecture build error | Check CUDA, PyTorch CUDA, driver, and build flags for the target GPU |
+| Latency is much slower than expected | Check `nvidia-smi`, rerun after warmup/JIT, and make sure no other process is using the GPU |

@@ -1,0 +1,196 @@
+---
+title: "PI0.5 外部 Runtime 延迟测试"
+description: "使用 FlashRT、realtime-vla 和 vla.cpp 跑 PI0.5 latency benchmark"
+icon: "timer"
+---
+
+# 概述
+
+这篇文档说明如何配置并运行 `benchmark/pi05/` 下的三个外部 PI0.5 latency wrapper。
+
+这些 wrapper 不使用 PhyAI engine 做推理。每个脚本会直接调用对应 runtime，同时复用 PhyAI 的通用 benchmark runner 来做 warmup、计时和 JSONL 输出。
+
+| 脚本 | Runtime | 计时调用 |
+| --- | --- | --- |
+| `bench_flashrt_pi05.py` | FlashRT | `Pi05TorchFrontendRtx.infer(obs)` |
+| `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward(...)` |
+| `bench_vlacpp_pi05_client.py` | vla.cpp | 向运行中的 `vla-server` 发一次 ZMQ 请求 |
+
+这些脚本会生成 synthetic image 和 state 输入，只用于 latency 测试，不用于 LIBERO accuracy 评测。
+
+# 通用环境
+
+需要一个能 import PhyAI、PyTorch 和通用 benchmark runner 的 Python 环境。
+
+```bash
+cd <PHYAI_REPO>
+python -c "import torch; import phyai; import benchmark.bench_n_batch"
+nvidia-smi
+```
+
+对比不同 runtime 时，下面这些设置要对齐：
+
+| 项 | 设置 |
+| --- | --- |
+| Batch size | 1 |
+| Camera streams | 2 |
+| Chunk size | 50 |
+| Prompt | 各 runtime 使用相同 prompt 文本 |
+| Warmup / timed iterations | 各 runtime 使用相同次数 |
+| Precision | 按 runtime 的实际精度路径标注结果 |
+
+下面的命令都使用占位路径：
+
+| 占位符 | 含义 |
+| --- | --- |
+| `<PHYAI_REPO>` | 包含 `benchmark/pi05/` 的 PhyAI 仓库 |
+| `<FLASHRT_REPO>` | FlashRT 仓库 |
+| `<REALTIME_VLA_REPO>` | realtime-vla 仓库 |
+| `<VLACPP_REPO>` | vla.cpp 仓库 |
+| `<VLA_SERVER>` | 编译后的 vla.cpp `vla-server` 二进制文件 |
+| `<PI05_CHECKPOINT>` | PI0.5 safetensors checkpoint 目录或文件 |
+| `<PI05_GGUF>` | vla.cpp 使用的 PI0.5 GGUF 文件 |
+| `<MM_PROJ_GGUF>` | vla.cpp multimodal projector GGUF 文件 |
+| `<TOKENIZER_DIR>` | 本地 tokenizer 目录 |
+| `<LIBERO_STATS_JSON>` | LIBERO `meta/stats.json`，包含 `observation.state.q01/q99` |
+
+# FlashRT
+
+先按 FlashRT 官方仓库说明安装，然后把仓库路径暴露给 wrapper。
+
+```bash
+export FLASHRT_ROOT=<FLASHRT_REPO>
+cd <PHYAI_REPO>
+python -c "import sys; sys.path.insert(0, '$FLASHRT_ROOT'); from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx; print(Pi05TorchFrontendRtx)"
+```
+
+运行 latency：
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_flashrt_pi05.py \
+  --flashrt-root <FLASHRT_REPO> \
+  --checkpoint <PI05_CHECKPOINT> \
+  --precision bf16 \
+  --num-views 2 \
+  --chunk-size 50 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/flashrt_pi05.jsonl
+```
+
+说明：
+
+| 项 | 说明 |
+| --- | --- |
+| Chunk size | wrapper 直接使用 FlashRT 的 `Pi05TorchFrontendRtx` API，因为 `chunk_size` 是 frontend 构造参数 |
+| Denoise steps | 不要用 `load_model(..., num_steps=50)` 设置 action chunk size；FlashRT 里的 `num_steps` 表示 denoise steps |
+| Precision | `--precision bf16` 使用 FlashRT 的 forced-BF16 PI0.5 RTX 路径；`--precision fp8_bf16` 是单独的 FP8/BF16 优化结果 |
+
+# realtime-vla
+
+先按 realtime-vla 官方仓库说明安装。wrapper 可以直接加载转换后的 `.pt` / `.pth` checkpoint。如果传入 PI0.5 safetensors checkpoint，还需要提供 FlashRT 路径，用它的 PI0.5 转换 helper。
+
+```bash
+export REALTIME_VLA_ROOT=<REALTIME_VLA_REPO>
+export FLASHRT_ROOT=<FLASHRT_REPO>
+cd <PHYAI_REPO>
+python -c "import sys; sys.path.insert(0, '$REALTIME_VLA_ROOT'); from pi05_infer import Pi05Inference; print(Pi05Inference)"
+```
+
+运行 latency：
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_realtime_vla_pi05.py \
+  --realtime-vla-root <REALTIME_VLA_REPO> \
+  --flashrt-root <FLASHRT_REPO> \
+  --checkpoint <PI05_CHECKPOINT> \
+  --num-views 2 \
+  --chunk-size 50 \
+  --prompt-len 16 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/realtime_vla_pi05.jsonl
+```
+
+说明：
+
+| 项 | 说明 |
+| --- | --- |
+| Precision | wrapper 使用 BF16 synthetic inputs |
+| Pickle checkpoint | `.pkl` / `.pickle` 文件只有在可信时才加 `--trust-pickle-checkpoint` |
+| Prompt embedding | 如果 checkpoint 没有 `language_embeds`，wrapper 会为 latency-only 测试创建 synthetic prompt embedding |
+
+# vla.cpp
+
+vla.cpp 是 server/client 流程。先用 CUDA 编译 `vla-server`，然后在一个 shell 启动 server，在另一个 shell 运行 Python client。
+
+基础检查：
+
+```bash
+test -x <VLA_SERVER>
+test -f <PI05_GGUF>
+test -f <MM_PROJ_GGUF>
+test -f <TOKENIZER_DIR>/tokenizer.json
+test -f <LIBERO_STATS_JSON>
+```
+
+启动 server：
+
+```bash
+<VLA_SERVER> \
+  --bind tcp://127.0.0.1:5555 \
+  --timing-detail phase \
+  <MM_PROJ_GGUF> \
+  <PI05_GGUF>
+```
+
+运行 latency client：
+
+```bash
+cd <PHYAI_REPO>
+python benchmark/pi05/bench_vlacpp_pi05_client.py \
+  --vlacpp-root <VLACPP_REPO> \
+  --addr tcp://127.0.0.1:5555 \
+  --arch pi05 \
+  --tokenizer <TOKENIZER_DIR> \
+  --stats-json <LIBERO_STATS_JSON> \
+  --num-views 2 \
+  --chunk-size 50 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --result-file results/vlacpp_pi05.jsonl
+```
+
+说明：
+
+| 项 | 说明 |
+| --- | --- |
+| 模型格式 | vla.cpp 需要 GGUF 文件；safetensors checkpoint 不够 |
+| 本地文件 | tokenizer 和 stats 建议都用本地文件，避免测试时触发网络或 HuggingFace 权限问题 |
+| Stats 格式 | PI0.5 下 vla.cpp 需要 lerobot 风格的 `meta/stats.json`；OpenPI 风格的 `norm_stats.json` 不是同一种格式 |
+| 详细计时 | 如果 server 返回 phase timing，wrapper 会写入 `extras.server_phase_latency_ms` |
+
+# 计时口径
+
+| Runtime | 计时范围 |
+| --- | --- |
+| FlashRT | 对 steady-state `Pi05TorchFrontendRtx.infer(obs)` 计 wall time；不包含 prompt setup、calibration 和第一次 graph-building 调用 |
+| realtime-vla | 用 CUDA event 计一次 `Pi05Inference.forward(...)` |
+| vla.cpp | 计一次 ZMQ 请求的 client wall time；如果 response 里有 server phase timing，会一并记录 |
+
+# 常见问题
+
+| 现象 | 检查方式 |
+| --- | --- |
+| `No module named flash_rt` | 传 `--flashrt-root` 或设置 `FLASHRT_ROOT` |
+| `No module named pi05_infer` | 传 `--realtime-vla-root` 或设置 `REALTIME_VLA_ROOT` |
+| realtime-vla safetensors 转换失败 | 同时传 `--flashrt-root`，并确认 FlashRT import 正常 |
+| vla.cpp client 连不上 | 确认 server 已 ready，且 client `--addr` 和 server `--bind` 一致 |
+| vla.cpp tokenizer 触发下载或鉴权 | 使用本地 tokenizer 目录 |
+| GPU 架构编译报错 | 检查 CUDA、PyTorch CUDA、driver 和目标 GPU 的 build flags |
+| latency 明显偏慢 | 看 `nvidia-smi`，排除 GPU 占用；JIT/warmup 后重新跑 |

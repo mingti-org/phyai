@@ -26,10 +26,19 @@
             "group": "Models",
             "pages": [
               {
+                "group": "PI0",
+                "pages": [
+                  "models/pi0/ws1"
+                ]
+              },
+              {
                 "group": "PI0.5",
                 "pages": [
                   "models/pi05/ws1",
-                  "models/pi05/processors"
+                  "models/pi05/processors",
+                  "models/pi05/libero-four-suites",
+                  "models/pi05/eight-gpu-inference",
+                  "models/pi05/external-runtime-latency"
                 ]
               },
               {
@@ -37,15 +46,31 @@
                 "pages": [
                   "models/cosmos/ws1",
                   "models/cosmos/ws1_policy",
+                  "models/cosmos/wn",
+                  "models/cosmos/wn_policy",
                   "models/cosmos/processors"
                 ]
               }
             ]
           },
           {
+            "group": "Quantization",
+            "pages": [
+              "quantization/overview",
+              "quantization/configuration",
+              "quantization/internals"
+            ]
+          },
+          {
             "group": "Tools",
             "pages": [
               "tools/tensor-dump"
+            ]
+          },
+          {
+            "group": "Developer guide",
+            "pages": [
+              "developer_guide/code-of-conduct"
             ]
           }
         ]
@@ -65,10 +90,19 @@
             "group": "模型",
             "pages": [
               {
+                "group": "PI0",
+                "pages": [
+                  "zh/models/pi0/ws1"
+                ]
+              },
+              {
                 "group": "PI0.5",
                 "pages": [
                   "zh/models/pi05/ws1",
-                  "zh/models/pi05/processors"
+                  "zh/models/pi05/processors",
+                  "zh/models/pi05/libero-four-suites",
+                  "zh/models/pi05/eight-gpu-inference",
+                  "zh/models/pi05/external-runtime-latency"
                 ]
               },
               {
@@ -76,15 +110,31 @@
                 "pages": [
                   "zh/models/cosmos/ws1",
                   "zh/models/cosmos/ws1_policy",
+                  "zh/models/cosmos/wn",
+                  "zh/models/cosmos/wn_policy",
                   "zh/models/cosmos/processors"
                 ]
               }
             ]
           },
           {
+            "group": "量化",
+            "pages": [
+              "zh/quantization/overview",
+              "zh/quantization/configuration",
+              "zh/quantization/internals"
+            ]
+          },
+          {
             "group": "工具",
             "pages": [
               "zh/tools/tensor-dump"
+            ]
+          },
+          {
+            "group": "开发者指南",
+            "pages": [
+              "zh/developer_guide/code-of-conduct"
             ]
           }
         ]

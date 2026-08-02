@@ -1,0 +1,198 @@
+---
+title: "PI0.5 LIBERO 四套任务复现"
+description: "使用 PhyAI pi0.5 policy 跑 LIBERO spatial、object、goal 和 libero_10 四套评测"
+icon: "list-checks"
+---
+
+# 概述
+
+这篇文档说明如何用 PhyAI 的 PI0.5 LIBERO policy 跑完 `vla-evaluation-harness` 里的四套 LIBERO benchmark。
+
+四套任务对应关系如下：
+
+| Suite | 配置文件 |
+| --- | --- |
+| `libero_spatial` | `configs/benchmarks/libero/spatial.yaml` |
+| `libero_object` | `configs/benchmarks/libero/object.yaml` |
+| `libero_goal` | `configs/benchmarks/libero/goal.yaml` |
+| `libero_10` | `configs/benchmarks/libero/10.yaml` |
+
+默认评测设置：
+
+| 项目 | 设置 |
+| --- | --- |
+| 运行模式 | sync |
+| Action chunk size | 10 |
+| 每套任务 episode 数 | 10 tasks x 50 episodes |
+| 总 episode 数 | 4 suites x 500 episodes |
+| 模型 | PI0.5 LIBERO converted checkpoint |
+| 仿真环境 | `vla-evaluation-harness` LIBERO Docker container |
+| 输出 | 每套任务一个 JSON 结果文件 |
+
+# 准备资源
+
+需要先准备这些资源：
+
+| 资源 | 说明 |
+| --- | --- |
+| PhyAI 仓库 | 包含 PI0.5 policy 和 benchmark 脚本 |
+| `vla-evaluation-harness` | LIBERO 仿真评测框架 |
+| PI0.5 LIBERO checkpoint | 已转换成 PhyAI 可加载格式 |
+| `paligemma-3b-pt-224` | PI0.5 使用的 tokenizer / processor |
+| Docker + NVIDIA Container Toolkit | 用来启动 LIBERO 仿真容器 |
+
+`paligemma-3b-pt-224` 可能需要 HuggingFace 权限。更稳的做法是从已有权限的机器同步到本机。
+
+# 设置路径
+
+先在目标机器上设置路径。下面只用占位路径，按实际机器改即可。
+
+```bash
+export PHYAI_ROOT=$HOME/phyai
+export VLA_ROOT=$HOME/vla-evaluation-harness
+export MODEL_ROOT=$HOME/phyai_models
+export PHYAI_CONTAINER=phyai_libero_eval
+
+export PHYAI_CKPT_HOST=$MODEL_ROOT/pi05_libero_phyai_converted
+export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
+
+export PHYAI_CKPT_IN_CONTAINER=/data/share/pi05_libero_phyai_converted
+export TOKENIZER_IN_CONTAINER=/data/share/paligemma-3b-pt-224
+
+export LIBERO_IMAGE=ghcr.io/allenai/vla-evaluation-harness/libero:latest
+```
+
+检查模型目录：
+
+```bash
+test -d "$PHYAI_CKPT_HOST"
+test -d "$TOKENIZER_HOST"
+```
+
+# 准备 Python 环境
+
+在 PhyAI 仓库里创建并同步环境：
+
+```bash
+cd "$PHYAI_ROOT"
+uv sync --group cu130 --extra libero
+source .venv/bin/activate
+```
+
+做一次最小导入检查：
+
+```bash
+python -c "import torch; import phyai; print(torch.__version__, torch.cuda.get_device_name(0))"
+python -c "from phyai.policies.pi05_libero import PI05LiberoPolicy; print(PI05LiberoPolicy)"
+```
+
+# 准备 LIBERO 容器
+
+拉取或构建 `vla-evaluation-harness` 的 LIBERO 镜像。镜像准备好后，启动容器：
+
+```bash
+docker run --gpus all -it --rm \
+  --name "$PHYAI_CONTAINER" \
+  --ipc=host \
+  --network=host \
+  -v "$PHYAI_ROOT:$PHYAI_ROOT" \
+  -v "$MODEL_ROOT:/data/share" \
+  "$LIBERO_IMAGE" \
+  bash
+```
+
+进入容器后，确认能看到代码和模型：
+
+```bash
+test -d "$PHYAI_ROOT"
+test -d "$PHYAI_CKPT_IN_CONTAINER"
+test -d "$TOKENIZER_IN_CONTAINER"
+```
+
+# 启动 PhyAI policy server
+
+在一个终端里启动 PI0.5 LIBERO policy server：
+
+```bash
+cd "$PHYAI_ROOT"
+source .venv/bin/activate
+
+python -m phyai.policies.pi05_libero \
+  --checkpoint-dir "$PHYAI_CKPT_IN_CONTAINER" \
+  --tokenizer-path "$TOKENIZER_IN_CONTAINER" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --chunk-size 10 \
+  --num-images 2 \
+  --dtype bf16
+```
+
+server 启动后保持运行。第一次请求通常会触发初始化和图捕获，不建议把这部分算进 benchmark latency。
+
+# 跑 smoke test
+
+在另一个终端里跑一次很短的检查，确认 evaluator 能连到 policy server：
+
+```bash
+cd "$VLA_ROOT"
+
+python -m experiments.robot.libero.run_libero_eval \
+  --benchmark libero_spatial \
+  --policy-host 127.0.0.1 \
+  --policy-port 8000 \
+  --num-trials-per-task 1 \
+  --max-steps 20 \
+  --result-dir results/pi05_libero_smoke
+```
+
+如果 smoke test 失败，先不要跑完整四套任务。优先检查 server 日志、端口、模型路径和 tokenizer 路径。
+
+# 跑四套任务
+
+确认 GPU 空闲后，再跑完整评测。建议每套任务单独保存结果。
+
+```bash
+cd "$VLA_ROOT"
+
+for suite in libero_spatial libero_object libero_goal libero_10; do
+  python -m experiments.robot.libero.run_libero_eval \
+    --benchmark "$suite" \
+    --policy-host 127.0.0.1 \
+    --policy-port 8000 \
+    --num-trials-per-task 50 \
+    --result-dir "results/pi05_${suite}"
+done
+```
+
+运行时记录这些信息，后续对齐结果会用到：
+
+| 项目 | 需要记录 |
+| --- | --- |
+| PhyAI commit | `git rev-parse HEAD` |
+| checkpoint | checkpoint 名称和来源 |
+| tokenizer | 本地目录或 HF id |
+| GPU | `nvidia-smi --query-gpu=name --format=csv,noheader` |
+| dtype | 例如 `bf16` |
+| chunk size | 例如 `10` |
+| camera view 数 | 例如 `2` |
+| 每套任务 episode 数 | 例如 `500` |
+
+# 汇总结果
+
+每套 benchmark 结束后，结果目录里会有对应 JSON 文件。可用下面的方式快速看成功率和平均耗时字段：
+
+```bash
+python - <<PY
+import json
+from pathlib import Path
+
+for path in sorted(Path("results").glob("pi05_libero_*/*.json")):
+    data = json.loads(path.read_text())
+    print(path)
+    for key in ("success_rate", "avg_success", "avg_episode_length", "avg_time"):
+        if key in data:
+            print(f"  {key}: {data[key]}")
+PY
+```
+
+不同版本的 `vla-evaluation-harness` 输出字段可能不完全一样。最终提交结果时，以实际 JSON 中的字段为准。
