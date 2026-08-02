@@ -33,6 +33,8 @@ import torch.nn.functional as F
 try:
     from compare_pi0_lerobot_live import (
         add_lerobot_to_path,
+        choose_attn_backend,
+        cuda_device_from_name,
         dtype_from_name,
         import_lerobot_symbols,
         is_empty_camera_key,
@@ -44,6 +46,8 @@ try:
 except ModuleNotFoundError:
     from benchmark.pi0.compare_pi0_lerobot_live import (
         add_lerobot_to_path,
+        choose_attn_backend,
+        cuda_device_from_name,
         dtype_from_name,
         import_lerobot_symbols,
         is_empty_camera_key,
@@ -141,10 +145,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional LeRobot checkout root. Its src/ directory is prepended to sys.path.",
     )
-    ap.add_argument("--device", default="cuda")
     ap.add_argument(
-        "--dtype", default="bfloat16", choices=("float32", "bf16", "bfloat16")
+        "--device",
+        default="cuda",
+        help="Use cuda/cuda:0 after binding the physical GPU with CUDA_VISIBLE_DEVICES.",
     )
+    ap.add_argument("--dtype", default="bfloat16", choices=("bf16", "bfloat16"))
     ap.add_argument(
         "--vision-dtype",
         default="float32",
@@ -239,6 +245,14 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def load_payload(path: Path) -> dict[str, Any]:
+    """Load a tensor-only payload produced by the live comparison tool."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected payload to be a dict, got {type(payload)!r}.")
+    return payload
+
+
 def cpu(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().float().cpu()
 
@@ -266,12 +280,6 @@ def patch_method(
 def restore_patches(patches: list[tuple[Any, str, Any]]) -> None:
     for obj, name, old_value in reversed(patches):
         setattr(obj, name, old_value)
-
-
-def phyai_attn_backend(name: str | None) -> str:
-    if name is None or name == "auto":
-        return "flashinfer"
-    return name
 
 
 def payload_num_steps(payload: dict[str, Any], fallback: int) -> int:
@@ -1442,14 +1450,13 @@ def main() -> None:
     if not args.pt.is_file():
         raise FileNotFoundError(f"--pt must be a file, got {args.pt}")
 
-    payload = torch.load(args.pt, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected payload to be a dict, got {type(payload)!r}.")
+    payload = load_payload(args.pt)
 
-    device = torch.device(args.device)
+    device = cuda_device_from_name(args.device)
+    torch.cuda.set_device(device)
     dtype = dtype_from_name(args.dtype)
     vision_dtype = dtype_from_name(args.vision_dtype)
-    attn_backend = phyai_attn_backend(args.phyai_attn_backend)
+    attn_backend = choose_attn_backend(args.phyai_attn_backend)
     config = load_config(args.checkpoint, payload)
     num_steps = (
         args.num_steps
@@ -1480,7 +1487,7 @@ def main() -> None:
         payload=payload,
         checkpoint=args.checkpoint,
         device=device,
-        device_target=args.device,
+        device_target=str(device),
         dtype=dtype,
         dtype_name=args.dtype,
         vision_dtype=vision_dtype,

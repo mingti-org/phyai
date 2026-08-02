@@ -30,6 +30,7 @@ import sys
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -143,6 +144,8 @@ REALTIME_PI0_REQUIRED_KEYS = DIRECT_PI0_KEYS + (
     "language_embeds",
 )
 REALTIME_PI0_REQUIRED_KEY_SET = frozenset(REALTIME_PI0_REQUIRED_KEYS)
+REALTIME_PI0_NUM_DENOISE_STEPS = 10
+REALTIME_PI0_EXPERT_HIDDEN_SIZE = 1024
 
 
 def env_path(name: str) -> Path | None:
@@ -155,13 +158,20 @@ def _bf16_cpu(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _sinusoidal_time_embedding(
-    time_value: float, dimension: int = 1024
+    time_value: float, dimension: int = REALTIME_PI0_EXPERT_HIDDEN_SIZE
 ) -> torch.Tensor:
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=torch.float32)
     period = 4e-3 * (4.0 / 4e-3) ** fraction
     scaling_factor = 1.0 / period * 2 * torch.pi
     sin_input = scaling_factor * float(time_value)
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=0)
+
+
+def _require_shape(name: str, tensor: torch.Tensor, expected: tuple[int, ...]) -> None:
+    if tuple(tensor.shape) != expected:
+        raise ValueError(
+            f"{name} must have shape {expected}, got {tuple(tensor.shape)}."
+        )
 
 
 def adapt_flashrt_pi0_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -185,12 +195,26 @@ def adapt_flashrt_pi0_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
     action_time_in_wt_raw = checkpoint["_action_time_mlp_in_wt_raw"].float().cpu()
     action_time_in_b = checkpoint["_action_time_mlp_in_b"].float().cpu()
 
+    hidden = REALTIME_PI0_EXPERT_HIDDEN_SIZE
+    _require_shape("decoder_action_in_proj_b", action_in_b, (hidden,))
+    _require_shape("action_time_mlp_in_wa_w", action_time_in_wa, (hidden, hidden))
+    _require_shape(
+        "_action_time_mlp_in_wt_raw", action_time_in_wt_raw, (hidden, hidden)
+    )
+    _require_shape("_action_time_mlp_in_b", action_time_in_b, (hidden,))
+
     out["decoder_action_fused_in_proj_w"] = _bf16_cpu(action_in_w @ action_time_in_wa)
 
     action_bias_contrib = action_time_in_wa.t() @ action_in_b
-    time_biases = torch.empty(10, 1024, dtype=torch.float32)
-    for step in range(10):
-        time_emb = _sinusoidal_time_embedding(1.0 - step / 10.0)
+    time_biases = torch.empty(
+        REALTIME_PI0_NUM_DENOISE_STEPS,
+        REALTIME_PI0_EXPERT_HIDDEN_SIZE,
+        dtype=torch.float32,
+    )
+    for step in range(REALTIME_PI0_NUM_DENOISE_STEPS):
+        time_emb = _sinusoidal_time_embedding(
+            1.0 - step / REALTIME_PI0_NUM_DENOISE_STEPS
+        )
         time_contrib = time_emb @ action_time_in_wt_raw.t()
         time_biases[step] = action_bias_contrib + time_contrib + action_time_in_b
     out["decoder_action_fused_time_biases"] = _bf16_cpu(time_biases)
@@ -256,21 +280,12 @@ def build_language_embeds(
     tokenizer_path: Path,
     max_length: int,
 ) -> torch.Tensor:
-    from torch import nn
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
     embedding_weight = checkpoint["embedding_weight"].to(
         device="cuda", dtype=torch.bfloat16
     )
-    language_embedding = nn.Embedding(
-        num_embeddings=embedding_weight.shape[0],
-        embedding_dim=embedding_weight.shape[1],
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    with torch.no_grad():
-        language_embedding.weight.copy_(embedding_weight)
     token_ids = (
         tokenizer(
             [prompt.strip().replace("_", " ") + "\n"],
@@ -281,7 +296,9 @@ def build_language_embeds(
         .to(device="cuda")
         .squeeze(0)
     )
-    embeds = language_embedding(token_ids) * (embedding_weight.shape[1] ** 0.5)
+    embeds = F.embedding(token_ids, embedding_weight) * (
+        embedding_weight.shape[1] ** 0.5
+    )
     return embeds.cpu()
 
 

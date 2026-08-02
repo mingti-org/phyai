@@ -96,15 +96,15 @@ def stage_flops(dims: Pi0Dims, *, lang_len: int = 1) -> dict[str, float]:
     """Per-sample FLOP for pi0 stages.
 
     ``llm_prefix`` follows the scheduler's padded prefix graph shape: every
-    sample uses ``image_tokens + tokenizer_max_length`` query slots. The real
-    language length is still recorded because it controls visible K/V slots and
-    RoPE positions, but the dense GEMM work is shape-fixed by CUDA graph capture.
+    sample uses ``image_tokens + tokenizer_max_length`` query slots for dense
+    projections. Attention reads only the real image and language K/V slots.
 
     The pi0 expert layer is staged as one state-token pass plus one action-chunk
     pass per layer. State attends over prefix + state. Action attends over prefix
     + state + action tokens.
     """
     image_tokens = dims.image_tokens
+    real_prefix = image_tokens + max(0, min(lang_len, dims.tokenizer_max_length))
 
     vision = 0.0
     for _ in range(dims.v_layers):
@@ -133,15 +133,14 @@ def stage_flops(dims: Pi0Dims, *, lang_len: int = 1) -> dict[str, float]:
             dims.l_kv_heads,
             dims.l_head_dim,
             dims.l_intermediate,
-            kv_len=n_prefix,
+            kv_len=real_prefix,
             gated_mlp=True,
         )
 
-    real_prefix = image_tokens + max(0, min(lang_len, dims.tokenizer_max_length))
-    state_1step = 0.0
-    action_1step = 0.0
+    state_layers_once = 0.0
+    action_layers_1step = 0.0
     for _ in range(dims.e_layers):
-        state_1step += transformer_layer_flop(
+        state_layers_once += transformer_layer_flop(
             1,
             dims.e_hidden,
             dims.e_heads,
@@ -151,7 +150,7 @@ def stage_flops(dims: Pi0Dims, *, lang_len: int = 1) -> dict[str, float]:
             kv_len=real_prefix + 1,
             gated_mlp=True,
         )
-        action_1step += transformer_layer_flop(
+        action_layers_1step += transformer_layer_flop(
             dims.chunk_size,
             dims.e_hidden,
             dims.e_heads,
@@ -162,22 +161,23 @@ def stage_flops(dims: Pi0Dims, *, lang_len: int = 1) -> dict[str, float]:
             gated_mlp=True,
         )
 
-    heads_1step = 0.0
-    heads_1step += gemm_flop(1, dims.e_hidden, dims.max_state_dim)
-    heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, dims.max_action_dim)
-    heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, 2 * dims.e_hidden)
-    heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, dims.e_hidden)
-    heads_1step += gemm_flop(dims.chunk_size, dims.max_action_dim, dims.e_hidden)
+    state_head_once = gemm_flop(1, dims.e_hidden, dims.max_state_dim)
+    action_heads_1step = 0.0
+    action_heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, dims.max_action_dim)
+    action_heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, 2 * dims.e_hidden)
+    action_heads_1step += gemm_flop(dims.chunk_size, dims.e_hidden, dims.e_hidden)
+    action_heads_1step += gemm_flop(dims.chunk_size, dims.max_action_dim, dims.e_hidden)
 
-    expert_1step = state_1step + action_1step + heads_1step
+    expert_state_prefill = state_head_once + state_layers_once
+    expert_action_step = action_heads_1step + action_layers_1step
+    expert_loop = expert_action_step * dims.num_inference_steps
     return {
         "vision": vision,
         "llm_prefix": llm_prefix,
-        "expert_state_1step": state_1step,
-        "expert_action_1step": action_1step,
-        "heads_1step": heads_1step,
-        "expert_1step": expert_1step,
-        "expert_loop": expert_1step * dims.num_inference_steps,
+        "expert_state_prefill": expert_state_prefill,
+        "expert_action_step": expert_action_step,
+        "expert_loop": expert_loop,
+        "expert_total": expert_state_prefill + expert_loop,
         "real_prefix_tokens": float(real_prefix),
         "padded_prefix_tokens": float(n_prefix),
     }
@@ -221,19 +221,23 @@ def analytic_weight_bytes(dims: Pi0Dims, *, dtype_bytes: int = 2) -> dict[str, f
         dims.e_intermediate,
         gated=True,
     )
-    head_params = (
-        dims.max_state_dim * dims.e_hidden
-        + dims.max_action_dim * dims.e_hidden
+    state_head_params = dims.max_state_dim * dims.e_hidden
+    action_head_params = (
+        dims.max_action_dim * dims.e_hidden
         + dims.e_hidden * dims.max_action_dim
         + 2 * dims.e_hidden * dims.e_hidden
         + dims.e_hidden * dims.e_hidden
     )
-    expert = e_params + head_params
+    expert_state_prefill = (e_params + state_head_params) * dtype_bytes
+    expert_action_step = (e_params + action_head_params) * dtype_bytes
+    expert_loop = expert_action_step * dims.num_inference_steps
     return {
         "vision": v_params * dtype_bytes,
         "llm_prefix": l_params * dtype_bytes,
-        "expert_1step": expert * dtype_bytes,
-        "expert_loop": expert * dtype_bytes * dims.num_inference_steps,
+        "expert_state_prefill": expert_state_prefill,
+        "expert_action_step": expert_action_step,
+        "expert_loop": expert_loop,
+        "expert_total": expert_state_prefill + expert_loop,
     }
 
 
@@ -247,7 +251,14 @@ def _main() -> None:
         f"chunk={dims.chunk_size}  steps={dims.num_inference_steps}"
     )
     print(f"{'stage':<18}{'GFLOP':>14}{'W_MiB(est)':>12}{'AI(est)':>10}")
-    for key in ("vision", "llm_prefix", "expert_1step", "expert_loop"):
+    for key in (
+        "vision",
+        "llm_prefix",
+        "expert_state_prefill",
+        "expert_action_step",
+        "expert_loop",
+        "expert_total",
+    ):
         ai = flop[key] / wbytes[key]
         print(
             f"{key:<18}{flop[key] / 1e9:>14.2f}{wbytes[key] / 2**20:>12.1f}{ai:>10.1f}"

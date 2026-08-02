@@ -13,13 +13,24 @@ def device_slug(name: str) -> str:
     return slug or "gpu"
 
 
-def probe_device(index: int = 0) -> dict:
-    """Static CUDA device facts."""
+def cuda_device(index: int) -> torch.device:
+    """Validated CUDA device for a logical device index."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; cannot probe a GPU.")
-    props = torch.cuda.get_device_properties(index)
+    if not 0 <= index < torch.cuda.device_count():
+        raise ValueError(
+            f"CUDA device index must be in [0, {torch.cuda.device_count() - 1}], "
+            f"got {index}."
+        )
+    return torch.device("cuda", index)
+
+
+def probe_device(index: int = 0) -> dict:
+    """Static CUDA device facts."""
+    device = cuda_device(index)
+    props = torch.cuda.get_device_properties(device)
     return {
-        "name": torch.cuda.get_device_name(index),
+        "name": torch.cuda.get_device_name(device),
         "index": index,
         "sm_count": props.multi_processor_count,
         "total_mem_gb": round(props.total_memory / 1e9, 2),
@@ -29,8 +40,8 @@ def probe_device(index: int = 0) -> dict:
     }
 
 
-def _sync() -> None:
-    torch.cuda.synchronize()
+def _sync(device: torch.device) -> None:
+    torch.cuda.synchronize(device)
 
 
 def measure_bf16_peak_tflops(
@@ -41,23 +52,32 @@ def measure_bf16_peak_tflops(
     device: int = 0,
 ) -> float:
     """Peak sustained BF16 dense GEMM throughput in TFLOPS."""
-    dev = torch.device(f"cuda:{device}")
-    a = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
-    b = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
-    for _ in range(warmup):
-        torch.mm(a, b)
-    _sync()
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}.")
+    if warmup < 0:
+        raise ValueError(f"warmup must be non-negative, got {warmup}.")
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}.")
 
-    flop = 2.0 * size**3
-    best_s = float("inf")
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(iters):
-        start.record()
-        torch.mm(a, b)
-        end.record()
-        _sync()
-        best_s = min(best_s, start.elapsed_time(end) / 1e3)
+    dev = cuda_device(device)
+    with torch.cuda.device(dev):
+        a = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
+        b = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
+        for _ in range(warmup):
+            torch.mm(a, b)
+        _sync(dev)
+
+        flop = 2.0 * size**3
+        best_s = float("inf")
+        stream = torch.cuda.current_stream(dev)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(iters):
+            start.record(stream)
+            torch.mm(a, b)
+            end.record(stream)
+            _sync(dev)
+            best_s = min(best_s, start.elapsed_time(end) / 1e3)
     return flop / best_s / 1e12
 
 
@@ -69,24 +89,33 @@ def measure_hbm_bandwidth_tb_s(
     device: int = 0,
 ) -> float:
     """Peak HBM bandwidth from a large device-to-device copy in TB/s."""
-    dev = torch.device(f"cuda:{device}")
-    n_elems = nbytes // 2
-    src = torch.empty(n_elems, dtype=torch.bfloat16, device=dev)
-    dst = torch.empty_like(src)
-    for _ in range(warmup):
-        dst.copy_(src)
-    _sync()
+    if nbytes < 2:
+        raise ValueError(f"nbytes must be at least 2, got {nbytes}.")
+    if warmup < 0:
+        raise ValueError(f"warmup must be non-negative, got {warmup}.")
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}.")
 
-    moved = 2.0 * src.numel() * src.element_size()
-    best_s = float("inf")
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(iters):
-        start.record()
-        dst.copy_(src)
-        end.record()
-        _sync()
-        best_s = min(best_s, start.elapsed_time(end) / 1e3)
+    dev = cuda_device(device)
+    with torch.cuda.device(dev):
+        n_elems = nbytes // 2
+        src = torch.empty(n_elems, dtype=torch.bfloat16, device=dev)
+        dst = torch.empty_like(src)
+        for _ in range(warmup):
+            dst.copy_(src)
+        _sync(dev)
+
+        moved = 2.0 * src.numel() * src.element_size()
+        best_s = float("inf")
+        stream = torch.cuda.current_stream(dev)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(iters):
+            start.record(stream)
+            dst.copy_(src)
+            end.record(stream)
+            _sync(dev)
+            best_s = min(best_s, start.elapsed_time(end) / 1e3)
     return moved / best_s / 1e12
 
 
@@ -127,12 +156,14 @@ def _main() -> None:
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--gemm-size", type=int, default=8192)
     ap.add_argument("--copy-bytes", type=int, default=4 * 1024**3)
+    ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
     args = ap.parse_args()
     info = measure_roofline(
         device=args.device,
         gemm_size=args.gemm_size,
         copy_bytes=args.copy_bytes,
+        warmup=args.warmup,
         iters=args.iters,
     )
     print(json.dumps(info, indent=2))

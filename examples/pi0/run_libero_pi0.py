@@ -8,7 +8,7 @@ Example:
 
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MUJOCO_GL=egl \
     CUDA_VISIBLE_DEVICES=2 MUJOCO_EGL_DEVICE_ID=0 \
-    uv run python examples/run_libero_pi0.py \
+    uv run python examples/pi0/run_libero_pi0.py \
       --checkpoint /path/to/pi0_libero_checkpoint \
       --tokenizer-name /path/to/paligemma-3b-pt-224 \
       --assets-root /path/to/libero-assets \
@@ -82,6 +82,21 @@ def add_lerobot_paths(lerobot_root: Path) -> None:
             sys.path.append(str(path))
 
 
+def ensure_assets_link(link: Path, assets_root: Path) -> None:
+    """Point the LIBERO assets link at the requested directory."""
+    if link.is_symlink():
+        if link.resolve(strict=False) == assets_root:
+            return
+        link.unlink()
+    elif link.exists():
+        if link.resolve() == assets_root:
+            return
+        raise FileExistsError(
+            f"Refusing to replace non-symlink LIBERO assets path: {link}"
+        )
+    link.symlink_to(assets_root, target_is_directory=True)
+
+
 def configure_libero(assets_root: Path | None) -> None:
     """Write LIBERO's local path config before importing ``libero.libero``."""
 
@@ -105,9 +120,7 @@ def configure_libero(assets_root: Path | None) -> None:
         if not assets_root.is_dir():
             raise NotADirectoryError(f"--assets-root is not a directory: {assets_root}")
 
-        link = benchmark_root / "assets"
-        if not link.exists():
-            link.symlink_to(assets_root, target_is_directory=True)
+        ensure_assets_link(benchmark_root / "assets", assets_root)
 
     config_dir = Path.home() / ".libero"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -377,6 +390,11 @@ def flatten_task_ids(task_ids: Iterable[int] | None) -> list[int] | None:
     return None if task_ids is None else [int(x) for x in task_ids]
 
 
+def success_percentage(successes: list[bool]) -> float:
+    """Return the LeRobot-compatible success percentage."""
+    return 100.0 * float(np.mean(successes)) if successes else 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -398,11 +416,11 @@ def main() -> None:
     parser.add_argument(
         "--lerobot-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "lerobot-main",
+        default=Path(__file__).resolve().parents[2] / "lerobot-main",
         help="Local LeRobot checkout whose venv has the LIBERO extra installed.",
     )
     parser.add_argument("--task", default="libero_object")
-    parser.add_argument("--task-ids", type=parse_task_ids, default=[0])
+    parser.add_argument("--task-ids", type=parse_task_ids, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--n-episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -572,7 +590,7 @@ def main() -> None:
             "avg_max_reward": float(np.mean(all_max_rewards))
             if all_max_rewards
             else 0.0,
-            "pc_success": float(np.mean(all_successes)) if all_successes else 0.0,
+            "pc_success": success_percentage(all_successes),
             "n_episodes": n_episodes,
             "eval_s": eval_s,
             "eval_ep_s": eval_s / max(n_episodes, 1),

@@ -61,10 +61,24 @@ class Profile:
         return self.hw.get("ridge_point_flop_per_byte")
 
     def stage(self, scope: str) -> np.ndarray:
-        return np.array([r["stage_gpu_ms"][scope] for r in self.sweep], dtype=float)
+        return np.array(
+            [r["stage_gpu_ms"].get(scope, 0.0) for r in self.sweep], dtype=float
+        )
 
     def field(self, key: str) -> np.ndarray:
         return np.array([r[key] for r in self.sweep], dtype=float)
+
+    def expert_metric(self, section: str) -> np.ndarray:
+        return np.array(
+            [
+                r[section].get("expert_loop", r[section].get("expert", 0.0))
+                for r in self.sweep
+            ],
+            dtype=float,
+        )
+
+    def expert_total_stage(self) -> np.ndarray:
+        return self.stage("pi0.expert_state_prefill") + self.stage("pi0.expert_loop")
 
     def hw_caption(self) -> str:
         base = self.gpu
@@ -95,7 +109,7 @@ def _save(fig, out_dir: Path, name: str):
 def fig1_stage_latency(p: Profile, out_dir: Path):
     vis = p.stage("pi0.vision_loop")
     llm = p.stage("pi0.llm_prefix_fwd")
-    exp = p.stage("pi0.expert_loop")
+    exp = p.expert_total_stage()
     fig, ax = plt.subplots(figsize=(7.4, 4.6))
     ax.bar(p.x, vis, 0.6, label="vision (SigLIP)", color=COLOR["vision"])
     ax.bar(p.x, llm, 0.6, bottom=vis, label="LLM prefix", color=COLOR["llm"])
@@ -104,7 +118,7 @@ def fig1_stage_latency(p: Profile, out_dir: Path):
         exp,
         0.6,
         bottom=vis + llm,
-        label=f"expert ({p.meta.get('num_inference_steps')}-step Euler)",
+        label=f"expert prefill + {p.meta.get('num_inference_steps')}-step Euler",
         color=COLOR["expert"],
     )
     total = vis + llm + exp
@@ -128,8 +142,8 @@ def fig2_roofline(p: Profile, out_dir: Path):
     r0 = p.sweep[0]
     ai0 = r0["arithmetic_intensity"]
     ach0 = r0["achieved_tflops"]
-    exp_ai = [r["arithmetic_intensity"]["expert"] for r in p.sweep]
-    exp_ach = [r["achieved_tflops"]["expert"] for r in p.sweep]
+    exp_ai = p.expert_metric("arithmetic_intensity").tolist()
+    exp_ach = p.expert_metric("achieved_tflops").tolist()
     x_hi = 10 ** np.ceil(np.log10(max(exp_ai + [ai0["vision"], ai0["llm_prefix"]]) * 3))
     ai_axis = np.logspace(0, np.log10(x_hi), 200)
     roof = np.minimum(p.bw * ai_axis, p.peak)
@@ -203,12 +217,12 @@ def fig3_per_sample_stage(p: Profile, out_dir: Path):
     bs = np.array(p.bs, dtype=float)
     vis = p.stage("pi0.vision_loop") / bs
     llm = p.stage("pi0.llm_prefix_fwd") / bs
-    exp = p.stage("pi0.expert_loop") / bs
+    exp = p.expert_total_stage() / bs
     fig, ax = plt.subplots(figsize=(7.2, 4.4))
     for y, key, label in (
         (vis, "vision", "vision"),
         (llm, "llm", "LLM prefix"),
-        (exp, "expert", "expert loop"),
+        (exp, "expert", "expert total"),
     ):
         ax.plot(p.x, y, "-o", color=COLOR[key], lw=2.2, label=label)
     if exp[0] > 0 and exp[-1] > 0:
@@ -274,7 +288,7 @@ def fig4_latency_throughput(p: Profile, out_dir: Path):
 
 
 def fig5_expert_mfu(p: Profile, out_dir: Path):
-    mfu = [r.get("expert_mfu_pct") for r in p.sweep]
+    mfu = [r.get("expert_loop_mfu_pct", r.get("expert_mfu_pct")) for r in p.sweep]
     if any(value is None for value in mfu):
         print("skip fig5_expert_mfu: no MFU in JSON")
         return
@@ -284,10 +298,12 @@ def fig5_expert_mfu(p: Profile, out_dir: Path):
     for i, v in enumerate(y):
         ax.text(i, v + y.max() * 0.02, f"{v:.1f}%", ha="center", fontsize=9)
     _xticks(ax, p)
-    ax.set_ylabel(f"expert MFU (% of {p.peak:g} TFLOPS)")
+    ax.set_ylabel(f"expert loop MFU (% of {p.peak:g} TFLOPS)")
     ax.set_ylim(0, y.max() * 1.18)
     ax.set_title(
-        f"pi0 expert MFU vs batch\n{p.hw_caption()}", fontsize=11.5, weight="bold"
+        f"pi0 expert loop MFU vs batch\n{p.hw_caption()}",
+        fontsize=11.5,
+        weight="bold",
     )
     _save(fig, out_dir, "fig5_expert_mfu.svg")
 
@@ -295,7 +311,7 @@ def fig5_expert_mfu(p: Profile, out_dir: Path):
 def fig6_stage_share(p: Profile, out_dir: Path):
     vis = p.stage("pi0.vision_loop")
     llm = p.stage("pi0.llm_prefix_fwd")
-    exp = p.stage("pi0.expert_loop")
+    exp = p.expert_total_stage()
     other = (p.field("stage_sum_ms") - vis - llm - exp).clip(min=0)
     total = vis + llm + exp + other
     total[total == 0] = 1.0
@@ -304,7 +320,7 @@ def fig6_stage_share(p: Profile, out_dir: Path):
     for y, key, label in (
         (vis, "vision", "vision"),
         (llm, "llm", "LLM prefix"),
-        (exp, "expert", "expert loop"),
+        (exp, "expert", "expert total"),
         (other, None, "plan / other"),
     ):
         frac = 100 * y / total

@@ -71,12 +71,29 @@ def dtype_from_name(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def choose_attn_backend(dtype: torch.dtype, requested: str | None) -> str:
-    if requested is not None and requested != "auto":
-        return requested
-    if dtype is torch.float32:
-        return "eager"
-    return "flashinfer"
+def choose_attn_backend(requested: str | None) -> str:
+    """Resolve the PI0 paged attention backend."""
+    if requested in {None, "auto", "flashinfer"}:
+        return "flashinfer"
+    raise ValueError(
+        f"PhyAI PI0 requires the flashinfer paged backend, got {requested!r}."
+    )
+
+
+def cuda_device_from_name(name: str) -> torch.device:
+    """Resolve the visible CUDA device used by the single-process tools."""
+    device = torch.device(name)
+    if device.type != "cuda":
+        raise ValueError(f"PhyAI PI0 requires a CUDA device, got {name!r}.")
+    index = 0 if device.index is None else device.index
+    if index != 0:
+        raise ValueError(
+            "Bind the physical GPU with CUDA_VISIBLE_DEVICES, then use "
+            f"--device cuda or cuda:0; got {name!r}."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; cannot run PhyAI PI0.")
+    return torch.device("cuda", 0)
 
 
 def align_shapes(
@@ -152,10 +169,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional LeRobot checkout root. Its src/ directory is prepended to sys.path.",
     )
-    parser.add_argument("--device", default="cuda")
     parser.add_argument(
-        "--dtype", choices=("float32", "bf16", "bfloat16"), default="bfloat16"
+        "--device",
+        default="cuda",
+        help="Use cuda/cuda:0 after binding the physical GPU with CUDA_VISIBLE_DEVICES.",
     )
+    parser.add_argument("--dtype", choices=("bf16", "bfloat16"), default="bfloat16")
     parser.add_argument(
         "--vision-dtype",
         dest="vision_dtype",
@@ -168,9 +187,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--phyai-attn-backend",
-        default=None,
-        choices=("auto", "flashinfer", "sdpa", "eager"),
-        help="PhyAI attention backend. Default is eager for fp32 and flashinfer otherwise.",
+        default="auto",
+        choices=("auto", "flashinfer"),
+        help="PhyAI attention backend. Auto selects flashinfer.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=10)
@@ -584,14 +603,15 @@ def main() -> None:
             f"--checkpoint must be a directory, got {args.checkpoint}"
         )
 
+    device = cuda_device_from_name(args.device)
+    torch.cuda.set_device(device)
+    dtype = dtype_from_name(args.dtype)
+    vision_dtype = dtype_from_name(args.vision_dtype)
+    attn_backend = choose_attn_backend(args.phyai_attn_backend)
+
     add_lerobot_to_path(args.lerobot_root)
     symbols = import_lerobot_symbols()
     seed_everything(args.seed)
-
-    dtype = dtype_from_name(args.dtype)
-    vision_dtype = dtype_from_name(args.vision_dtype)
-    attn_backend = choose_attn_backend(dtype, args.phyai_attn_backend)
-    device = torch.device(args.device)
 
     phyai_cfg = load_phyai_config(args.checkpoint, PI0Config)
     phyai_cfg = replace(phyai_cfg, num_inference_steps=args.num_steps)
@@ -655,7 +675,7 @@ def main() -> None:
         dtype=dtype,
         vision_dtype=vision_dtype,
         attn_backend=attn_backend,
-        device_target=args.device,
+        device_target=str(device),
         use_cuda_graph=args.phyai_cuda_graph and device.type == "cuda",
         weight_strict=args.weight_strict,
     )
@@ -723,7 +743,7 @@ def main() -> None:
         "meta": {
             "checkpoint": str(args.checkpoint),
             "lerobot_root": str(args.lerobot_root) if args.lerobot_root else None,
-            "device": args.device,
+            "device": str(device),
             "dtype": args.dtype,
             "phyai_vision_dtype": args.vision_dtype,
             "phyai_attn_backend": attn_backend,

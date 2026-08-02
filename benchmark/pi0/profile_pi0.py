@@ -30,9 +30,26 @@ STAGES = [
     "pi0.llm_prefix_plan",
     "pi0.llm_prefix_fwd",
     "pi0.expert_plan",
+    "pi0.expert_state_prefill",
     "pi0.expert_loop",
 ]
 EXPERT_GRAPH_STAGE = "pi0.expert_graph"
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer, got {value}"
+        )
+    return parsed
 
 
 def dims_from_config(cfg: PI0Config) -> mf.Pi0Dims:
@@ -82,12 +99,19 @@ def stage_weight_bytes(model) -> dict[str, float]:
     n_steps = model.config.num_inference_steps
     vision_b = _module_bytes(model.vision)
     llm_b = _module_bytes(model.paligemma_lm, exclude_prefixes=("embed_tokens",))
-    expert_b = _module_bytes(model.expert_stack) + _module_bytes(model.heads)
+    expert_stack_b = _module_bytes(model.expert_stack)
+    state_head_b = _module_bytes(model.heads.state_proj)
+    action_heads_b = _module_bytes(model.heads, exclude_prefixes=("state_proj.",))
+    state_prefill_b = expert_stack_b + state_head_b
+    action_step_b = expert_stack_b + action_heads_b
+    expert_loop_b = action_step_b * n_steps
     return {
         "vision": float(vision_b),
         "llm_prefix": float(llm_b),
-        "expert_1step": float(expert_b),
-        "expert_loop": float(expert_b * n_steps),
+        "expert_state_prefill": float(state_prefill_b),
+        "expert_action_step": float(action_step_b),
+        "expert_loop": float(expert_loop_b),
+        "expert_total": float(state_prefill_b + expert_loop_b),
     }
 
 
@@ -138,19 +162,26 @@ def make_request(
     )
 
 
-def time_e2e(engine, request: PI0Request, n_warmup: int, n_timed: int) -> dict:
+def time_e2e(
+    engine,
+    request: PI0Request,
+    device: torch.device,
+    n_warmup: int,
+    n_timed: int,
+) -> dict:
     """Cuda-event end-to-end ``step`` latency stats."""
     for _ in range(n_warmup):
         engine.step(request)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     times = []
+    stream = torch.cuda.current_stream(device)
     for _ in range(n_timed):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        start.record(stream)
         engine.step(request)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(stream)
+        torch.cuda.synchronize(device)
         times.append(start.elapsed_time(end))
     times.sort()
     return {
@@ -191,17 +222,23 @@ def parse_stage_gpu_ms(trace_path: Path, n_steps: int) -> dict[str, float]:
     return result
 
 
-def profile_stages(engine, request: PI0Request, prof_dir: Path, n_prof_steps: int):
+def profile_stages(
+    engine,
+    request: PI0Request,
+    device: torch.device,
+    prof_dir: Path,
+    n_prof_steps: int,
+):
     """Run the torch profiler and parse stage-level GPU ms."""
     prof_dir.mkdir(parents=True, exist_ok=True)
     install_profiler(ProfilerConfig(backend="torch", output_dir=prof_dir))
     prof = get_profiler()
     engine.step(request)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     prof.start()
     for _ in range(n_prof_steps):
         engine.step(request)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     prof.stop()
     traces = sorted(prof_dir.glob("*.trace.json*"), key=lambda p: p.stat().st_mtime)
     if not traces:
@@ -242,8 +279,10 @@ def main() -> None:
         default=None,
         help="HF-style pi0 checkpoint folder. Omit for random-weight smoke timing.",
     )
-    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
-    ap.add_argument("--lang-len", type=int, default=1)
+    ap.add_argument(
+        "--batch-sizes", type=_positive_int, nargs="+", default=[1, 2, 4, 8]
+    )
+    ap.add_argument("--lang-len", type=_positive_int, default=1)
     ap.add_argument(
         "--num-images",
         type=int,
@@ -260,14 +299,13 @@ def main() -> None:
     ap.add_argument("--fixed-noise", action="store_true")
     ap.add_argument(
         "--workspace-bytes",
-        type=int,
+        type=_positive_int,
         default=512 * 1024**2,
         help="flashinfer workspace bytes.",
     )
-    ap.add_argument("--n-warmup", type=int, default=10)
-    ap.add_argument("--n-timed", type=int, default=50)
-    ap.add_argument("--n-prof-steps", type=int, default=5)
-    ap.add_argument("--gpu-index", type=int, default=0)
+    ap.add_argument("--n-warmup", type=_non_negative_int, default=10)
+    ap.add_argument("--n-timed", type=_positive_int, default=50)
+    ap.add_argument("--n-prof-steps", type=_positive_int, default=5)
     ap.add_argument("--no-roofline", action="store_true")
     ap.add_argument("--out", type=Path, default=Path("benchmark/pi0/pi0_profile.json"))
     ap.add_argument(
@@ -282,8 +320,8 @@ def main() -> None:
         raise NotADirectoryError(f"--checkpoint must be a directory: {args.checkpoint}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for this benchmark.")
-
-    device = torch.device("cuda")
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
     dtype = torch.bfloat16
     vision_dtype = torch.float32 if args.vision_dtype == "float32" else torch.bfloat16
     if args.checkpoint is not None:
@@ -299,11 +337,7 @@ def main() -> None:
     dims = dims_from_config(cfg)
 
     print("[hw] probing device + measuring roofline microbench...")
-    hardware = (
-        hp.probe_device(args.gpu_index)
-        if args.no_roofline
-        else hp.measure_roofline(device=args.gpu_index)
-    )
+    hardware = hp.probe_device(0) if args.no_roofline else hp.measure_roofline(device=0)
     print(
         f"[hw] {hardware['name']}: "
         + (
@@ -327,7 +361,7 @@ def main() -> None:
             f"vision={args.vision_dtype})..."
         )
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats(device)
         try:
             engine = Engine(
                 EngineArgs(
@@ -339,7 +373,7 @@ def main() -> None:
                         vision_params_dtype=vision_dtype,
                     ),
                     config=EngineConfig(
-                        device=DeviceConfig(target="cuda", params_dtype=dtype),
+                        device=DeviceConfig(target=str(device), params_dtype=dtype),
                         runtime=RuntimeConfig(
                             use_cuda_graph=True,
                             flashinfer_workspace_bytes=args.workspace_bytes,
@@ -358,11 +392,21 @@ def main() -> None:
                 fixed_noise=args.fixed_noise,
             )
 
-            lat = time_e2e(engine, request, args.n_warmup, args.n_timed)
-            mem_alloc = torch.cuda.max_memory_allocated() / 2**20
-            mem_resv = torch.cuda.max_memory_reserved() / 2**20
+            lat = time_e2e(
+                engine,
+                request,
+                device,
+                args.n_warmup,
+                args.n_timed,
+            )
+            mem_alloc = torch.cuda.max_memory_allocated(device) / 2**20
+            mem_resv = torch.cuda.max_memory_reserved(device) / 2**20
             stages, trace_file = profile_stages(
-                engine, request, args.trace_dir / f"bs{bs}", args.n_prof_steps
+                engine,
+                request,
+                device,
+                args.trace_dir / f"bs{bs}",
+                args.n_prof_steps,
             )
         except Exception as exc:  # noqa: BLE001
             if "engine" in locals() and engine is not None:
@@ -381,14 +425,25 @@ def main() -> None:
             "llm_prefix": achieved_tflops(
                 flop["llm_prefix"], stages["pi0.llm_prefix_fwd"]
             ),
-            "expert": achieved_tflops(flop["expert_loop"], stages["pi0.expert_loop"]),
+            "expert_state_prefill": achieved_tflops(
+                flop["expert_state_prefill"],
+                stages["pi0.expert_state_prefill"],
+            ),
+            "expert_loop": achieved_tflops(
+                flop["expert_loop"], stages["pi0.expert_loop"]
+            ),
         }
         ai = {
             "vision": bs * flop["vision"] / weight_bytes["vision"],
             "llm_prefix": bs * flop["llm_prefix"] / weight_bytes["llm_prefix"],
-            "expert": bs * flop["expert_loop"] / weight_bytes["expert_loop"],
+            "expert_state_prefill": bs
+            * flop["expert_state_prefill"]
+            / weight_bytes["expert_state_prefill"],
+            "expert_loop": bs * flop["expert_loop"] / weight_bytes["expert_loop"],
         }
-        expert_mfu = (100.0 * ach["expert"] / peak_tflops) if peak_tflops else None
+        expert_loop_mfu = (
+            100.0 * ach["expert_loop"] / peak_tflops if peak_tflops else None
+        )
         throughput = bs * 1000.0 / lat["mean"]
 
         sweep.append(
@@ -404,7 +459,7 @@ def main() -> None:
                 "stage_sum_ms": sum(stages.values()),
                 "achieved_tflops": ach,
                 "arithmetic_intensity": ai,
-                "expert_mfu_pct": expert_mfu,
+                "expert_loop_mfu_pct": expert_loop_mfu,
                 "trace": trace_file,
             }
         )
@@ -420,8 +475,8 @@ def main() -> None:
             )
         )
         print(
-            f"[bs={bs}] expert: {ach['expert']:.1f} TFLOPS"
-            + (f" ({expert_mfu:.1f}% MFU)" if expert_mfu else "")
+            f"[bs={bs}] expert loop: {ach['expert_loop']:.1f} TFLOPS"
+            + (f" ({expert_loop_mfu:.1f}% MFU)" if expert_loop_mfu else "")
         )
         engine.close()
         del engine
@@ -434,6 +489,7 @@ def main() -> None:
             "model": "pi0",
             "scheduler": "ws1",
             "checkpoint": args.checkpoint.name if args.checkpoint else None,
+            "device": str(device),
             "dtype": "bfloat16",
             "vision_dtype": args.vision_dtype,
             "use_cuda_graph": True,
@@ -470,7 +526,9 @@ def main() -> None:
     )
     for row in sweep:
         st = row["stage_gpu_ms"]
-        mfu = f"{row['expert_mfu_pct']:.1f}%" if row["expert_mfu_pct"] else "-"
+        mfu = (
+            f"{row['expert_loop_mfu_pct']:.1f}%" if row["expert_loop_mfu_pct"] else "-"
+        )
         print(
             f"{row['bs']:>4}{row['latency_ms']['mean']:>10.2f}"
             f"{row['latency_ms']['p99']:>8.2f}{row['throughput_sps']:>9.1f}"
