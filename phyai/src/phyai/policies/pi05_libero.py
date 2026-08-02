@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -61,16 +62,18 @@ class PI05LiberoPolicy:
         flashinfer_workspace_bytes: int = 512 * 1024 * 1024,
         tokenizer_name: str | None = None,
         camera_mode: str | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.device = device
         self.params_dtype = params_dtype
         self.max_batch_size = int(max_batch_size)
         self.config = self._read_config()
+        self._engine_config = self._resolve_engine_config(chunk_size)
         self.image_size = self._resolve_image_size(self.config)
         self._action_dim = self._resolve_action_dim(self.config)
-        self.max_action_dim = int(self.config.get("max_action_dim", 32))
-        self._chunk_size = int(self.config.get("chunk_size", PI05Config().chunk_size))
+        self.max_action_dim = int(self._engine_config.max_action_dim)
+        self._chunk_size = int(self._engine_config.chunk_size)
         self.camera_names = self._resolve_camera_names(camera_mode)
         self.tokenizer_name = self._resolve_tokenizer_name(tokenizer_name)
         self.prompt_mode = str(
@@ -108,6 +111,7 @@ class PI05LiberoPolicy:
                 plugin="pi05",
                 plugin_args=PI05Args(
                     checkpoint_dir=self.checkpoint_dir,
+                    config=self._engine_config,
                     max_batch_size=self.max_batch_size,
                     weight_remap=_lerobot_pi05_weight_remap,
                     inputs_image_shape=[
@@ -156,6 +160,12 @@ class PI05LiberoPolicy:
             return {}
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
+
+    def _resolve_engine_config(self, chunk_size: int | None) -> PI05Config:
+        config = PI05Config.from_dict(self.config)
+        if chunk_size is None:
+            return config
+        return replace(config, chunk_size=int(chunk_size))
 
     def _resolve_camera_names(self, camera_mode: str | None) -> list[str]:
         mode = camera_mode or envs.PHYAI_CAMERA_MODE.get() or "three_camera"
