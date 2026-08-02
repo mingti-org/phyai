@@ -49,8 +49,8 @@ This reproduction uses immutable commits from two linked pull requests:
 
 | Repository | Pull request | Commit |
 | --- | --- | --- |
-| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`c5a9044`](https://github.com/rebecca26358/phyai/commit/c5a904493b74b29a9126a11caaa72ebd51385169) |
-| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`0b2fadb`](https://github.com/rebecca26358/vla-evaluation-harness/commit/0b2fadb3f4b30ad9e2591537120171d9cccee86d) |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e9566511d4d7ad5ff45ec072c667e93ccc27483) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`6ac5b32`](https://github.com/rebecca26358/vla-evaluation-harness/commit/6ac5b3212a87e93f3d507699fbbbc416d8ed6945) |
 
 Check out those exact revisions:
 
@@ -59,13 +59,14 @@ export PHYAI_ROOT=${PHYAI_ROOT:-$HOME/phyai}
 export VLA_ROOT=${VLA_ROOT:-$HOME/vla-evaluation-harness}
 
 git clone https://github.com/rebecca26358/phyai.git "$PHYAI_ROOT"
-git -C "$PHYAI_ROOT" checkout c5a904493b74b29a9126a11caaa72ebd51385169
+git -C "$PHYAI_ROOT" checkout 4e9566511d4d7ad5ff45ec072c667e93ccc27483
 
 git clone https://github.com/rebecca26358/vla-evaluation-harness.git "$VLA_ROOT"
-git -C "$VLA_ROOT" checkout 0b2fadb3f4b30ad9e2591537120171d9cccee86d
+git -C "$VLA_ROOT" checkout 6ac5b3212a87e93f3d507699fbbbc416d8ed6945
 ```
 
-The VLA revision contains `src/vla_eval/model_servers/phyai.py` and
+The VLA revision contains `src/vla_eval/model_servers/phyai.py`,
+`src/vla_eval/model_servers/phyai_wn.py`, and
 `configs/model_servers/phyai/libero.yaml`. The server script pins the same
 PhyAI commit in its PEP 723 dependency metadata.
 

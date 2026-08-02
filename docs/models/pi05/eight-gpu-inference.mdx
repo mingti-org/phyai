@@ -22,6 +22,19 @@ The current demo uses `chunk_size=1`. Each request returns one action, so the cl
 
 Other machines can use the same flow. You need 8 idle CUDA GPUs, Docker, `tmux`, the PI0.5 LIBERO checkpoint, and an offline tokenizer. Different GPU models mainly change latency.
 
+# Pin Source Revisions
+
+Use the linked pull requests at these exact commits:
+
+| Repository | Pull request | Commit |
+| --- | --- | --- |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e9566511d4d7ad5ff45ec072c667e93ccc27483) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`6ac5b32`](https://github.com/rebecca26358/vla-evaluation-harness/commit/6ac5b3212a87e93f3d507699fbbbc416d8ed6945) |
+
+The VLA commit provides both `vla_eval.model_servers.phyai` and
+`vla_eval.model_servers.phyai_wn`; the PhyAI commit provides the matching
+`PI05LiberoPolicy` batch and distributed-worker interfaces.
+
 # Paths
 
 Set these paths for your machine:

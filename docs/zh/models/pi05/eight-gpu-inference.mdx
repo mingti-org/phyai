@@ -22,6 +22,19 @@ icon: "server"
 
 其它机器也可以复现。至少需要 8 张空闲 CUDA GPU、Docker、`tmux`，以及 PI0.5 LIBERO checkpoint 和离线 tokenizer。卡型不同会影响耗时，但流程不变。
 
+# 固定源码版本
+
+使用以下两个 PR 中的精确提交：
+
+| 仓库 | Pull request | 提交 |
+| --- | --- | --- |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e9566511d4d7ad5ff45ec072c667e93ccc27483) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`6ac5b32`](https://github.com/rebecca26358/vla-evaluation-harness/commit/6ac5b3212a87e93f3d507699fbbbc416d8ed6945) |
+
+VLA 提交同时提供 `vla_eval.model_servers.phyai` 和
+`vla_eval.model_servers.phyai_wn`；PhyAI 提供与之匹配的
+`PI05LiberoPolicy` 批处理与分布式 worker 接口。
+
 # 路径设置
 
 按机器实际目录修改下面几个路径：
