@@ -43,6 +43,14 @@
                 ]
               },
               {
+                "group": "GR00T",
+                "pages": [
+                  "models/gr00t/ws1",
+                  "models/gr00t/n17-accuracy-parity",
+                  "models/gr00t/n17-libero-closed-loop"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "models/cosmos/ws1",
@@ -105,6 +113,14 @@
                   "zh/models/pi05/libero-four-suites",
                   "zh/models/pi05/eight-gpu-inference",
                   "zh/models/pi05/external-runtime-latency"
+                ]
+              },
+              {
+                "group": "GR00T",
+                "pages": [
+                  "zh/models/gr00t/ws1",
+                  "zh/models/gr00t/n17-accuracy-parity",
+                  "zh/models/gr00t/n17-libero-closed-loop"
                 ]
               },
               {

@@ -1,0 +1,85 @@
+---
+title: "GR00T-N1.7 精度对齐"
+description: "复现 PhyAI 与 Isaac-GR00T 在 LIBERO 上的解码动作精度对齐结果"
+---
+
+# GR00T-N1.7 精度对齐
+
+本页使用
+[`GR00T-N1.7-LIBERO/libero_10`](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO/tree/main/libero_10)
+checkpoint，对比 PhyAI 与 NVIDIA Isaac-GR00T 的结果。
+
+## 结果
+
+benchmark 使用以下公式计算由 MAE 推导出的回归指标：
+
+```text
+Avg Acc = 1 - Avg MAE
+```
+
+`Avg Acc` 不是分类任务中的正确率。这里的 MAE 也不是在归一化后的
+`40 x 132` 模型输出上计算的。每次请求都会先解码为 checkpoint 对应的
+`16 x 7` LIBERO action。评估取其中前 8 步并向前推进 8 步，因此每条 200-step
+轨迹由 25 次请求完整覆盖；拼接后的 `200 x 7` 序列会与数据集记录的全部 200 个
+action 比较。
+
+| Benchmark | PhyAI Avg Acc | Isaac-GR00T Avg Acc |
+| --- | ---: | ---: |
+| LIBERO demo，trajectory `0`-`4` | `0.987320` | `0.987152` |
+
+对应的误差如下：
+
+| 实现 | Avg MSE | Avg MAE | Avg Acc |
+| --- | ---: | ---: | ---: |
+| PhyAI | `0.001272` | `0.012680` | `0.987320` |
+| Isaac-GR00T | `0.001285` | `0.012848` | `0.987152` |
+
+## 评估配置
+
+| 项目 | 配置 |
+| --- | --- |
+| 模型 checkpoint | `GR00T-N1.7-LIBERO/libero_10` |
+| 数据集 | NVIDIA [`demo_data/libero_demo`](https://github.com/NVIDIA/Isaac-GR00T/tree/main/demo_data/libero_demo) |
+| 模型输入 | `videos/chunk-000` 中的两路相机视频，以及 state 和任务信息 |
+| Ground truth | `data/chunk-000` 中记录的 action |
+| Trajectory | `0`、`1`、`2`、`3`、`4` |
+| 每条 trajectory 的 step 数 | `200` |
+| 模型请求数 | `125` |
+| 精度 | bf16 |
+| 模型 action chunk | `40 x 132` |
+| 解码后的 LIBERO action chunk | `16 x 7` |
+| 评估范围 | 每次请求解码结果的前 `8` 个 action step |
+| 随机种子 | `42` |
+
+两种实现使用相同的 checkpoint、数据集、trajectory、图像变换、prompt
+构造方式、精度、action horizon 和随机种子。脚本先在解码后的 action 空间内计算
+每条 trajectory 的 MSE 和 MAE，再对五条 trajectory 取平均值。
+
+## 复现 PhyAI 结果
+
+请先按照 [GR00T-N1.7 ws1 指南](./ws1)准备 checkpoint 和 Cosmos-Reason2
+tokenizer 文件。克隆 NVIDIA Isaac-GR00T 时需要启用 Git LFS，确保上面链接的
+LIBERO demo 中包含 `meta`、`data` 和 `videos` 三个目录。
+
+在 PhyAI 仓库根目录运行：
+
+```bash
+uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
+  --checkpoint <gr00t-checkpoint-dir> \
+  --dataset-path <isaac-gr00t-dir>/demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --traj-ids 0 1 2 3 4 \
+  --steps 200 \
+  --action-horizon 8 \
+  --seed 42
+```
+
+如果本地还没有 Cosmos-Reason2 tokenizer 和 preprocessor 缓存，仅在第一次运行时
+追加 `--online`。
+内置Cosmos-Reason2 processor不需要执行远程代码；只有在使用可信的自定义processor
+仓库时才传入`--trust-remote-code`。
+
+Isaac-GR00T 参考值根据 NVIDIA 官方模型和 processor 在相同设置下生成的解码
+action 计算。NVIDIA 的
+[`standalone_inference_script.py`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/scripts/deployment/standalone_inference_script.py)
+实现了对应的 200-step、horizon-8 评估流程。

@@ -7,9 +7,17 @@ dependencies = [
     "av>=14.0.0",
     "huggingface-hub",
     "numpy",
-    "torch==2.11",
+    "opencv-python-headless",
+    "pillow",
+    "qwen-vl-utils",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "transformers==5.8.1",
 ]
+
+[project.optional-dependencies]
+# fastokens accelerates phyai_utils_tools.tokenizer and processor utilities.
+fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
