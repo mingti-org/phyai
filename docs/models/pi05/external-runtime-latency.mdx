@@ -1,196 +1,218 @@
 ---
-title: "PI0.5 External Runtime Latency"
-description: "Run PI0.5 latency benchmarks for FlashRT, realtime-vla, and vla.cpp"
+title: "PI0.5 Latency Benchmark"
+description: "Reproduce native PhyAI PI0.5 latency and run optional external runtime comparisons"
 icon: "timer"
 ---
 
 # Overview
 
-This page explains how to set up and run the three external PI0.5 latency wrappers under `benchmark/pi05/`.
+This page uses the native PhyAI benchmark as the primary PI0.5 latency path:
 
-These wrappers do not use the PhyAI engine for inference. Each wrapper calls the target runtime directly, while reusing PhyAI's common benchmark runner for warmup, timing, and JSONL output.
+```text
+benchmark/bench_n_batch_ws1_pi05.py
+```
 
-| Script | Runtime | Timed call |
-| --- | --- | --- |
-| `bench_flashrt_pi05.py` | FlashRT | `Pi05TorchFrontendRtx.infer(obs)` |
-| `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward(...)` |
-| `bench_vlacpp_pi05_client.py` | vla.cpp | One ZMQ request to a running `vla-server` |
+The script builds a PhyAI `Engine` with the `pi05` plugin, creates synthetic inputs, runs warmup, and records steady-state `Engine.step(request)` latency. It is a performance benchmark, not a LIBERO accuracy evaluation.
 
-The wrappers generate synthetic image and state inputs. Use them for latency-only measurements, not LIBERO accuracy evaluation.
+The FlashRT, realtime-vla, and vla.cpp wrappers are listed at the end as optional comparison paths.
 
-# Common Setup
+# What the PhyAI benchmark measures
 
-Use a Python environment that can import PhyAI, PyTorch, and the common benchmark runner.
+| Item | Behavior |
+| --- | --- |
+| Timed call | One `Engine.step(request)` |
+| Input | Synthetic images and a one-token synthetic prompt |
+| Included | Vision tower, language-model prefix, all 10 Euler expert steps, scheduler work, and action output |
+| Excluded | Environment setup, checkpoint loading, engine construction, CUDA graph capture, request creation, and warmup |
+| GPU timing | CUDA events around each step, followed by CUDA synchronization |
+| Output | One JSONL row per batch size |
+
+The request is created on the target device before timing. Image decoding, tokenization, simulator communication, and host-to-device preprocessing are therefore outside this benchmark.
+
+# Prepare the environment
+
+From a clean checkout:
 
 ```bash
-cd <PHYAI_REPO>
-python -c "import torch; import phyai; import benchmark.bench_n_batch"
+git clone https://github.com/MEmbodied/phyai.git
+cd phyai
+uv sync
+```
+
+Confirm that the environment can import PhyAI and see the GPU:
+
+```bash
+uv run python -c "import torch, phyai; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name(0))"
 nvidia-smi
 ```
 
-Keep these settings aligned when comparing runtimes:
+Record the source revision and GPU state with each result:
 
-| Item | Setting |
+```bash
+git rev-parse HEAD
+nvidia-smi --query-gpu=name,driver_version,memory.used,utilization.gpu --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+Run latency measurements only when the GPU and CPU are idle.
+
+# Prepare the checkpoint
+
+`--checkpoint` must point to one directory containing:
+
+```text
+<PI05_CHECKPOINT>/
+  config.json
+  model.safetensors
+```
+
+A sharded checkpoint may use `model.safetensors.index.json` and its shard files instead.
+
+Check the files before starting:
+
+```bash
+test -f <PI05_CHECKPOINT>/config.json
+test -f <PI05_CHECKPOINT>/model.safetensors || \
+  test -f <PI05_CHECKPOINT>/model.safetensors.index.json
+```
+
+The action chunk size and denoise-step count come from `config.json`. The standard PI0.5 configuration uses `chunk_size=50` and `num_inference_steps=10`; the benchmark has no separate `--chunk-size` flag.
+
+Use the same PI0.5 checkpoint family when comparing runtimes. Converted formats may be used when a runtime requires them, but they should originate from the same checkpoint.
+
+# Run the PhyAI BF16 benchmark
+
+The command below is the recommended single-batch, two-camera LIBERO-shaped latency run:
+
+```bash
+cd <PHYAI_REPO>
+mkdir -p results
+
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_bs1.jsonl
+```
+
+This configuration means:
+
+| Argument | Value |
 | --- | --- |
+| Engine precision | BF16 |
+| Vision tower precision | BF16 |
 | Batch size | 1 |
 | Camera streams | 2 |
-| Chunk size | 50 |
-| Prompt | Same prompt text across runs |
-| Warmup / timed iterations | Same values across runs |
-| Precision | Label each row by the runtime's real precision path |
+| Action chunk | Read from checkpoint, normally 50 |
+| Euler steps | Read from checkpoint, normally 10 |
+| CUDA graph | Enabled by default on CUDA |
+| Prompt shape | One synthetic token |
+| Warmup / timed iterations | 100 / 100 |
 
-Use your own paths for these placeholders:
+The PI0.5 plugin also applies the runtime recommendations stored in its model configuration when the user has not overridden them. Record any `PHYAI_*` environment overrides because they can change backend selection or workspace settings.
 
-| Placeholder | Meaning |
-| --- | --- |
-| `<PHYAI_REPO>` | PhyAI checkout containing `benchmark/pi05/` |
-| `<FLASHRT_REPO>` | FlashRT checkout |
-| `<REALTIME_VLA_REPO>` | realtime-vla checkout |
-| `<VLACPP_REPO>` | vla.cpp checkout |
-| `<VLA_SERVER>` | Compiled vla.cpp `vla-server` binary |
-| `<PI05_CHECKPOINT>` | PI0.5 safetensors checkpoint directory or file |
-| `<PI05_GGUF>` | PI0.5 GGUF file for vla.cpp |
-| `<MM_PROJ_GGUF>` | vla.cpp multimodal projector GGUF |
-| `<TOKENIZER_DIR>` | Local tokenizer directory |
-| `<LIBERO_STATS_JSON>` | LIBERO `meta/stats.json` with `observation.state.q01/q99` |
+## Three-camera PI0.5 base shape
 
-# FlashRT
-
-Install FlashRT from its official repository, then make the checkout visible to the wrapper.
+The public `pi05_base` contract uses three camera streams. Change only `--num-images` and the output label:
 
 ```bash
-export FLASHRT_ROOT=<FLASHRT_REPO>
-cd <PHYAI_REPO>
-python -c "import sys; sys.path.insert(0, '$FLASHRT_ROOT'); from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx; print(Pi05TorchFrontendRtx)"
-```
-
-Run latency:
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_flashrt_pi05.py \
-  --flashrt-root <FLASHRT_REPO> \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
   --checkpoint <PI05_CHECKPOINT> \
-  --precision bf16 \
-  --num-views 2 \
-  --chunk-size 50 \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 3 \
   --batch-sizes 1 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/flashrt_pi05.jsonl
+  --run-name pi05_bf16_views3_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views3_bs1.jsonl
 ```
 
-Notes:
+Do not compare two-camera and three-camera rows as if they had the same workload.
 
-| Item | Note |
-| --- | --- |
-| Chunk size | The wrapper uses FlashRT's direct `Pi05TorchFrontendRtx` API because `chunk_size` is a frontend constructor argument |
-| Denoise steps | Do not use `load_model(..., num_steps=50)` to set action chunk size; in FlashRT, `num_steps` means denoise steps |
-| Precision | `--precision bf16` uses FlashRT's forced-BF16 PI0.5 RTX path; `--precision fp8_bf16` is a separate optimized FP8/BF16 result |
+## FP32 vision parity row
 
-# realtime-vla
-
-Install realtime-vla from its official repository. The wrapper can load a converted `.pt` / `.pth` checkpoint directly. If you pass a PI0.5 safetensors checkpoint, also provide FlashRT so the wrapper can reuse FlashRT's conversion helper.
+To compare with an implementation whose vision tower cannot run in BF16, keep the language and expert stacks in BF16 and run SigLIP plus its projector in FP32:
 
 ```bash
-export REALTIME_VLA_ROOT=<REALTIME_VLA_REPO>
-export FLASHRT_ROOT=<FLASHRT_REPO>
-cd <PHYAI_REPO>
-python -c "import sys; sys.path.insert(0, '$REALTIME_VLA_ROOT'); from pi05_infer import Pi05Inference; print(Pi05Inference)"
-```
-
-Run latency:
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_realtime_vla_pi05.py \
-  --realtime-vla-root <REALTIME_VLA_REPO> \
-  --flashrt-root <FLASHRT_REPO> \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
   --checkpoint <PI05_CHECKPOINT> \
-  --num-views 2 \
-  --chunk-size 50 \
-  --prompt-len 16 \
+  --dtype bf16 \
+  --vision-dtype float32 \
+  --num-images 2 \
   --batch-sizes 1 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/realtime_vla_pi05.jsonl
+  --run-name pi05_bf16_vision_fp32_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_vision_fp32_views2_bs1.jsonl
 ```
 
-Notes:
+Label this row as `BF16 language/expert + FP32 vision`, not as full BF16.
 
-| Item | Note |
-| --- | --- |
-| Precision | The wrapper uses BF16 synthetic inputs |
-| Pickle checkpoints | For `.pkl` / `.pickle`, add `--trust-pickle-checkpoint` only for trusted files |
-| Prompt embedding | If the checkpoint does not contain `language_embeds`, the wrapper creates a synthetic prompt embedding for latency-only runs |
+## Batch-size sweep
 
-# vla.cpp
-
-vla.cpp uses a server/client flow. Build `vla-server` with CUDA enabled, then start the server in one shell and run the Python client in another.
-
-Basic checks:
+Use one command when measuring scaling under otherwise identical settings:
 
 ```bash
-test -x <VLA_SERVER>
-test -f <PI05_GGUF>
-test -f <MM_PROJ_GGUF>
-test -f <TOKENIZER_DIR>/tokenizer.json
-test -f <LIBERO_STATS_JSON>
-```
-
-Start server:
-
-```bash
-<VLA_SERVER> \
-  --bind tcp://127.0.0.1:5555 \
-  --timing-detail phase \
-  <MM_PROJ_GGUF> \
-  <PI05_GGUF>
-```
-
-Run latency client:
-
-```bash
-cd <PHYAI_REPO>
-python benchmark/pi05/bench_vlacpp_pi05_client.py \
-  --vlacpp-root <VLACPP_REPO> \
-  --addr tcp://127.0.0.1:5555 \
-  --arch pi05 \
-  --tokenizer <TOKENIZER_DIR> \
-  --stats-json <LIBERO_STATS_JSON> \
-  --num-views 2 \
-  --chunk-size 50 \
-  --batch-sizes 1 \
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 2 4 \
   --n-warmup 100 \
   --n-timed 100 \
-  --result-file results/vlacpp_pi05.jsonl
+  --run-name pi05_bf16_views2_batch_sweep \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_batch_sweep.jsonl
 ```
 
-Notes:
+The engine is rebuilt for each batch size so that `max_batch_size`, scheduler buffers, and captured graphs match that row.
 
-| Item | Note |
-| --- | --- |
-| Model format | vla.cpp needs GGUF files; a safetensors checkpoint is not enough |
-| Local files | Prefer local tokenizer and stats files to avoid network or HuggingFace auth issues |
-| Stats format | For PI0.5, vla.cpp expects lerobot-style `meta/stats.json`; OpenPI-style `norm_stats.json` is not the same format |
-| Timing detail | If the server returns phase timing, the wrapper writes it under `extras.server_phase_latency_ms` |
+# Read the result
 
-# Timing Scope
+The result file is append-only. Use a new path for a new experiment or remove an old result deliberately before rerunning.
 
-| Runtime | Timing scope |
-| --- | --- |
-| FlashRT | Wall time around steady-state `Pi05TorchFrontendRtx.infer(obs)`, after prompt setup, calibration, and the first graph-building call |
-| realtime-vla | CUDA-event time around one `Pi05Inference.forward(...)` call |
-| vla.cpp | Client wall time for one ZMQ request; server phase timing is copied from the response when available |
+Each JSONL row records:
 
-# Troubleshooting
+- `latency_ms_mean`, `latency_ms_median`, `latency_ms_p50`
+- `latency_ms_p90`, `latency_ms_p99`
+- `latency_ms_stdev`, `latency_ms_min`, `latency_ms_max`
+- `throughput_samples_per_s`
+- batch size, warmup count, timed count, dtype, device, and CUDA graph state
 
-| Symptom | Check |
-| --- | --- |
-| `No module named flash_rt` | Pass `--flashrt-root` or set `FLASHRT_ROOT` |
-| `No module named pi05_infer` | Pass `--realtime-vla-root` or set `REALTIME_VLA_ROOT` |
-| realtime-vla safetensors conversion fails | Also pass `--flashrt-root`; verify the FlashRT import works |
-| vla.cpp client cannot connect | Confirm the server is ready and client `--addr` matches server `--bind` |
-| vla.cpp tokenizer downloads or asks for auth | Use a local tokenizer directory |
-| GPU architecture build error | Check CUDA, PyTorch CUDA, driver, and build flags for the target GPU |
-| Latency is much slower than expected | Check `nvidia-smi`, rerun after warmup/JIT, and make sure no other process is using the GPU |
+Inspect the latest row with:
+
+```bash
+tail -n 1 results/phyai_pi05_bf16_views2_bs1.jsonl | python -m json.tool
+```
+
+For a comparable report, retain the command, Git commit, checkpoint identity, GPU and driver, precision, number of images, batch size, warmup count, timed count, and whether CUDA graph was enabled.
+
+# Optional external runtime wrappers
+
+These wrappers reuse PhyAI's common warmup and result format but do not use the PhyAI engine for inference. Prepare each runtime using its official repository before running the corresponding script.
+
+| Runtime | Script | Timed scope | Model format |
+| --- | --- | --- | --- |
+| FlashRT | `benchmark/pi05/bench_flashrt_pi05.py` | Steady-state `Pi05TorchFrontendRtx.infer(obs)` wall time | PI0.5 safetensors |
+| realtime-vla | `benchmark/pi05/bench_realtime_vla_pi05.py` | One `Pi05Inference.forward(...)` call | Converted checkpoint or PI0.5 safetensors |
+| vla.cpp | `benchmark/pi05/bench_vlacpp_pi05_client.py` | One client ZMQ request; server phases are recorded separately | PI0.5 GGUF plus multimodal projector |
+
+Show the runtime-specific arguments with:
+
+```bash
+uv run python benchmark/pi05/bench_flashrt_pi05.py --help
+uv run python benchmark/pi05/bench_realtime_vla_pi05.py --help
+uv run python benchmark/pi05/bench_vlacpp_pi05_client.py --help
+```
+
+For comparisons, align checkpoint origin, batch size, camera count, action chunk size, prompt shape, warmup, timed iterations, and actual runtime precision. Keep external-runtime rows separate when their model format or timing boundary differs from PhyAI.

@@ -81,6 +81,7 @@ def make_setup_fn(args: argparse.Namespace):
         if batch_size != 1:
             raise ValueError("realtime-vla PI0.5 wrapper supports only batch_size=1")
 
+        torch.manual_seed(args.seed)
         checkpoint = load_checkpoint(
             args.checkpoint, args.flashrt_root, args.trust_pickle_checkpoint
         )
@@ -97,7 +98,6 @@ def make_setup_fn(args: argparse.Namespace):
             tokenizer_path=str(args.tokenizer) if args.tokenizer else None,
             discrete_state_input=args.discrete_state_input,
         )
-        torch.manual_seed(args.seed)
         input_image = torch.randn(
             args.num_views, 224, 224, 3, dtype=torch.bfloat16, device="cuda"
         )
