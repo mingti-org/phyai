@@ -1,0 +1,175 @@
+---
+title: "PI0.5 八卡推理"
+description: "使用 PhyAI pi0.5 WN policy 跑 8 卡数据并行推理和并发 LIBERO client"
+icon: "server"
+---
+
+# 概述
+
+这篇文档说明如何复现 PhyAI `pi05_wn` 的八卡数据并行推理，并同时启动多路 LIBERO client。
+
+当前 demo 使用 `chunk_size=1`。也就是每次请求只返回 1 个 action，client 每步都向 server 请求一次。
+
+# 参考环境
+
+| 项 | 配置 |
+| --- | --- |
+| OS | Ubuntu 22.04 LTS |
+| GPU | 8 x NVIDIA H20，单卡约 96 GB |
+| CPU / 内存 | 192 核 / 约 1.8 TiB |
+| 容器 | Docker，server 和 LIBERO 都在容器内跑 |
+| 会话 | `tmux` 挂住 server |
+
+其它机器也可以复现。至少需要 8 张空闲 CUDA GPU、Docker、`tmux`，以及 PI0.5 LIBERO checkpoint 和离线 tokenizer。卡型不同会影响耗时，但流程不变。
+
+# 固定源码版本
+
+使用以下两个 PR 中的精确提交：
+
+| 仓库 | Pull request | 提交 |
+| --- | --- | --- |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`5fc3288`](https://github.com/rebecca26358/phyai/commit/5fc3288dcd8fe1de0a3859a28cfa7036e42217d8) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`8bb9009`](https://github.com/rebecca26358/vla-evaluation-harness/commit/8bb90099c719ee8d151497c6636e76a9da5d5c6f) |
+
+VLA 提交同时提供 `vla_eval.model_servers.phyai` 和
+`vla_eval.model_servers.phyai_wn`；PhyAI 提供与之匹配的
+`PI05LiberoPolicy` 批处理与分布式 worker 接口。VLA server 的 PEP 723 元数据固定到 policy 实现提交 [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e95665fae38e7d13a737922398eaadb4db24669)；上面的 PhyAI checkout 还包含文档中记录的 3 条测试。
+
+# 路径设置
+
+按机器实际目录修改下面几个路径：
+
+```bash
+export WORKSPACE="$HOME/vla_workplace"
+export PHYAI_ROOT="$WORKSPACE/phyai"
+export VLA_ROOT="$WORKSPACE/vla-evaluation-harness"
+export MODEL_ROOT="$WORKSPACE/phyai_models"
+```
+
+启动前检查：
+
+```bash
+ls "$MODEL_ROOT/pi05_libero_phyai_converted"
+ls "$MODEL_ROOT/paligemma-3b-pt-224"
+ls "$PHYAI_ROOT/.venv/bin/torchrun"
+ls "$VLA_ROOT/.venv/bin/vla-eval"
+
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
+ss -ltnp | grep 8000 || echo "8000 free"
+```
+
+`paligemma-3b-pt-224` 要提前放在本地。脚本会设置离线模式，运行时不应该再从 HuggingFace 下载 tokenizer。
+
+# 执行流程
+
+```text
+32 个 LIBERO 仿真进程
+  -> 连接 rank0 WebSocket，地址 ws://127.0.0.1:8000
+  -> rank0 收集请求，凑满 MAX_BATCH_SIZE 或等待 MAX_WAIT_TIME
+  -> 8 卡 DP：scatter -> 每卡计算自己的 batch slice -> gather
+  -> server 返回 action
+  -> 每路仿真写一份 JSON 结果
+```
+
+本次 demo 参数：
+
+| 项 | 值 |
+| --- | --- |
+| GPU 数 | 8 |
+| `max_batch_size` | 32，每卡 B=4 |
+| `chunk_size` | 1 |
+| `max_wait_time` | 0.02 |
+| dtype | bfloat16 |
+
+CUDA graph 按固定 shape 运行。不足 batch 的请求会 padding，所以 partial batch 不会按比例变快。
+
+# 启动八卡 server
+
+server 在 Docker 容器里启动，容器需要挂载 `PHYAI_ROOT`、`VLA_ROOT` 和 `MODEL_ROOT`。核心启动命令如下：
+
+```bash
+export PHYAI_TOKENIZER_PATH=/data/share/paligemma-3b-pt-224
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+torchrun --nproc_per_node=8 --master_port=29619 \
+  -m vla_eval.model_servers.phyai_wn \
+  --checkpoint_path /data/share/pi05_libero_phyai_converted \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --chunk_size 1 \
+  --max_batch_size 32 \
+  --max_wait_time 0.02 \
+  --use_cuda_graph \
+  --params_dtype bfloat16 \
+  --attn_backend flashinfer \
+  --norm_backend phyai-kernel \
+  --linear_backend flashinfer
+```
+
+第一次启动通常需要 1 到 3 分钟完成 CUDA graph capture。就绪后检查：
+
+```bash
+curl -sS http://127.0.0.1:8000/config
+```
+
+返回内容里应能看到 `max_batch_size=32`。如果 server 放在 `tmux` 里，可以这样查看日志：
+
+```bash
+tmux attach -t <server_session>
+# 分离：Ctrl-b，然后按 d
+```
+
+# 启动 LIBERO client
+
+启动 32 路 LIBERO client：4 个 suite，每个 suite 8 个 shard，全部连接同一个 server。
+
+```bash
+for suite in spatial object goal libero_10; do
+  for shard_id in 0 1 2 3 4 5 6 7; do
+    env NO_PROXY="*" no_proxy="*" \
+      "$VLA_ROOT/.venv/bin/vla-eval" run \
+        --config "<suite yaml>" \
+        --server-url ws://127.0.0.1:8000 \
+        --output-dir "<result dir>/$suite" \
+        --dev --yes \
+        --shard-id "$shard_id" \
+        --num-shards 8 &
+  done
+done
+wait
+```
+
+`<suite yaml>` 需要换成对应的 LIBERO 配置文件。跑完后，每个结果目录下会生成 JSON。
+
+# 改参数
+
+| 目标 | 改法 |
+| --- | --- |
+| 改 chunk | 修改 server 的 `--chunk_size N` |
+| batch16 | 改成 `--max_batch_size 16`，并只启动 16 路 client |
+| 换端口 | 同时修改 `--port`、client 的 `--server-url` 和结果目录 |
+
+batch16 和 batch32 建议分两次启动 server，不要在同一个 `torchrun` 进程里切换。
+
+纯模型 `Engine.step` 的参考 latency：batch16 约 60 ms，batch32 约 97 ms。这个数只代表模型推理，不等于 LIBERO 端到端等待时间。
+
+# 收尾
+
+评测结束后关闭 server，并确认 GPU 已释放：
+
+```bash
+tmux kill-session -t <server_session>
+docker rm -f <server_container> 2>/dev/null || true
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits
+```
+
+# 常见问题
+
+| 现象 | 处理方式 |
+| --- | --- |
+| setup 卡住 | 检查离线 tokenizer、`master_port`、同名容器和显存占用 |
+| `:8000/config` 不通 | 等待 graph capture 完成，或查看 server 日志 |
+| shard 连不上 | 确认 host network、`ws://127.0.0.1:8000` 和 `NO_PROXY="*"` |
+| 只有部分结果 | 查看对应结果目录下的日志文件 |
+| FlashInfer / CUDA 冲突 | 优先使用 Docker 环境，避免混用宿主机 CUDA 库 |

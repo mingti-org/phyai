@@ -36,7 +36,10 @@
                 "group": "PI0.5",
                 "pages": [
                   "models/pi05/ws1",
-                  "models/pi05/processors"
+                  "models/pi05/processors",
+                  "models/pi05/libero-four-suites",
+                  "models/pi05/eight-gpu-inference",
+                  "models/pi05/external-runtime-latency"
                 ]
               },
               {
@@ -106,7 +109,10 @@
                 "group": "PI0.5",
                 "pages": [
                   "zh/models/pi05/ws1",
-                  "zh/models/pi05/processors"
+                  "zh/models/pi05/processors",
+                  "zh/models/pi05/libero-four-suites",
+                  "zh/models/pi05/eight-gpu-inference",
+                  "zh/models/pi05/external-runtime-latency"
                 ]
               },
               {

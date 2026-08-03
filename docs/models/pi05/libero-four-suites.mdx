@@ -1,0 +1,273 @@
+---
+title: "PI0.5 LIBERO Four-Suite Reproduction"
+description: "Run the PhyAI pi0.5 policy on LIBERO spatial, object, goal, and libero_10"
+icon: "list-checks"
+---
+
+# Overview
+
+This page explains how to run the PhyAI PI0.5 LIBERO policy with `vla-evaluation-harness` on the four LIBERO benchmark suites.
+
+The four suites are:
+
+| Suite | Config file |
+| --- | --- |
+| `libero_spatial` | `configs/benchmarks/libero/spatial.yaml` |
+| `libero_object` | `configs/benchmarks/libero/object.yaml` |
+| `libero_goal` | `configs/benchmarks/libero/goal.yaml` |
+| `libero_10` | `configs/benchmarks/libero/10.yaml` |
+
+Default evaluation settings:
+
+| Item | Value |
+| --- | --- |
+| Mode | sync |
+| Action chunk size | 10 |
+| Episodes per suite | 10 tasks x 50 episodes |
+| Total episodes | 4 suites x 500 episodes |
+| Model | PI0.5 LIBERO converted checkpoint |
+| Simulator | `vla-evaluation-harness` LIBERO Docker container |
+| Output | One JSON result file per suite |
+
+# Resources
+
+Prepare these resources first:
+
+| Resource | Notes |
+| --- | --- |
+| PhyAI repository | Contains the PI0.5 policy and benchmark scripts |
+| `vla-evaluation-harness` | LIBERO simulation benchmark framework |
+| PI0.5 LIBERO checkpoint | OpenPI's official `pi05_libero` checkpoint, converted to the format PhyAI can load |
+| [`google/paligemma-3b-pt-224`](https://huggingface.co/google/paligemma-3b-pt-224) | Tokenizer / processor used by PI0.5 |
+| Docker + NVIDIA Container Toolkit | Required for the LIBERO simulation container |
+
+`paligemma-3b-pt-224` may require HuggingFace access. If possible, sync it from a machine that already has access instead of downloading it during the run.
+
+# Pin Source Revisions
+
+This reproduction uses immutable commits from two linked pull requests:
+
+| Repository | Pull request | Commit |
+| --- | --- | --- |
+| PhyAI | [mingti-org/phyai#21](https://github.com/mingti-org/phyai/pull/21) | [`3a9a28b`](https://github.com/rebecca26358/phyai/commit/3a9a28b21aa53627a07c3be9fcb86e6adb1b4ae8) |
+| `vla-evaluation-harness` | [allenai/vla-evaluation-harness#111](https://github.com/allenai/vla-evaluation-harness/pull/111) | [`8bb9009`](https://github.com/rebecca26358/vla-evaluation-harness/commit/8bb90099c719ee8d151497c6636e76a9da5d5c6f) |
+
+Check out those exact revisions:
+
+```bash
+export PHYAI_ROOT=${PHYAI_ROOT:-$HOME/phyai}
+export VLA_ROOT=${VLA_ROOT:-$HOME/vla-evaluation-harness}
+
+git clone https://github.com/rebecca26358/phyai.git "$PHYAI_ROOT"
+git -C "$PHYAI_ROOT" checkout 3a9a28b21aa53627a07c3be9fcb86e6adb1b4ae8
+
+git clone https://github.com/rebecca26358/vla-evaluation-harness.git "$VLA_ROOT"
+git -C "$VLA_ROOT" checkout 8bb90099c719ee8d151497c6636e76a9da5d5c6f
+```
+
+The VLA revision contains `src/vla_eval/model_servers/phyai.py`,
+`src/vla_eval/model_servers/phyai_wn.py`, and
+`configs/model_servers/phyai/libero.yaml`. Its PEP 723 metadata pins the policy
+implementation commit [`4e95665`](https://github.com/rebecca26358/phyai/commit/4e95665fae38e7d13a737922398eaadb4db24669), an ancestor of the PhyAI checkout above. The later PhyAI commits add documentation, tests, and the checkpoint converter without changing the policy implementation.
+
+# Download and Convert the Checkpoint
+
+OpenPI publishes the LIBERO checkpoint at
+[`gs://openpi-assets/checkpoints/pi05_libero`](https://github.com/Physical-Intelligence/openpi/blob/main/examples/libero/README.md).
+Download the checkpoint and tokenizer into `MODEL_ROOT`:
+
+```bash
+export MODEL_ROOT=${MODEL_ROOT:-$HOME/phyai_models}
+export OPENPI_CKPT_HOST=$MODEL_ROOT/pi05_libero
+export PHYAI_CKPT_HOST=$MODEL_ROOT/pi05_libero_phyai_converted
+export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
+
+mkdir -p "$MODEL_ROOT"
+gcloud storage rsync --recursive \
+  gs://openpi-assets/checkpoints/pi05_libero \
+  "$OPENPI_CKPT_HOST"
+
+uvx --from huggingface_hub hf download \
+  google/paligemma-3b-pt-224 \
+  --local-dir "$TOKENIZER_HOST"
+```
+
+The PaliGemma download requires accepting the model terms and authenticating
+with Hugging Face. Convert the OpenPI Orbax checkpoint into the safetensors and
+processor files loaded by `PI05LiberoPolicy`:
+
+```bash
+cd "$PHYAI_ROOT"
+uv run tools/convert_openpi_pi05_to_phyai.py \
+  --checkpoint "$OPENPI_CKPT_HOST" \
+  --write \
+  --out "$PHYAI_CKPT_HOST/model.safetensors"
+```
+
+The converter uses pinned PEP 723 dependencies. It reads normalization
+statistics from the official checkpoint and creates `config.json`, the two
+processor JSON files, and their safetensors sidecars next to
+`model.safetensors`.
+
+# Set Paths
+
+Set paths on the target machine. These are placeholders; change them for your environment.
+
+```bash
+export PHYAI_ROOT=$HOME/phyai
+export VLA_ROOT=$HOME/vla-evaluation-harness
+export MODEL_ROOT=$HOME/phyai_models
+export PHYAI_CONTAINER=phyai_libero_eval
+
+export OPENPI_CKPT_HOST=$MODEL_ROOT/pi05_libero
+export PHYAI_CKPT_HOST=$MODEL_ROOT/pi05_libero_phyai_converted
+export TOKENIZER_HOST=$MODEL_ROOT/paligemma-3b-pt-224
+
+export PHYAI_CKPT_IN_CONTAINER=/data/share/pi05_libero_phyai_converted
+export TOKENIZER_IN_CONTAINER=/data/share/paligemma-3b-pt-224
+
+export PHYAI_IMAGE=nvcr.io/nvidia/pytorch:25.12-py3
+```
+
+Check the model directories:
+
+```bash
+test -d "$OPENPI_CKPT_HOST"
+test -f "$PHYAI_CKPT_HOST/model.safetensors"
+test -f "$PHYAI_CKPT_HOST/config.json"
+test -f "$PHYAI_CKPT_HOST/policy_preprocessor.json"
+test -f "$PHYAI_CKPT_HOST/policy_postprocessor.json"
+test -d "$TOKENIZER_HOST"
+```
+
+# Evaluator Environment
+
+Create the VLA evaluator environment on the host. This works from a clean checkout; PhyAI does not define `cu130` or `libero` dependency groups.
+
+```bash
+cd "$VLA_ROOT"
+uv sync
+```
+
+# PhyAI Runtime Container
+
+Run the policy server in the CUDA 13 image used by PhyAI. The evaluator starts
+the separate LIBERO simulator image declared by each benchmark config.
+
+```bash
+docker run --gpus all -it --rm \
+  --name "$PHYAI_CONTAINER" \
+  --ipc=host \
+  --network=host \
+  -v "$PHYAI_ROOT:$PHYAI_ROOT" \
+  -v "$VLA_ROOT:$VLA_ROOT" \
+  -v "$MODEL_ROOT:/data/share" \
+  "$PHYAI_IMAGE" \
+  bash
+```
+
+Inside the container, sync both clean checkouts and verify the model paths:
+
+```bash
+cd "$PHYAI_ROOT"
+uv sync
+
+cd "$VLA_ROOT"
+uv sync
+
+test -d "$PHYAI_CKPT_IN_CONTAINER"
+test -d "$TOKENIZER_IN_CONTAINER"
+```
+
+# Validate the Policy Adapter
+
+Run the lightweight policy tests inside the PhyAI runtime container:
+
+```bash
+cd "$PHYAI_ROOT"
+uv run pytest phyai/tests/policies/test_pi05_libero.py -q
+```
+
+The expected result is `3 passed`. These tests cover the default single-GPU
+configuration, single-observation inference, and batched input concatenation.
+They do not load a checkpoint or execute CUDA model inference.
+
+# Start the Policy Server
+
+`phyai.policies.pi05_libero` is a policy adapter, not a CLI server. Start the WebSocket server through the VLA config added by PR #111:
+
+```bash
+cd "$VLA_ROOT"
+
+export PHYAI_CHECKPOINT_PATH="$PHYAI_CKPT_IN_CONTAINER"
+export PHYAI_TOKENIZER_PATH="$TOKENIZER_IN_CONTAINER"
+
+uv run vla-eval serve --config configs/model_servers/phyai/libero.yaml
+```
+
+Keep the server running while the evaluator connects to `ws://localhost:8000`.
+
+# Smoke Test
+
+In another terminal, run a short check to confirm that the evaluator can reach the policy server:
+
+```bash
+cd "$VLA_ROOT"
+
+uv run vla-eval run \
+  --config configs/benchmarks/libero/smoke_test.yaml \
+  --server-url ws://localhost:8000 \
+  --dev \
+  --yes
+```
+
+If the smoke test fails, stop there and check the server log, port, checkpoint path, and tokenizer path first.
+
+# Run All Four Suites
+
+After confirming that the GPU is idle, run the full evaluation. Save each suite separately.
+
+```bash
+cd "$VLA_ROOT"
+
+for suite in spatial object goal 10; do
+  uv run vla-eval run \
+    --config "configs/benchmarks/libero/${suite}.yaml" \
+    --server-url ws://localhost:8000 \
+    --dev \
+    --yes
+done
+```
+
+Record these fields with the result:
+
+| Item | What to record |
+| --- | --- |
+| PhyAI commit | `git rev-parse HEAD` |
+| Checkpoint | Name and source |
+| Tokenizer | Local path or HuggingFace id |
+| GPU | `nvidia-smi --query-gpu=name --format=csv,noheader` |
+| dtype | For example, `bf16` |
+| Chunk size | For example, `10` |
+| Number of camera views | For example, `2` |
+| Episodes per suite | For example, `500` |
+
+# Summarize Results
+
+Each benchmark suite writes a JSON file under its result directory. This helper prints common summary fields when they exist:
+
+```bash
+python - <<PY
+import json
+from pathlib import Path
+
+for path in sorted(Path("results").glob("pi05_libero_*/*.json")):
+    data = json.loads(path.read_text())
+    print(path)
+    for key in ("success_rate", "avg_success", "avg_episode_length", "avg_time"):
+        if key in data:
+            print(f"  {key}: {data[key]}")
+PY
+```
+
+The exact JSON field names can differ across `vla-evaluation-harness` versions. Use the fields present in your result files when reporting numbers.

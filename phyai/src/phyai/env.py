@@ -155,6 +155,10 @@ class envs:
     # ---------- runtime ---------- #
     PHYAI_USE_CUDA_GRAPH = EnvField("PHYAI_USE_CUDA_GRAPH", None, _parse_bool)
 
+    # ---------- policy adapters ---------- #
+    PHYAI_CAMERA_MODE = EnvField("PHYAI_CAMERA_MODE", None, str)
+    PHYAI_TOKENIZER_PATH = EnvField("PHYAI_TOKENIZER_PATH", None, str)
+
     # ---------- parallel ---------- #
     PHYAI_WORLD_SIZE = EnvField("PHYAI_WORLD_SIZE", None, int)
     PHYAI_DP_SIZE = EnvField("PHYAI_DP_SIZE", None, int)

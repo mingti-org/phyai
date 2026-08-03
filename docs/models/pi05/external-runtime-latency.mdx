@@ -1,0 +1,218 @@
+---
+title: "PI0.5 Latency Benchmark"
+description: "Reproduce native PhyAI PI0.5 latency and run optional external runtime comparisons"
+icon: "timer"
+---
+
+# Overview
+
+This page uses the native PhyAI benchmark as the primary PI0.5 latency path:
+
+```text
+benchmark/bench_n_batch_ws1_pi05.py
+```
+
+The script builds a PhyAI `Engine` with the `pi05` plugin, creates synthetic inputs, runs warmup, and records steady-state `Engine.step(request)` latency. It is a performance benchmark, not a LIBERO accuracy evaluation.
+
+The FlashRT, realtime-vla, and vla.cpp wrappers are listed at the end as optional comparison paths.
+
+# What the PhyAI benchmark measures
+
+| Item | Behavior |
+| --- | --- |
+| Timed call | One `Engine.step(request)` |
+| Input | Synthetic images and a one-token synthetic prompt |
+| Included | Vision tower, language-model prefix, all 10 Euler expert steps, scheduler work, and action output |
+| Excluded | Environment setup, checkpoint loading, engine construction, CUDA graph capture, request creation, and warmup |
+| GPU timing | CUDA events around each step, followed by CUDA synchronization |
+| Output | One JSONL row per batch size |
+
+The request is created on the target device before timing. Image decoding, tokenization, simulator communication, and host-to-device preprocessing are therefore outside this benchmark.
+
+# Prepare the environment
+
+From a clean checkout:
+
+```bash
+git clone https://github.com/MEmbodied/phyai.git
+cd phyai
+uv sync
+```
+
+Confirm that the environment can import PhyAI and see the GPU:
+
+```bash
+uv run python -c "import torch, phyai; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name(0))"
+nvidia-smi
+```
+
+Record the source revision and GPU state with each result:
+
+```bash
+git rev-parse HEAD
+nvidia-smi --query-gpu=name,driver_version,memory.used,utilization.gpu --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+Run latency measurements only when the GPU and CPU are idle.
+
+# Prepare the checkpoint
+
+`--checkpoint` must point to one directory containing:
+
+```text
+<PI05_CHECKPOINT>/
+  config.json
+  model.safetensors
+```
+
+A sharded checkpoint may use `model.safetensors.index.json` and its shard files instead.
+
+Check the files before starting:
+
+```bash
+test -f <PI05_CHECKPOINT>/config.json
+test -f <PI05_CHECKPOINT>/model.safetensors || \
+  test -f <PI05_CHECKPOINT>/model.safetensors.index.json
+```
+
+The action chunk size and denoise-step count come from `config.json`. The standard PI0.5 configuration uses `chunk_size=50` and `num_inference_steps=10`; the benchmark has no separate `--chunk-size` flag.
+
+Use the same PI0.5 checkpoint family when comparing runtimes. Converted formats may be used when a runtime requires them, but they should originate from the same checkpoint.
+
+# Run the PhyAI BF16 benchmark
+
+The command below is the recommended single-batch, two-camera LIBERO-shaped latency run:
+
+```bash
+cd <PHYAI_REPO>
+mkdir -p results
+
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_bs1.jsonl
+```
+
+This configuration means:
+
+| Argument | Value |
+| --- | --- |
+| Engine precision | BF16 |
+| Vision tower precision | BF16 |
+| Batch size | 1 |
+| Camera streams | 2 |
+| Action chunk | Read from checkpoint, normally 50 |
+| Euler steps | Read from checkpoint, normally 10 |
+| CUDA graph | Enabled by default on CUDA |
+| Prompt shape | One synthetic token |
+| Warmup / timed iterations | 100 / 100 |
+
+The PI0.5 plugin also applies the runtime recommendations stored in its model configuration when the user has not overridden them. Record any `PHYAI_*` environment overrides because they can change backend selection or workspace settings.
+
+## Three-camera PI0.5 base shape
+
+The public `pi05_base` contract uses three camera streams. Change only `--num-images` and the output label:
+
+```bash
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 3 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_views3_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views3_bs1.jsonl
+```
+
+Do not compare two-camera and three-camera rows as if they had the same workload.
+
+## FP32 vision parity row
+
+To compare with an implementation whose vision tower cannot run in BF16, keep the language and expert stacks in BF16 and run SigLIP plus its projector in FP32:
+
+```bash
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype float32 \
+  --num-images 2 \
+  --batch-sizes 1 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_vision_fp32_views2_bs1 \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_vision_fp32_views2_bs1.jsonl
+```
+
+Label this row as `BF16 language/expert + FP32 vision`, not as full BF16.
+
+## Batch-size sweep
+
+Use one command when measuring scaling under otherwise identical settings:
+
+```bash
+uv run python benchmark/bench_n_batch_ws1_pi05.py \
+  --checkpoint <PI05_CHECKPOINT> \
+  --dtype bf16 \
+  --vision-dtype bfloat16 \
+  --num-images 2 \
+  --batch-sizes 1 2 4 \
+  --n-warmup 100 \
+  --n-timed 100 \
+  --run-name pi05_bf16_views2_batch_sweep \
+  --bench-name pi05_ws1 \
+  --result-file results/phyai_pi05_bf16_views2_batch_sweep.jsonl
+```
+
+The engine is rebuilt for each batch size so that `max_batch_size`, scheduler buffers, and captured graphs match that row.
+
+# Read the result
+
+The result file is append-only. Use a new path for a new experiment or remove an old result deliberately before rerunning.
+
+Each JSONL row records:
+
+- `latency_ms_mean`, `latency_ms_median`, `latency_ms_p50`
+- `latency_ms_p90`, `latency_ms_p99`
+- `latency_ms_stdev`, `latency_ms_min`, `latency_ms_max`
+- `throughput_samples_per_s`
+- batch size, warmup count, timed count, dtype, device, and CUDA graph state
+
+Inspect the latest row with:
+
+```bash
+tail -n 1 results/phyai_pi05_bf16_views2_bs1.jsonl | python -m json.tool
+```
+
+For a comparable report, retain the command, Git commit, checkpoint identity, GPU and driver, precision, number of images, batch size, warmup count, timed count, and whether CUDA graph was enabled.
+
+# Optional external runtime wrappers
+
+These wrappers reuse PhyAI's common warmup and result format but do not use the PhyAI engine for inference. Prepare each runtime using its official repository before running the corresponding script.
+
+| Runtime | Script | Timed scope | Model format |
+| --- | --- | --- | --- |
+| FlashRT | `benchmark/pi05/bench_flashrt_pi05.py` | Steady-state `Pi05TorchFrontendRtx.infer(obs)` wall time | PI0.5 safetensors |
+| realtime-vla | `benchmark/pi05/bench_realtime_vla_pi05.py` | One `Pi05Inference.forward(...)` call | Converted checkpoint or PI0.5 safetensors |
+| vla.cpp | `benchmark/pi05/bench_vlacpp_pi05_client.py` | One client ZMQ request; server phases are recorded separately | PI0.5 GGUF plus multimodal projector |
+
+Show the runtime-specific arguments with:
+
+```bash
+uv run python benchmark/pi05/bench_flashrt_pi05.py --help
+uv run python benchmark/pi05/bench_realtime_vla_pi05.py --help
+uv run python benchmark/pi05/bench_vlacpp_pi05_client.py --help
+```
+
+For comparisons, align checkpoint origin, batch size, camera count, action chunk size, prompt shape, warmup, timed iterations, and actual runtime precision. Keep external-runtime rows separate when their model format or timing boundary differs from PhyAI.
