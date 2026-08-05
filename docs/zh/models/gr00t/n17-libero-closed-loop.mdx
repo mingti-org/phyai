@@ -1,0 +1,168 @@
+---
+title: "GR00T-N1.7 LIBERO 闭环成功率"
+description: "使用固定初始状态复现 PhyAI 在 LIBERO-10 上的任务成功率"
+---
+
+# GR00T-N1.7 LIBERO 闭环成功率
+
+每个 episode 都会在 LIBERO 中执行模型动作，直到 `check_success()` 返回真或达到
+episode 步数上限。
+
+## 结果
+
+| 后端 | 成功 episode | 成功率 | Wilson 95% CI |
+| --- | ---: | ---: | ---: |
+| NVIDIA Isaac-GR00T | `456 / 500` | `91.2%` | `[88.39%, 93.38%]` |
+| PhyAI | `459 / 500` | `91.8%` | `[89.06%, 93.90%]` |
+
+### 逐任务结果
+
+每个任务包含 50 个固定初始状态。
+
+| Task ID | 任务摘要 | Isaac-GR00T | PhyAI |
+| ---: | --- | ---: | ---: |
+| 0 | 将 alphabet soup 和 tomato sauce 放入篮子 | `46 / 50 (92%)` | `45 / 50 (90%)` |
+| 1 | 将 cream cheese 和 butter 放入篮子 | `50 / 50 (100%)` | `50 / 50 (100%)` |
+| 2 | 打开炉灶并放置 moka pot | `50 / 50 (100%)` | `50 / 50 (100%)` |
+| 3 | 将黑碗放入底层抽屉并关闭抽屉 | `48 / 50 (96%)` | `44 / 50 (88%)` |
+| 4 | 将两个杯子分别放到左右盘子上 | `42 / 50 (84%)` | `43 / 50 (86%)` |
+| 5 | 将书放入 caddy 的后部隔间 | `48 / 50 (96%)` | `48 / 50 (96%)` |
+| 6 | 将杯子放到盘子上，并把 pudding 放到右侧 | `44 / 50 (88%)` | `46 / 50 (92%)` |
+| 7 | 将 alphabet soup 和 cream cheese 放入篮子 | `47 / 50 (94%)` | `48 / 50 (96%)` |
+| 8 | 将两个 moka pot 都放到炉灶上 | `40 / 50 (80%)` | `43 / 50 (86%)` |
+| 9 | 将杯子放入微波炉并关闭炉门 | `41 / 50 (82%)` | `42 / 50 (84%)` |
+
+## 测试配置
+
+| 项目 | 配置 |
+| --- | --- |
+| Checkpoint | `GR00T-N1.7-LIBERO/libero_10` |
+| 任务 | `libero_10` 的全部 10 个任务 |
+| Episode | 每个任务 50 个固定初始状态；每个后端共 500 个 |
+| Seed | 每个任务内依次为 42 到 91 |
+| 相机 | Agent view 和 wrist view，分辨率 `256 x 256` |
+| Action horizon | 每次请求执行前 8 个解码动作 |
+| Episode 上限 | 720 次底层 `env.step()` |
+| Batch size | 1 |
+| 成功判定 | 每个底层 step 后调用 `check_success()` |
+
+测试使用以下两个脚本：
+
+- `benchmark/gr00t/libero_rollout_server.py`：将 PhyAI 包装为 NVIDIA
+  policy-server 协议。
+- `benchmark/gr00t/libero_closed_loop_client.py`：运行 LIBERO episode，并在每个
+  episode 后保存结果。
+
+## 复现
+
+先按照 ws1 准备 checkpoint。PhyAI 复现使用固定版本的 LIBERO 仿真容器，环境
+需要 Docker、NVIDIA Container Toolkit 和 CUDA GPU。
+
+在 PhyAI 仓库根目录设置：
+
+```bash
+export PHYAI_REPO="$PWD"
+export CHECKPOINT=/path/to/GR00T-N1.7-LIBERO/libero_10
+export MODEL_GPU=0
+export SIM_GPU=0
+export SIM_IMAGE=ghcr.io/allenai/vla-evaluation-harness/libero@sha256:f8eff9c099d250f391da62658f12eb8631a3994b98f24d41eda3895a3f8c5a04
+export SIM_DEPS=/tmp/phyai-libero-client-deps
+export RESULT_DIR="$PHYAI_REPO/results/libero-10"
+mkdir -p "$SIM_DEPS" "$RESULT_DIR"
+```
+
+将传输依赖安装到临时目录：
+
+```bash
+docker run --rm --entrypoint conda \
+  -v "$SIM_DEPS:/deps" \
+  "$SIM_IMAGE" \
+  run -n libero pip install --target /deps --no-deps \
+  pyzmq msgpack-numpy==0.4.8
+```
+
+在第一个终端启动 PhyAI adapter：
+
+```bash
+CUDA_VISIBLE_DEVICES="$MODEL_GPU" \
+UV_CACHE_DIR=/tmp/phyai-libero-adapter-uv \
+uv run --with pyzmq --with msgpack --with msgpack-numpy \
+  python benchmark/gr00t/libero_rollout_server.py \
+  --checkpoint "$CHECKPOINT" \
+  --host 0.0.0.0 \
+  --port 5556 \
+  --max-batch-size 1 \
+  --capture-suite libero_10 \
+  --seed 42
+```
+
+如果本地尚未缓存 Cosmos-Reason2 文件，第一次运行时追加 `--online`。
+内置processor不需要执行远程代码；只有在使用可信的自定义processor仓库时才传入
+`--trust-remote-code`。
+启用CUDA Graph时，`--max-batch-size`就是捕获Graph所用的batch，必须与
+客户端实际请求batch一致。此处客户端每次发送一个环境，因此两者都为`1`；
+使用官方客户端时，应将其设为与`--n-envs`相同的值。
+`--capture-suite libero_10`会在绑定端口前扫描全部十个任务，并按Backbone
+和Action Head的完整Graph结构对profile去重。这十条标准任务描述的结构
+相同，因此setup只对一条代表profile执行预热，两个阶段分别只捕获一张
+Graph；运行时只回放这些Graph。测试自定义固定任务子集时，将其替换为
+重复的`--capture-task "..."`；等价结构仍只捕获一次。该CUDA Graph路径中的
+Action Head使用SDPA；选择可选FlashInfer backend时，scheduler会同时关闭
+Backbone和Action Head的CUDA Graph，让完整请求统一走eager。看到
+`Server is ready and listening` 后，在另一个终端重新导出相同变量并运行：
+
+```bash
+docker run --rm --network host --gpus "device=$SIM_GPU" \
+  --entrypoint conda \
+  -e PYTHONPATH=/deps \
+  -e MUJOCO_GL=egl \
+  -e PYOPENGL_PLATFORM=egl \
+  -e MUJOCO_EGL_DEVICE_ID=0 \
+  -v "$SIM_DEPS:/deps:ro" \
+  -v "$PHYAI_REPO/benchmark/gr00t/libero_closed_loop_client.py:/client.py:ro" \
+  -v "$RESULT_DIR:/results" \
+  "$SIM_IMAGE" \
+  run --no-capture-output -n libero python /client.py \
+  --host 127.0.0.1 \
+  --port 5556 \
+  --backend phyai \
+  --suite libero_10 \
+  --episodes-per-task 50 \
+  --seed 42 \
+  --max-episode-steps 720 \
+  --n-action-steps 8 \
+  --timeout-ms 120000 \
+  --fixed-init-states \
+  --resume \
+  --result-file /results/phyai.json
+```
+
+检查结果：
+
+```bash
+jq '{server_info,successes,trials,complete,success_rate,wilson_95}' \
+  "$RESULT_DIR/phyai.json"
+```
+
+如果运行中断，`--resume` 会跳过已经完成的 `(task_id, episode)`。结果中的
+`server_info` 记录服务端身份，`backend` 记录结果分组。
+
+## 官方基线
+
+复现官方基线时，按照
+[Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) 说明准备 LIBERO 环境，
+然后启动 NVIDIA server：
+
+```bash
+export ISAAC_GR00T_REPO=/path/to/Isaac-GR00T
+cd "$ISAAC_GR00T_REPO"
+uv run python gr00t/eval/run_gr00t_server.py \
+  --model-path "$CHECKPOINT" \
+  --embodiment-tag LIBERO_PANDA \
+  --device cuda \
+  --port 5555 \
+  --use-sim-policy-wrapper
+```
+
+将同一条仿真命令的端口改为 `5555`，设置 `--backend official`，并将结果写入
+`/results/official.json`。其余参数沿用上面的测试配置。

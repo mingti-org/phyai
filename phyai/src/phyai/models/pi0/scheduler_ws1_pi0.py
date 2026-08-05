@@ -25,7 +25,6 @@ from phyai.layers.attention import (
 )
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.model_runner_pi0 import (
-    PI0ExpertForwardBatch,
     PI0ExpertRunner,
     PI0LLMRunner,
     PI0VisionRunner,
@@ -257,12 +256,29 @@ class PI0WS1Scheduler(Scheduler):
             max_paged_kv_indices=self.max_batch_size
             * (self.n_per_sample + self.suffix_len),
         )
+        self.time_emb_table: torch.Tensor | None = None
 
+    @torch.no_grad()
     def setup(self) -> None:
         self.vision_runner.setup()
         self.llm_runner.setup()
-        self.expert_runner.setup()
 
+        num_steps = self.cfg.num_inference_steps
+        dt = -1.0 / num_steps
+        times = torch.tensor(
+            [1.0 + step * dt for step in range(num_steps)],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.time_emb_table = self.model.heads.embed_time(times).contiguous()
+        self.expert_runner.bind_euler_schedule(
+            self.time_emb_table,
+            dt=dt,
+            num_steps=num_steps,
+        )
+
+        # Bind the fixed suffix slots before capture. Expert graph warmup writes
+        # K/V through these buffers, so their capture-time values must be valid.
         write_indices_state = (
             self.suffix_base
             + torch.arange(
@@ -285,6 +301,7 @@ class PI0WS1Scheduler(Scheduler):
             write_indices_state,
             write_indices_action,
         )
+        self.expert_runner.setup()
 
     @torch.no_grad()
     def step(self, request: PI0Request) -> torch.Tensor:
@@ -465,16 +482,24 @@ class PI0WS1Scheduler(Scheduler):
             )
             self.expert_runner.plan_inference(state_meta, action_meta)
 
+        state = torch.zeros(
+            max_B,
+            cfg.max_state_dim,
+            dtype=dtype,
+            device=device,
+        )
+        state[:actual_B] = request.state.to(device=device, dtype=dtype)
+        with event_scope("pi0.expert_state_prefill"):
+            self.expert_runner.prefill_state(state)
+
         with event_scope("pi0.expert_loop"):
-            state = torch.zeros(
-                max_B,
-                cfg.max_state_dim,
-                dtype=dtype,
-                device=device,
-            )
-            state[:actual_B] = request.state.to(device=device, dtype=dtype)
+            if self.time_emb_table is None:
+                raise RuntimeError(
+                    "PI0WS1Scheduler.step() called before setup(); "
+                    "the timestep embedding table has not been built."
+                )
             if request.noise is None:
-                x_t = torch.randn(
+                noise = torch.randn(
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
@@ -482,31 +507,18 @@ class PI0WS1Scheduler(Scheduler):
                     device=device,
                 )
             else:
-                x_t = torch.zeros(
+                noise = torch.zeros(
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
                     dtype=dtype,
                     device=device,
                 )
-                x_t[:actual_B] = request.noise.to(device=device, dtype=dtype)
+                noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
+            with event_scope("pi0.expert_graph"):
+                x_t = self.expert_runner.forward(noise)
 
-            dt = -1.0 / cfg.num_inference_steps
-            for step in range(cfg.num_inference_steps):
-                with event_scope("pi0.expert_step"):
-                    t = 1.0 + step * dt
-                    time = torch.full(
-                        (max_B,),
-                        t,
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    v_t = self.expert_runner.forward(
-                        PI0ExpertForwardBatch(state=state, x_t=x_t, time=time)
-                    )
-                    x_t = x_t + dt * v_t.to(x_t.dtype)
-
-        return x_t[:actual_B]
+        return x_t[:actual_B].clone()
 
     def _validate(self, req: PI0Request) -> None:
         cfg = self.cfg

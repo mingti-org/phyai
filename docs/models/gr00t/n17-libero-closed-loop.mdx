@@ -1,0 +1,176 @@
+---
+title: "GR00T-N1.7 LIBERO closed-loop evaluation"
+description: "Reproduce PhyAI task success on LIBERO-10 with fixed initial states"
+---
+
+# GR00T-N1.7 LIBERO closed-loop evaluation
+
+Each episode executes model actions in LIBERO until `check_success()` becomes
+true or the episode reaches its step limit.
+
+## Result
+
+| Backend | Successful episodes | Success rate | Wilson 95% CI |
+| --- | ---: | ---: | ---: |
+| NVIDIA Isaac-GR00T | `456 / 500` | `91.2%` | `[88.39%, 93.38%]` |
+| PhyAI | `459 / 500` | `91.8%` | `[89.06%, 93.90%]` |
+
+### Per-task results
+
+Each task contains 50 fixed initial states.
+
+| Task ID | Task summary | Isaac-GR00T | PhyAI |
+| ---: | --- | ---: | ---: |
+| 0 | Put alphabet soup and tomato sauce in the basket | `46 / 50 (92%)` | `45 / 50 (90%)` |
+| 1 | Put cream cheese and butter in the basket | `50 / 50 (100%)` | `50 / 50 (100%)` |
+| 2 | Turn on the stove and place the moka pot | `50 / 50 (100%)` | `50 / 50 (100%)` |
+| 3 | Put the black bowl in the bottom drawer and close it | `48 / 50 (96%)` | `44 / 50 (88%)` |
+| 4 | Put two mugs on the left and right plates | `42 / 50 (84%)` | `43 / 50 (86%)` |
+| 5 | Put the book in the back compartment of the caddy | `48 / 50 (96%)` | `48 / 50 (96%)` |
+| 6 | Put the mug on the plate and the pudding to its right | `44 / 50 (88%)` | `46 / 50 (92%)` |
+| 7 | Put alphabet soup and cream cheese in the basket | `47 / 50 (94%)` | `48 / 50 (96%)` |
+| 8 | Put both moka pots on the stove | `40 / 50 (80%)` | `43 / 50 (86%)` |
+| 9 | Put the mug in the microwave and close it | `41 / 50 (82%)` | `42 / 50 (84%)` |
+
+## Evaluation settings
+
+| Item | Setting |
+| --- | --- |
+| Checkpoint | `GR00T-N1.7-LIBERO/libero_10` |
+| Tasks | All 10 tasks in `libero_10` |
+| Episodes | 50 fixed initial states per task; 500 per backend |
+| Seeds | 42 through 91 within each task |
+| Cameras | Agent view and wrist view at `256 x 256` |
+| Executed action horizon | First 8 decoded actions per request |
+| Episode limit | 720 low-level `env.step()` calls |
+| Batch size | 1 |
+| Success predicate | `check_success()` after every low-level step |
+
+The evaluation uses:
+
+- `benchmark/gr00t/libero_rollout_server.py` to expose PhyAI through the NVIDIA
+  policy-server protocol.
+- `benchmark/gr00t/libero_closed_loop_client.py` to run LIBERO episodes and
+  save the result after every episode.
+
+## Reproduce
+
+Prepare the checkpoint as described in ws1. The PhyAI reproduction runs LIBERO
+from a pinned simulator container. It requires Docker, NVIDIA Container
+Toolkit, and a CUDA GPU.
+
+From the PhyAI repository root, set:
+
+```bash
+export PHYAI_REPO="$PWD"
+export CHECKPOINT=/path/to/GR00T-N1.7-LIBERO/libero_10
+export MODEL_GPU=0
+export SIM_GPU=0
+export SIM_IMAGE=ghcr.io/allenai/vla-evaluation-harness/libero@sha256:f8eff9c099d250f391da62658f12eb8631a3994b98f24d41eda3895a3f8c5a04
+export SIM_DEPS=/tmp/phyai-libero-client-deps
+export RESULT_DIR="$PHYAI_REPO/results/libero-10"
+mkdir -p "$SIM_DEPS" "$RESULT_DIR"
+```
+
+Install the transport packages in a temporary directory:
+
+```bash
+docker run --rm --entrypoint conda \
+  -v "$SIM_DEPS:/deps" \
+  "$SIM_IMAGE" \
+  run -n libero pip install --target /deps --no-deps \
+  pyzmq msgpack-numpy==0.4.8
+```
+
+Start the PhyAI adapter in the first terminal:
+
+```bash
+CUDA_VISIBLE_DEVICES="$MODEL_GPU" \
+UV_CACHE_DIR=/tmp/phyai-libero-adapter-uv \
+uv run --with pyzmq --with msgpack --with msgpack-numpy \
+  python benchmark/gr00t/libero_rollout_server.py \
+  --checkpoint "$CHECKPOINT" \
+  --host 0.0.0.0 \
+  --port 5556 \
+  --max-batch-size 1 \
+  --capture-suite libero_10 \
+  --seed 42
+```
+
+If the Cosmos-Reason2 files are not cached, add `--online` on the first run.
+The built-in processor does not require remote code. Only pass
+`--trust-remote-code` for a custom processor repository whose code you trust.
+With CUDA graphs enabled, `--max-batch-size` is the captured batch size and
+must equal the client's actual request batch. This client sends one environment
+per request, so both values are `1`; when using the official client, set it to
+the same value as `--n-envs`.
+`--capture-suite libero_10` scans all ten tasks before the socket is bound, then
+deduplicates profiles by their complete Backbone and Action Head Graph structure.
+The ten canonical prompts share the same structure, so setup runs one
+representative warmup and captures one graph for each stage. Runtime requests
+only replay these graphs. For a custom fixed task subset, replace it with one
+repeated `--capture-task "..."` argument per task structure; equivalent
+structures are still captured only once.
+The Action Head uses SDPA in this CUDA Graph path. If the optional FlashInfer
+backend is selected, the scheduler disables CUDA Graphs for both the Backbone
+and Action Head so the complete request runs eagerly.
+After `Server is ready and listening` appears, run the client from another
+terminal with the same exported variables:
+
+```bash
+docker run --rm --network host --gpus "device=$SIM_GPU" \
+  --entrypoint conda \
+  -e PYTHONPATH=/deps \
+  -e MUJOCO_GL=egl \
+  -e PYOPENGL_PLATFORM=egl \
+  -e MUJOCO_EGL_DEVICE_ID=0 \
+  -v "$SIM_DEPS:/deps:ro" \
+  -v "$PHYAI_REPO/benchmark/gr00t/libero_closed_loop_client.py:/client.py:ro" \
+  -v "$RESULT_DIR:/results" \
+  "$SIM_IMAGE" \
+  run --no-capture-output -n libero python /client.py \
+  --host 127.0.0.1 \
+  --port 5556 \
+  --backend phyai \
+  --suite libero_10 \
+  --episodes-per-task 50 \
+  --seed 42 \
+  --max-episode-steps 720 \
+  --n-action-steps 8 \
+  --timeout-ms 120000 \
+  --fixed-init-states \
+  --resume \
+  --result-file /results/phyai.json
+```
+
+Check the result:
+
+```bash
+jq '{server_info,successes,trials,complete,success_rate,wilson_95}' \
+  "$RESULT_DIR/phyai.json"
+```
+
+`--resume` skips completed `(task_id, episode)` pairs after an interruption.
+The result records the server identity in `server_info` and the result group in
+`backend`.
+
+## Official baseline
+
+To reproduce the official baseline, prepare LIBERO with
+[Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T), then start the NVIDIA
+server:
+
+```bash
+export ISAAC_GR00T_REPO=/path/to/Isaac-GR00T
+cd "$ISAAC_GR00T_REPO"
+uv run python gr00t/eval/run_gr00t_server.py \
+  --model-path "$CHECKPOINT" \
+  --embodiment-tag LIBERO_PANDA \
+  --device cuda \
+  --port 5555 \
+  --use-sim-policy-wrapper
+```
+
+Run the same simulator command with port `5555`, `--backend official`, and
+result file `/results/official.json`. Use the remaining evaluation arguments
+shown above.

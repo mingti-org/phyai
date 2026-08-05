@@ -58,6 +58,7 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 - Using ENGLISH for comment.
 - Be aware that phyai is a general inference engine for physical AI. Do not modify general components(such as phyai.layers, phyai.runtime) in phyai when supporting new models. Unless lack of layers, or lack of phyai's system components. Modify phyai's general components is a big deal, you should tell user first, let them agree.
 - When user want you to commit to github. You should run pre-commit first.
+- After an agent modifies code, it must run `scripts/run_pre_commit.sh` before handing off or committing. If `pre-commit` is not installed, follow the installation commands in `scripts/setup_dev_env.sh`.
 - using `flashinfer` by default if CP is not set. When CP is set, pls using `MagiAttention` whose github repo is https://github.com/SandAI-org/MagiAttention.
 - Eager Attention is just for debug only, u should use flashinfer/flash attn/sdpa. and in most of the time, debug mode also need use flashinfer/flash attn/sdpa at first.
 - When a user asks you to run a model in FP32 precision, double-check first. Most common models are trained in BF16/FP16/FP8/NVFP4 rather than FP32. Ask the user why they need FP32 precision before proceeding. (Exception: ViT, time-embedding MLPs — some models do use FP32 for these two modules.)

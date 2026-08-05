@@ -44,8 +44,9 @@ nsys`` without that wrapper.
 
 The pi0 scheduler is already instrumented with named event scopes
 (``pi0.vision_loop`` / ``pi0.lang_pack`` / ``pi0.llm_prefix_plan``
-/ ``pi0.llm_prefix_fwd`` / ``pi0.expert_plan`` / ``pi0.expert_loop``
-with per-Euler-step ``pi0.expert_step``), and the bench runner wraps
+/ ``pi0.llm_prefix_fwd`` / ``pi0.expert_plan`` /
+``pi0.expert_state_prefill`` / ``pi0.expert_loop``
+with one full-loop ``pi0.expert_graph`` replay), and the bench runner wraps
 each timed step in ``bench.step`` -- every profile backend sees these
 as named ranges with no extra wiring.
 

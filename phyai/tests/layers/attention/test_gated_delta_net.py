@@ -17,6 +17,7 @@ from phyai.layers.attention.gdn import (
 )
 from phyai.layers.attention.gdn.backends import fla as fla_backend
 from phyai.layers.attention.gdn.backends import flashinfer as flashinfer_backend
+from phyai.runtime.cuda_graph_manager import CudaGraph
 
 
 def _has_flashinfer_gdn() -> bool:
@@ -105,6 +106,10 @@ def test_gdn_registry_and_repr():
     assert list_backends() == ["fla", "flashinfer"]
     assert layer.num_state_heads == 4
     assert "backend='flashinfer'" in repr(layer)
+
+
+def test_fla_declares_cuda_graph_capture_support():
+    assert FlaGatedDeltaNetBackend().supports_capture()
 
 
 def test_flashinfer_padded_prefill_builds_gates(monkeypatch):
@@ -626,6 +631,40 @@ def test_fla_gdn_prefill_matches_recurrent_reference(dtype):
     atol = 3e-2 if dtype == torch.float16 else 5e-2
     torch.testing.assert_close(output.cpu().float(), ref_output, atol=atol, rtol=2e-2)
     torch.testing.assert_close(output_state.cpu(), ref_state, atol=atol, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _can_run_fla_gdn(),
+    reason="FLA GDN tests require CUDA + flash-linear-attention.",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fla_gdn_prefill_replays_under_cuda_graph(dtype):
+    layer = GatedDeltaNet(2, 64, backend="fla")
+
+    def make_inputs(seed: int) -> dict[str, torch.Tensor]:
+        torch.manual_seed(seed)
+        q = torch.randn(1, 16, 2, 64, device="cuda", dtype=dtype)
+        return {
+            "q": q,
+            "k": torch.randn_like(q),
+            "v": torch.randn_like(q),
+            "a": torch.randn(1, 16, 2, device="cuda", dtype=dtype),
+            "b": torch.randn(1, 16, 2, device="cuda", dtype=dtype),
+            "a_log": torch.randn(2, device="cuda", dtype=torch.float32),
+            "dt_bias": torch.randn(2, device="cuda", dtype=torch.float32),
+        }
+
+    def forward(**inputs: torch.Tensor) -> torch.Tensor:
+        return layer(**inputs)
+
+    graph = CudaGraph()
+    graph.capture(forward, make_inputs(41))
+    replay_inputs = make_inputs(43)
+    actual = graph.replay(replay_inputs).clone()
+    expected = forward(**replay_inputs)
+
+    tolerance = 3e-2 if dtype == torch.float16 else 5e-2
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=2e-2)
 
 
 @pytest.mark.skipif(

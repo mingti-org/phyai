@@ -22,6 +22,11 @@ _PI0_DROP_KEYS: frozenset[str] = frozenset(
         "paligemma_with_expert.gemma_expert.lm_head.weight",
     }
 )
+_PI0_DROP_PREFIXES: tuple[str, ...] = (
+    "normalize_inputs.",
+    "normalize_targets.",
+    "unnormalize_outputs.",
+)
 
 
 def _pi0_default_remap(k: str) -> str | None:
@@ -29,7 +34,7 @@ def _pi0_default_remap(k: str) -> str | None:
 
     if k.startswith("model."):
         k = k.removeprefix("model.")
-    if k in _PI0_DROP_KEYS:
+    if k in _PI0_DROP_KEYS or k.startswith(_PI0_DROP_PREFIXES):
         return None
     if k.startswith("time_mlp_in."):
         return k.replace("time_mlp_in.", "action_time_mlp_in.", 1)

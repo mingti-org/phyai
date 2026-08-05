@@ -90,6 +90,9 @@ class FlaGatedDeltaNetBackend(GatedDeltaNetBackend):
             raise ValueError("FLA GDN chunk_size must be 16, 32, or 64.")
         self.chunk_size = int(chunk_size)
 
+    def supports_capture(self) -> bool:
+        return True
+
     def init_forward_metadata(
         self, meta: GatedDeltaNetMetadata
     ) -> GatedDeltaNetPlanHandle:

@@ -12,7 +12,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
   icon="π"
   rows={{
     "模型类型": "VLA",
-    "权重": "HF-style pi0 PyTorch checkpoint",
+    "权重": <a href="https://huggingface.co/collections/lerobot/pi0" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/collections/lerobot/pi0</a>,
     "标签": ["VLA", "flow-matching", "PaliGemma", "SigLIP", "single-GPU"],
     "图像输入": "2 或 3 路 RGB 相机 · 224×224",
     "Tokenizer 长度": "48",
@@ -25,17 +25,17 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 # 概述
 
-pi0 是一个视觉-语言-动作模型。它把 PaliGemma 风格的图像和语言 prefix 与 Gemma action expert 结合起来。在 PhyAI 中，`ws1` 路径在单张 GPU 上运行完整的端到端推理循环：编码相机图像和任务文本，缓存 prefix，使用机器人 state 条件化 expert，并通过 flow matching 积分得到 action chunk。
+pi0 接收相机图像、任务文本和机器人 state，输出一段未来 action。PhyAI 的 `ws1` 路径把整条推理链留在一张 GPU 上：vision 与 language stack 先生成可复用的 prefix，action expert 再结合 prefix 和机器人 state，通过 flow matching 把噪声逐步还原成 action chunk。
 
-本页描述单卡实现。`PI0WS1Scheduler` 不包含 tensor parallel、continuous batching 或 preemption。
+`PI0WS1Scheduler` 只实现这条单卡路径，不承担 tensor parallel、continuous batching 或 preemption。
 
 <Note>
-  pi0 和 pi0.5 的 robot state 进入模型方式不同。pi0 保留一个数值形式的 expert-side state token；pi0.5 则把离散化后的 state bins 放进语言 prompt。
+  pi0 把 robot state 保留为 expert 侧的数值 token；pi0.5 则先把 state 离散成 bins，再写入语言 prompt。
 </Note>
 
 # 架构
 
-PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plugin" tip="Engine 根据 plugin 名称解析 Entry。Entry.setup() 构造模型、加载权重并准备 scheduler；Entry.step() 接收 canonical request 并返回模型输出。">engine + plugin 契约</Tooltip>。实现分布在配置、模型模块、runner 和 scheduler 中：
+请求先通过 <Tooltip headline="Engine + plugin" tip="Engine 根据 plugin 名称解析 Entry。Entry.setup() 构造模型、加载权重并准备 scheduler；Entry.step() 接收 canonical request 并返回模型输出。">engine + plugin 契约</Tooltip>进入 PhyAI。`PI0Entry` 负责构造模型和 scheduler，三个 runner 分别接管 vision、prefix 与 expert 计算。代码分布在这些文件中：
 
 <Tree>
   <Tree.Folder name="phyai/src/phyai/models/pi0" defaultOpen>
@@ -59,7 +59,7 @@ PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plug
 
 # 模型布局
 
-`PI0Model` 由三组主要 stack 组成：
+代码分散在几个模块中，数据却始终沿着一条路径流动。SigLIP 把相机图像变成 tokens，PaliGemma 将它们与任务文本合并，较小的 Gemma expert 最后生成 action 轨迹。
 
 | Stack | 默认形状 | 备注 |
 | --- | --- | --- |
@@ -67,7 +67,7 @@ PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plug
 | Text | PaliGemma/Gemma，18 层，hidden size 2048 | 处理 image + language prefix，并写入 prefix K/V |
 | Expert | Gemma action expert，18 层，hidden size 1024 | 处理一个 state token 和完整 action chunk |
 
-顶层配置默认值如下：
+三部分计算共用一组顶层几何配置：
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -78,11 +78,11 @@ PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plug
 | `tokenizer_max_length` | `48` | 右 padding 后的 PaliGemma task prompt 长度 |
 | `empty_cameras` | `0` | `num_images = 3 - empty_cameras`；pi0 支持 2 或 3 路相机 |
 
-模型用 `params_dtype` 控制 language 和 expert stacks 的参数精度。Vision tower 有独立的 `vision_params_dtype`，默认是 fp32，用于和参考实现对齐。只有当你明确希望 vision 以 bf16 执行时，才设置 `PI0Args(vision_params_dtype=torch.bfloat16)`。
+`params_dtype` 控制 language 与 expert stacks 的参数精度。Vision tower 使用独立的 `vision_params_dtype`，默认保留 fp32，以便和参考实现对齐。只有实验本身需要 bf16 vision 时，才传入 `PI0Args(vision_params_dtype=torch.bfloat16)`。
 
-# Request contract
+# 请求格式
 
-`PI0Request` 是 scheduler 的 canonical input：
+运行时，`PI0Request` 承接 processor 的输出，并把模型所需的 tensor 交给 scheduler：
 
 | 字段 | Shape | 备注 |
 | --- | --- | --- |
@@ -92,11 +92,11 @@ PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plug
 | `state` | `(B, max_state_dim)` | 数值形式的 robot state，在进入 expert 前完成 padding |
 | `noise` | `(B, chunk_size, max_action_dim)` 或 `None` | 可选的初始 action noise；为 `None` 时 scheduler 内部采样 Gaussian noise |
 
-`B` 可以是 `[1, max_batch_size]` 范围内任意值。Scheduler 会在内部把小 batch padding 到 `max_batch_size`，并在返回前切回 `actual_B`。
+`B` 可以取 `1` 到 `max_batch_size` 之间的任意值。较小的 batch 会在 scheduler 内部补到 captured shape，返回前再切回 `actual_B`。
 
-# Scheduler phases
+# 调度阶段
 
-一次 `engine.step(request)` 会映射到下面这些 scheduler phase：
+请求进入 `engine.step` 后，scheduler 按顺序执行这些阶段：
 
 | Phase | 工作内容 |
 | --- | --- |
@@ -105,21 +105,22 @@ PhyAI 的 pi0 路径沿用其他模型集成的 <Tooltip headline="Engine + plug
 | `pi0.llm_prefix_plan` | 重置 static caches，并准备 ragged prefix attention metadata |
 | `pi0.llm_prefix_fwd` | 运行 PaliGemma text stack，并把 prefix K/V 写入 `KVCachePool` |
 | `pi0.expert_plan` | 准备覆盖 prefix + suffix slots 的 state/action expert attention metadata |
+| `pi0.expert_state_prefill` | 对 robot state 做 embedding，并一次性缓存各层 K/V |
 | `pi0.expert_loop` | 初始化或复制 action noise，并运行 flow-matching integration |
 | `pi0.expert_step` | `pi0.expert_loop` 内部的一次 expert velocity prediction 和 Euler update |
 
-Prefix tokens 每个 request 只缓存一次。随后 expert 会 attend 到：
+Prefix 在 denoising 期间不会改变，因此每个 request 只需缓存一次。State query 与 action query 随后读取不同范围的 cache：
 
 ```text
 state query  -> prefix + state
 action query -> prefix + state + action chunk
 ```
 
-这也是为什么 pi0 的 suffix length 是 `1 + chunk_size`：一个 state token 后面跟着 action tokens。
+因此，pi0 的 suffix length 是 `1 + chunk_size`，由一个 state token 和随后的 action tokens 组成。
 
 # CUDA graphs
 
-当 `RuntimeConfig(use_cuda_graph=True)` 时，pi0 runners 会在 `scheduler.setup()` 期间捕获 CUDA graph：
+请求形状固定后，runner 才能复用 CUDA graph。启用 `RuntimeConfig(use_cuda_graph=True)` 时，每个 runner 都会在 `scheduler.setup()` 期间捕获自己的 graph：
 
 | Runner | 捕获形状 |
 | --- | --- |
@@ -127,10 +128,10 @@ action query -> prefix + state + action chunk
 | `PI0LLMRunner` | `(max_batch_size * n_per_sample, text_hidden_size)` |
 | `PI0ExpertRunner` | 固定 `max_batch_size` 下的 `state`、`x_t` 和 `time` buffers |
 
-在 `scheduler.step()` 期间，runners 会更新 static graph input buffers 并 replay 已捕获的 graph。Attention metadata 会通过 attention backend 的 capture-aware metadata buffers 在 captured region 外部完成 staging。
+每次处理请求时，runners 先刷新 static input buffers，再 replay 已捕获的 graph。Attention metadata 留在 captured region 之外，通过 backend 的 capture-aware buffers 写入。
 
 <Tip>
-  如果想在 Nsight Systems 里看到更展开的 trace，可以关闭 CUDA graph：
+  需要在 Nsight Systems 中展开 trace 时，可以关闭 CUDA graph：
 
   ```bash
   uv run python benchmark/bench_n_batch_ws1_pi0.py \
@@ -143,11 +144,11 @@ action query -> prefix + state + action chunk
 
 <Steps>
   <Step title="准备权重">
-    准备一份 HF-style pi0 PyTorch checkpoint 目录，里面包含 `config.json` 和 `model.safetensors` 文件。随机权重 smoke test 可以省略 `--checkpoint`。
+    使用包含 `config.json` 和 `model.safetensors` 的 HF-style pi0 PyTorch checkpoint 目录。只有检查执行链路时，才省略 `--checkpoint` 并使用随机权重。
   </Step>
 
   <Step title="构造 Engine">
-    插件名是 `"pi0"`。Engine 负责 setup、可选权重加载、runner setup 和 CUDA graph capture。
+    选择 `"pi0"` plugin。构造 Engine 时会加载可选 checkpoint、准备 runners，并在启用时捕获 CUDA graph。
 
     ```python
     import torch
@@ -173,11 +174,11 @@ action query -> prefix + state + action chunk
     )
     ```
 
-    `max_batch_size` 会固定 captured graph 的形状。如果需要不同的最大 batch，需要重建 engine。
+    `max_batch_size` 会成为 captured shape 的一部分；修改它需要重建 Engine。
   </Step>
 
   <Step title="构造请求">
-    使用 `PI0Processor` 把原始机器人观测转换为模型需要的 tensor。Processor 位于 engine 之外，属于 `phyai-utils-tools`。
+    `phyai-utils-tools` 中的 `PI0Processor` 负责把原始机器人观测转换成 `PI0Request` 所需的 tensor。
 
     ```python
     from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
@@ -216,7 +217,7 @@ action query -> prefix + state + action chunk
     actions = engine.step(request)  # (B, chunk_size, max_action_dim)
     ```
 
-    如果构造 processor 时传入了 `action_dim`，可以调用 `processor.postprocess(actions)` 裁掉 padding 的 action 宽度；当存在 dataset stats 时，它也会 unnormalize actions。
+    若 processor 配置了 `action_dim`，`processor.postprocess(actions)` 会裁掉 padding 的 action 宽度；存在 dataset stats 时，还会把 action 还原到原始量纲。
   </Step>
 
   <Step title="关闭 Engine">
@@ -228,7 +229,7 @@ action query -> prefix + state + action chunk
 
 # 端到端示例
 
-`examples/pi0/run_pi0.py` 同时覆盖 raw request 路径和 processor-backed request 路径：
+`examples/pi0/run_pi0.py` 既能使用 processor 构造请求，也能直接走 raw smoke 路径。带 checkpoint 时这样运行：
 
 ```bash
 uv run python examples/pi0/run_pi0.py \
@@ -236,13 +237,13 @@ uv run python examples/pi0/run_pi0.py \
     --batch-size 1
 ```
 
-随机权重 smoke test 可以省略 `--checkpoint`：
+只检查执行链路时，可以省略 checkpoint 并使用随机权重：
 
 ```bash
 uv run python examples/pi0/run_pi0.py --raw --batch-size 1
 ```
 
-当 checkpoint 使用一个 empty camera 时，传入 `--num-images 2`：
+Checkpoint 若留有一路 empty camera，应只传两路图像：
 
 ```bash
 uv run python examples/pi0/run_pi0.py \
@@ -250,9 +251,9 @@ uv run python examples/pi0/run_pi0.py \
     --num-images 2
 ```
 
-# Benchmarking 和 profiling
+# 性能测试与分析
 
-`benchmark/bench_n_batch_ws1_pi0.py` 可以扫 batch size，也可以为 Nsight Systems 打开一个短 profile window：
+使用 `benchmark/bench_n_batch_ws1_pi0.py`，可以在同一套 scheduler 配置下比较不同 batch size：
 
 ```bash
 uv run python benchmark/bench_n_batch_ws1_pi0.py \
@@ -262,7 +263,7 @@ uv run python benchmark/bench_n_batch_ws1_pi0.py \
     --result-file ./pi0_ws1_results.jsonl
 ```
 
-Nsight Systems capture：
+同一脚本也能为 Nsight Systems 划出一段较短的 capture window：
 
 ```bash
 nsys profile \
@@ -276,15 +277,13 @@ nsys profile \
         --profile-num-steps 3
 ```
 
-只有当你明确想测 bf16 vision latency 时，才设置 `--vision-dtype bfloat16`。默认会让 vision tower 保持 fp32。
+默认配置让 vision tower 保持 fp32。只有实验需要 bf16 vision latency 时，才添加 `--vision-dtype bfloat16`。
 
 # 当前限制
 
-- 这条路径只支持单卡。
-- `max_batch_size` 在 engine 构造时固定。
-- Vision tower 会对真实 batch 中每个样本 replay 一次。
-- Scheduler 期望输入已经完成 preprocess。图像 resize、tokenization、state padding 和 action unnormalize 属于 `PI0Processor` 的职责。
-- CUDA graph capture 的形状是固定的。修改相机数量、图像尺寸、tokenizer 长度或最大 batch 后，需要重建 engine。
+CUDA graph 能够复用，前提是请求形状保持固定。`PI0WS1Scheduler` 构造单卡 Engine 时会固定 `max_batch_size`，graph capture 还会固定相机数量、图像尺寸和 tokenizer 长度。任何一项发生变化，都需要重建 Engine。Vision tower 则按真实 batch 中的样本逐个 replay，并不会把这些样本合成一次 vision batch。
+
+Scheduler 的边界从预处理之后开始。图像 resize、tokenization、state padding 和 action unnormalize 都由 `PI0Processor` 完成；直接传给 Engine 的请求必须已经满足这一输入约定。
 
 # 完整代码
 

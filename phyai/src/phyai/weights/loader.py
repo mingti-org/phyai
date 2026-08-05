@@ -1,4 +1,4 @@
-"""Top-level safetensors -> model loader.
+"""Top-level checkpoint -> model loader.
 
 The whole load chain in one place:
 
@@ -6,12 +6,10 @@ The whole load chain in one place:
    ``param.weight_loader`` into a dispatch index keyed by HF tensor
    name. Params without ``hf_keys`` are skipped (tied weights, RoPE
    buffers, etc.).
-2. Resolve ``source`` to a concrete list of safetensors shards: a
-   checkpoint folder is expanded via
-   :func:`phyai.utils.checkpoint.find_safetensors` (honouring
-   ``model.safetensors.index.json``); a single file path becomes
-   ``[path]``; an iterable is consumed as-is.
-3. Open every shard lazily; for each key, optionally remap via
+2. Resolve ``source`` to concrete checkpoint files. Folders select the first
+   available format in safetensors, ``.bin``, ``.pt``, ``.pth`` order; a
+   single checkpoint file becomes ``[path]``; an iterable is consumed as-is.
+3. Open every checkpoint; for each tensor key, optionally remap via
    ``remap`` (callable or dict), look up in the index, and dispatch.
 4. Track every key seen, every cast, every miss; build a
    :class:`LoadReport`. Strict mode raises if anything required is
@@ -24,6 +22,7 @@ The whole load chain in one place:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -34,12 +33,15 @@ import torch.nn as nn
 from safetensors import safe_open
 from tqdm.auto import tqdm
 
-from phyai.utils.checkpoint import find_safetensors, resolve_checkpoint
+from phyai.utils.checkpoint import find_checkpoint_files, resolve_checkpoint
 from phyai.utils.logging import this_rank_log
 from phyai.weights.shards import WeightLoader, replicated
 
 
 _logger = logging.getLogger(__name__)
+
+_SAFETENSORS_SUFFIX = ".safetensors"
+_PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
 
 
 @dataclass
@@ -117,26 +119,35 @@ def _resolve_source(
     *,
     revision: str | None = None,
 ) -> list[Path]:
-    """Normalise ``source`` to a concrete list of safetensors file paths.
+    """Normalise ``source`` to a concrete list of checkpoint file paths.
 
     Accepts three shapes:
 
     * a checkpoint folder or a HuggingFace repo id (``str``/``Path``) —
       resolved to a local folder via
       :func:`phyai.utils.checkpoint.resolve_checkpoint` (a repo id is
-      downloaded; ``revision`` selects the branch/tag/commit), then
-      expanded via :func:`phyai.utils.checkpoint.find_safetensors`,
-    * a single safetensors file path (``str``/``Path`` pointing at a
-      file) — wrapped as ``[path]``,
-    * an iterable of file paths — materialised as a list (always treated
-      as already-local; no repo-id download for this form).
+      downloaded; ``revision`` selects the branch/tag/commit), then expanded
+      with the safetensors-first format selection used by
+      :func:`phyai.utils.checkpoint.find_checkpoint_files`,
+    * a single supported file path — wrapped as ``[path]``,
+    * an iterable of supported file paths — materialised as a list (always
+      treated as already-local; no repo-id download for this form).
     """
     if isinstance(source, (str, Path)):
         resolved = resolve_checkpoint(source, revision=revision)
         if resolved.is_dir():
-            return find_safetensors(resolved)
-        return [resolved]
-    return [Path(p) for p in source]
+            return find_checkpoint_files(resolved)
+        paths = [resolved]
+    else:
+        paths = [Path(p) for p in source]
+
+    if not paths:
+        raise ValueError("checkpoint source must contain at least one file")
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"checkpoint file does not exist: {path}")
+        checkpoint_format(path)
+    return paths
 
 
 def _source_label(source: str | Path | Iterable[str | Path]) -> str:
@@ -146,13 +157,91 @@ def _source_label(source: str | Path | Iterable[str | Path]) -> str:
     return "weights"
 
 
-def _count_keys(paths: list[Path]) -> int:
-    """Sum the tensor-key count across shards (header-only, cheap)."""
+def checkpoint_format(path: str | Path) -> str:
+    """Return ``safetensors`` or ``pytorch`` for a supported checkpoint."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == _SAFETENSORS_SUFFIX:
+        return "safetensors"
+    if suffix in _PYTORCH_CHECKPOINT_SUFFIXES:
+        return "pytorch"
+    supported = ", ".join(sorted({_SAFETENSORS_SUFFIX, *_PYTORCH_CHECKPOINT_SUFFIXES}))
+    raise ValueError(
+        f"Unsupported checkpoint extension {path.suffix!r} for {path}; "
+        f"expected one of: {supported}."
+    )
+
+
+def _count_progress_units(paths: list[Path]) -> int:
+    """Count progress units without loading PyTorch checkpoint tensors."""
     total = 0
     for path in paths:
-        with safe_open(str(path), framework="pt", device="cpu") as f:
-            total += len(f.keys())
+        if checkpoint_format(path) == "safetensors":
+            with safe_open(str(path), framework="pt", device="cpu") as f:
+                total += len(f.keys())
+        else:
+            total += 1
     return total
+
+
+def _unwrap_pytorch_state(
+    checkpoint: object,
+    *,
+    path: Path,
+) -> Mapping[object, object]:
+    """Resolve common training-checkpoint wrappers to their tensor mapping."""
+
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(
+            f"PyTorch checkpoint {path} must contain a mapping, got "
+            f"{type(checkpoint).__name__}."
+        )
+    for key in ("model_state_dict", "state_dict"):
+        nested = checkpoint.get(key)
+        if isinstance(nested, Mapping):
+            return nested
+    return checkpoint
+
+
+def _iter_checkpoint_tensor_loaders(
+    path: str | Path,
+) -> Iterator[tuple[str, Callable[[], torch.Tensor]]]:
+    """Yield checkpoint keys with deferred tensor materializers."""
+    path = Path(path)
+
+    if checkpoint_format(path) == "safetensors":
+        with safe_open(str(path), framework="pt", device="cpu") as file:
+            for name in file.keys():
+                yield name, lambda tensor_name=name: file.get_tensor(tensor_name)
+        return
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    except RuntimeError as exc:
+        if "legacy .tar format" not in str(exc).lower():
+            raise
+        this_rank_log(
+            _logger,
+            logging.WARNING,
+            "Loading legacy PyTorch checkpoint %s with weights_only=False",
+            path.name,
+        )
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    state = _unwrap_pytorch_state(checkpoint, path=path)
+    found = False
+    for name, tensor in state.items():
+        if isinstance(name, str) and isinstance(tensor, torch.Tensor):
+            found = True
+            yield name, lambda value=tensor: value
+    if not found:
+        raise ValueError(f"No model tensors found in PyTorch checkpoint {path}.")
+
+
+def iter_checkpoint_tensors(
+    path: str | Path,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield materialized tensors from one supported checkpoint container."""
+    for name, load_tensor in _iter_checkpoint_tensor_loaders(path):
+        yield name, load_tensor()
 
 
 def _progress_disable(progress: bool | None) -> bool | None:
@@ -180,7 +269,7 @@ def load_pretrained(
     progress: bool | None = None,
     revision: str | None = None,
 ) -> LoadReport:
-    """Load HF safetensors checkpoints into ``model``.
+    """Load safetensors or PyTorch checkpoints into ``model``.
 
     Parameters
     ----------
@@ -191,14 +280,15 @@ def load_pretrained(
     source : one of —
 
         * a checkpoint **folder** (single ``str``/``Path``) —
-          ``model.safetensors.index.json`` is consumed if present,
-          otherwise ``model.safetensors`` / glob fallback;
+          safetensors is preferred, followed by ``.bin``, ``.pt``, and
+          ``.pth``. Only the first available format is loaded;
         * a HuggingFace **repo id** (single ``str``/``Path`` that is not a
           local path) — the repo is downloaded via
           :func:`huggingface_hub.snapshot_download` and loaded from the
           local cache;
-        * a single safetensors **file** path; or
-        * an iterable of safetensors file paths (advanced / test) —
+        * a single safetensors or PyTorch ``.pth`` / ``.pt`` / ``.bin``
+          **file** path; or
+        * an iterable of supported checkpoint file paths (advanced / test) —
           always treated as already-local (no repo-id download).
 
     remap : optional HF-key rewriter. If callable, called with each
@@ -208,10 +298,12 @@ def load_pretrained(
         written in the post-remap namespace.
     strict : raise if any *required* key is missing or any HF key was
         unexpected. Optional missing keys never raise.
-    progress : control the per-tensor progress bar (rank 0 only).
-        ``None`` (default) auto-detects — shown on an interactive TTY /
-        notebook, silent when output is piped or captured (CI, pytest).
-        ``True`` forces it on even off-TTY; ``False`` disables it.
+    progress : control the rank-0 progress bar. Safetensors advances per
+        tensor; PyTorch checkpoints advance per file so they are never loaded
+        once just to count their keys. ``None`` (default) auto-detects — shown
+        on an interactive TTY / notebook, silent when output is piped or
+        captured (CI, pytest). ``True`` forces it on even off-TTY; ``False``
+        disables it.
     revision : branch / tag / commit selected when ``source`` is a repo id
         downloaded from the Hub. Ignored for local sources.
 
@@ -243,39 +335,56 @@ def load_pretrained(
 
     report = LoadReport()
     seen: set[str] = set()
+    encountered: dict[str, Path] = {}
 
-    # 2. Stream safetensors; dispatch. A rank-0 progress bar advances once
-    #    per tensor key (total = key count across all shards), so it always
-    #    fills to 100% regardless of remap drops / unexpected keys.
     disable = _progress_disable(progress)
-    total = None if disable is True else _count_keys(paths)
+    formats = {checkpoint_format(path) for path in paths}
+    if formats == {"safetensors"}:
+        progress_unit = "tensor"
+    elif formats == {"pytorch"}:
+        progress_unit = "file"
+    else:
+        progress_unit = "item"
+    total = None if disable is True else _count_progress_units(paths)
     bar = tqdm(
         total=total,
         disable=disable,
-        unit="tensor",
+        unit=progress_unit,
         desc=f"Loading {_source_label(source)}",
         leave=False,
     )
-    for path in paths:
-        bar.set_postfix_str(path.name, refresh=False)
-        with safe_open(str(path), framework="pt", device="cpu") as f:
-            for raw in f.keys():
-                bar.update(1)
+    try:
+        for path in paths:
+            bar.set_postfix_str(path.name, refresh=False)
+            file_format = checkpoint_format(path)
+            for raw, load_tensor in _iter_checkpoint_tensor_loaders(path):
+                if file_format == "safetensors":
+                    bar.update(1)
                 hf = remap_fn(raw)
                 if hf is None:
                     continue
+                previous_path = encountered.get(hf)
+                if previous_path is not None:
+                    raise RuntimeError(
+                        f"checkpoint key {hf!r} appears more than once after remap: "
+                        f"{previous_path.name!r} and {path.name!r}."
+                    )
+                encountered[hf] = path
                 hit = index.get(hf)
                 if hit is None:
                     report.unexpected.append(hf)
                     continue
                 param, shard_id, loader = hit
-                tensor = f.get_tensor(raw)
+                tensor = load_tensor()
                 if tensor.dtype != param.dtype:
                     report.casts.append((hf, tensor.dtype, param.dtype))
                 loader(param, tensor, shard_id)
                 seen.add(hf)
                 report.loaded.append(hf)
-    bar.close()
+            if file_format == "pytorch":
+                bar.update(1)
+    finally:
+        bar.close()
 
     # 3. Diagnose missing.
     for hf_key in index:
@@ -297,7 +406,9 @@ def load_pretrained(
 
     if report.casts:
         for hf_key, src_dtype, dst_dtype in report.casts[:10]:
-            _logger.warning(
+            this_rank_log(
+                _logger,
+                logging.WARNING,
                 "load_pretrained dtype cast at %r: %s -> %s",
                 hf_key,
                 src_dtype,
@@ -315,4 +426,9 @@ def load_pretrained(
     return report
 
 
-__all__ = ["LoadReport", "load_pretrained"]
+__all__ = [
+    "LoadReport",
+    "checkpoint_format",
+    "iter_checkpoint_tensors",
+    "load_pretrained",
+]

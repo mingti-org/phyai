@@ -118,11 +118,23 @@ def _resolve_engine_defaults(
 
 
 def _engine_to_paged_backend(attn_backend: str) -> str:
-    """Map EngineConfig attention backend names to paged backend names."""
+    """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
+    paged backend name.
+
+    The AR and Diffusion paged stacks are flashinfer-only (GPU):
+    ``"flashinfer"`` is the only backend registered in either
+    subpackage. ``"sdpa"`` / ``"eager"`` have no paged backend (SDPA
+    cannot read paged KV; there is no CPU reference path), so any
+    non-flashinfer name is rejected here rather than silently coerced.
+    """
 
     canonical = attn_backend.lower().replace("_", "-")
-    if canonical == "sdpa":
-        return "eager"
+    if canonical != "flashinfer":
+        raise ValueError(
+            f"AR / Diffusion paged stacks are flashinfer-only (GPU); got "
+            f"attn_backend={attn_backend!r}. pi0 inference requires "
+            f"backend='flashinfer'."
+        )
     return canonical
 
 
@@ -132,6 +144,31 @@ def _vision_norm_backend(norm_backend: str, vision_dtype: torch.dtype) -> str:
     if norm_backend == "flashinfer" and vision_dtype != torch.bfloat16:
         return "phyai-kernel"
     return norm_backend
+
+
+def _apply_lerobot_rope_precision(
+    rope: RotaryEmbedding,
+    params_dtype: torch.dtype,
+) -> None:
+    """Match LeRobot's BF16 RoPE frequency and coefficient rounding."""
+
+    if params_dtype != torch.bfloat16:
+        return
+
+    inv_freq = rope.inv_freq.to(torch.bfloat16)
+    positions = torch.arange(
+        rope.max_position_embeddings,
+        dtype=torch.float32,
+        device=inv_freq.device,
+    )
+    freqs = torch.outer(positions, inv_freq.float())
+    cos = (freqs.cos() * rope.attention_scaling).to(torch.bfloat16).float()
+    sin = (freqs.sin() * rope.attention_scaling).to(torch.bfloat16).float()
+
+    # FlashInfer requires an FP32 cache even when the coefficient values
+    # reproduce LeRobot's BF16 rounding.
+    rope.inv_freq = inv_freq
+    rope.cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
 
 
 SIGLIP_NORM_HF_NAMES: dict[str, str] = {
@@ -927,20 +964,35 @@ class ActionTimeHeads(nn.Module):
         out, _ = self.action_in_proj(x)
         return out
 
-    def embed_action_time(
-        self,
-        x_t: torch.Tensor,
-        time: torch.Tensor,
-    ) -> torch.Tensor:
-        """Fuse noisy actions and scalar flow time into expert action tokens."""
+    def embed_time(self, time: torch.Tensor) -> torch.Tensor:
+        """Encode scalar flow times as sinusoidal embeddings."""
 
-        action_emb = self.embed_action(x_t)
-        time_emb = create_sinusoidal_pos_embedding(
+        return create_sinusoidal_pos_embedding(
             time,
             dimension=self.expert_hidden,
             min_period=self.min_period,
             max_period=self.max_period,
         )
+
+    def fuse_action_time(
+        self,
+        x_t: torch.Tensor,
+        time_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse noisy actions with precomputed timestep embeddings."""
+
+        if time_emb.dim() != 2:
+            raise ValueError(
+                f"time_emb must be 2-D (B, expert_hidden), got "
+                f"shape {tuple(time_emb.shape)}."
+            )
+        expected_shape = (x_t.shape[0], self.expert_hidden)
+        if time_emb.shape != expected_shape:
+            raise ValueError(
+                f"time_emb shape {tuple(time_emb.shape)} != {expected_shape}."
+            )
+
+        action_emb = self.embed_action(x_t)
         time_emb = time_emb.to(action_emb.dtype)
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=-1)
@@ -949,6 +1001,15 @@ class ActionTimeHeads(nn.Module):
         h = F.silu(h)
         h, _ = self.action_time_mlp_out(h)
         return h
+
+    def embed_action_time(
+        self,
+        x_t: torch.Tensor,
+        time: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse noisy actions and scalar flow time into expert action tokens."""
+
+        return self.fuse_action_time(x_t, self.embed_time(time))
 
     def project_action(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, T, expert_hidden) -> (B, T, max_action_dim)``."""
@@ -1047,6 +1108,7 @@ class PI0Model(nn.Module):
             backend=rope_backend,
             device=device,
         )
+        _apply_lerobot_rope_precision(self.rope, params_dtype)
         self.heads = ActionTimeHeads(
             config,
             params_dtype=params_dtype,

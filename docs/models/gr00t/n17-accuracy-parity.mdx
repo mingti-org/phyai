@@ -1,0 +1,87 @@
+---
+title: "GR00T-N1.7 accuracy alignment"
+description: "Reproduce decoded-action accuracy alignment between PhyAI and Isaac-GR00T on LIBERO"
+---
+
+# GR00T-N1.7 accuracy alignment
+
+This page compares PhyAI with NVIDIA Isaac-GR00T using the
+[`GR00T-N1.7-LIBERO/libero_10`](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO/tree/main/libero_10)
+checkpoint.
+
+## Result
+
+The benchmark reports an MAE-derived regression score:
+
+```text
+Avg Acc = 1 - Avg MAE
+```
+
+`Avg Acc` is not a classification accuracy. The MAE is also not measured on
+the normalized `40 x 132` model output. Each request is decoded into the
+checkpoint's `16 x 7` LIBERO action representation. Evaluation takes the first
+eight steps and advances by eight, so 25 requests cover all 200 steps of each
+trajectory. The resulting `200 x 7` sequence is compared with all 200 recorded
+actions.
+
+| Benchmark | PhyAI Avg Acc | Isaac-GR00T Avg Acc |
+| --- | ---: | ---: |
+| LIBERO demo, trajectories `0`-`4` | `0.987320` | `0.987152` |
+
+The corresponding error values are:
+
+| Implementation | Avg MSE | Avg MAE | Avg Acc |
+| --- | ---: | ---: | ---: |
+| PhyAI | `0.001272` | `0.012680` | `0.987320` |
+| Isaac-GR00T | `0.001285` | `0.012848` | `0.987152` |
+
+## Evaluation settings
+
+| Item | Setting |
+| --- | --- |
+| Model checkpoint | `GR00T-N1.7-LIBERO/libero_10` |
+| Dataset | NVIDIA [`demo_data/libero_demo`](https://github.com/NVIDIA/Isaac-GR00T/tree/main/demo_data/libero_demo) |
+| Model inputs | Two camera videos from `videos/chunk-000`, plus state and task metadata |
+| Ground truth | Recorded actions from `data/chunk-000` |
+| Trajectories | `0`, `1`, `2`, `3`, `4` |
+| Steps per trajectory | `200` |
+| Model requests | `125` |
+| Precision | bf16 |
+| Model action chunk | `40 x 132` |
+| Decoded LIBERO action chunk | `16 x 7` |
+| Evaluation horizon | First `8` decoded action steps per request |
+| Seed | `42` |
+
+Both implementations use the same checkpoint, dataset, trajectories, image
+transform, prompt construction, precision, action horizon, and seed. MSE and
+MAE are calculated for each trajectory in decoded action space, then averaged
+across the five trajectories.
+
+## Reproduce the PhyAI result
+
+First prepare the checkpoint and Cosmos-Reason2 tokenizer files as described in
+the [GR00T-N1.7 ws1 guide](./ws1). Clone NVIDIA Isaac-GR00T with Git LFS so the
+linked LIBERO demo contains its `meta`, `data`, and `videos` directories.
+
+From the PhyAI repository root, run:
+
+```bash
+uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
+  --checkpoint <gr00t-checkpoint-dir> \
+  --dataset-path <isaac-gr00t-dir>/demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --traj-ids 0 1 2 3 4 \
+  --steps 200 \
+  --action-horizon 8 \
+  --seed 42
+```
+
+Append `--online` to the first run only if the Cosmos-Reason2 tokenizer and
+preprocessor files are not yet cached.
+The built-in Cosmos-Reason2 processor does not require remote code. Only pass
+`--trust-remote-code` for a custom processor repository whose code you trust.
+
+The Isaac-GR00T values were computed from decoded actions generated with
+NVIDIA's official model and processor under the same settings. NVIDIA's
+[`standalone_inference_script.py`](https://github.com/NVIDIA/Isaac-GR00T/blob/main/scripts/deployment/standalone_inference_script.py)
+implements the corresponding 200-step, horizon-8 evaluation schedule.
