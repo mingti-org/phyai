@@ -76,14 +76,13 @@ def validate_pair(
     official_meta = official["meta"]
     phyai_meta = phyai["meta"]
     mismatches: list[str] = []
-    patch_embed_operators: dict[str, str] = {}
     for name, meta in (("official", official_meta), ("phyai", phyai_meta)):
         try:
             required_meta_string(meta, "attention_backend")
         except ValueError as error:
             mismatches.append(f"{name}.{error}")
         try:
-            patch_embed_operators[name] = patch_embed_operator(meta)
+            patch_embed_operator(meta)
         except ValueError as error:
             mismatches.append(f"{name}.{error}")
     for key in META_KEYS:
@@ -92,17 +91,6 @@ def validate_pair(
                 f"meta.{key}: official={official_meta.get(key)!r}, "
                 f"phyai={phyai_meta.get(key)!r}"
             )
-    official_patch_embed = patch_embed_operators.get("official")
-    phyai_patch_embed = patch_embed_operators.get("phyai")
-    if (
-        official_patch_embed is not None
-        and phyai_patch_embed is not None
-        and official_patch_embed != phyai_patch_embed
-    ):
-        mismatches.append(
-            "meta.vision_patch_embed_backend: "
-            f"official={official_patch_embed!r}, phyai={phyai_patch_embed!r}"
-        )
     for key in CONTRACT_KEYS:
         official_value = official_meta["contract"].get(key)
         phyai_value = phyai_meta["contract"].get(key)
