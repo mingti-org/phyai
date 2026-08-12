@@ -9,8 +9,8 @@ INPUT="${LINGBOT_BENCH_INPUT:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU=0
 VISION_DTYPE="bf16"
-# Benchmark PHYAI's optimized production path by default.
-PATCH_EMBED_BACKEND="gemm"
+# Match the released PatchEmbed operator unless a target explicitly needs GEMM.
+PATCH_EMBED_BACKEND="conv3d"
 LINEAR_KERNEL="torch"
 N_WARMUP=10
 N_TIMED=50
@@ -35,7 +35,7 @@ Required:
 Options:
   -g, --gpu N                CUDA_VISIBLE_DEVICES index (default: 0)
       --vision-dtype DTYPE   bf16 or fp32 (default: bf16)
-      --patch-embed-backend  conv3d or gemm (default: gemm)
+      --patch-embed-backend  conv3d or gemm (default: conv3d)
       --linear-kernel NAME   torch or flashinfer (default: torch)
       --n-warmup N           warmup engine steps (default: 10)
       --n-timed N            CUDA-event timed steps (default: 50)
@@ -51,8 +51,8 @@ Options:
   -h, --help                 show this help
 
 The benchmark uses batch=1, three 256x256 views, BF16 ViT, chunk=50,
-ten Euler steps, Torch Linear, and torch.compile off. GEMM is PHYAI's default
-optimized PatchEmbed path; select Conv3D explicitly for operator parity checks.
+ten Euler steps, Torch Linear, and torch.compile off. Conv3D matches the
+released operator; select GEMM explicitly when Conv3D is unavailable or slow.
 CUDA Graph is enabled by default and can be disabled for diagnostics.
 EOF
 }

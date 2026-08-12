@@ -77,7 +77,7 @@ class LingBotV2Args(EntryArgs):
     weight_remap: _WeightRemap = None
     weight_strict: bool = True
     vision_params_dtype: torch.dtype | None = None
-    vision_patch_embed_backend: str = "gemm"
+    vision_patch_embed_backend: str = "conv3d"
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:

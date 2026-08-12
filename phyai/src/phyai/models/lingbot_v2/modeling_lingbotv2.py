@@ -412,7 +412,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         config: Qwen3VLVisionConfig,
         *,
         params_dtype: torch.dtype | None = None,
-        backend: str = "gemm",
+        backend: str = "conv3d",
         device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
@@ -716,7 +716,7 @@ class Qwen3VLVisionModel(nn.Module):
         params_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
-        patch_embed_backend: str = "gemm",
+        patch_embed_backend: str = "conv3d",
         device: torch.device | str | None = None,
         prefix: str = "visual",
     ) -> None:
@@ -1739,7 +1739,7 @@ class LingBotV2Model(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         vision_params_dtype: torch.dtype | None = None,
-        vision_patch_embed_backend: str = "gemm",
+        vision_patch_embed_backend: str = "conv3d",
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         device: torch.device | str | None = None,
