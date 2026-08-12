@@ -20,11 +20,12 @@ CONTRACT_KEYS = (
     "action_dim",
 )
 
+# Official stays on its native eager execution path while PHYAI may benchmark
+# its CUDA Graph path, so use_cuda_graph is recorded but not equality-matched.
 META_KEYS = (
     "input_sha256",
     "params_dtype",
     "vision_dtype",
-    "use_cuda_graph",
     "torch_compile",
     "n_warmup",
     "n_timed",
@@ -58,6 +59,15 @@ def required_meta_string(meta: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
+def required_meta_bool(meta: dict[str, Any], key: str) -> bool:
+    """Return one required boolean from benchmark metadata."""
+
+    value = meta.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"meta.{key} must be a boolean")
+    return value
+
+
 def patch_embed_operator(meta: dict[str, Any]) -> str:
     """Canonicalize old and new report labels to Conv3D or GEMM."""
 
@@ -77,6 +87,10 @@ def validate_pair(
     phyai_meta = phyai["meta"]
     mismatches: list[str] = []
     for name, meta in (("official", official_meta), ("phyai", phyai_meta)):
+        try:
+            required_meta_bool(meta, "use_cuda_graph")
+        except ValueError as error:
+            mismatches.append(f"{name}.{error}")
         try:
             required_meta_string(meta, "attention_backend")
         except ValueError as error:
@@ -147,7 +161,9 @@ def implementation_row(
         "peak_allocated_gib": (int(checks["allocated_peak_bytes"]) / 2**30),
         "params_dtype": meta["params_dtype"],
         "vision_dtype": meta["vision_dtype"],
+        "vision_patch_embed_backend": patch_embed_operator(meta),
         "attention_backend": required_meta_string(meta, "attention_backend"),
+        "use_cuda_graph": required_meta_bool(meta, "use_cuda_graph"),
         "moe_backend": meta.get("moe_backend", meta.get("linear_kernel")),
         "input_sha256": meta["input_sha256"],
     }
@@ -160,23 +176,32 @@ def phyai_latency_change_text(summary: dict[str, Any]) -> str:
     return f"{-change:.2f}% faster"
 
 
-def comparison_contract_text(report: dict[str, Any]) -> str:
-    """Render the already-validated comparison contract from report data."""
+def comparison_contract_text(
+    official: dict[str, Any],
+    phyai: dict[str, Any],
+) -> str:
+    """Render shared inputs and implementation-specific CUDA Graph modes."""
 
-    meta = report["meta"]
-    contract = meta["contract"]
-    graph = "on" if bool(meta["use_cuda_graph"]) else "off"
-    compile_mode = "on" if bool(meta["torch_compile"]) else "off"
+    official_meta = official["meta"]
+    phyai_meta = phyai["meta"]
+    contract = official_meta["contract"]
+    official_graph = (
+        "on" if required_meta_bool(official_meta, "use_cuda_graph") else "off"
+    )
+    phyai_graph = "on" if required_meta_bool(phyai_meta, "use_cuda_graph") else "off"
+    compile_mode = "on" if bool(official_meta["torch_compile"]) else "off"
     return (
         "Comparison contract: "
         f"B={contract['batch_size']}, {contract['num_images']} active views, "
         f"{contract['patches_per_image']} patches/view, "
-        f"parameters={meta['params_dtype']}, vision={meta['vision_dtype']}, "
+        f"parameters={official_meta['params_dtype']}, "
+        f"vision={official_meta['vision_dtype']}, "
         "prompt IDs identical, "
         f"chunk={contract['chunk_size']}, "
         f"{contract['num_inference_steps']} Euler steps, "
-        f"CUDA Graph {graph}, torch.compile {compile_mode}, and identical "
-        f"input SHA256={meta['input_sha256']}."
+        f"CUDA Graph Official={official_graph}/PHYAI={phyai_graph}, "
+        f"torch.compile {compile_mode}, and identical "
+        f"input SHA256={official_meta['input_sha256']}."
     )
 
 
@@ -201,13 +226,17 @@ def write_outputs(
     lines = [
         "# LingBot V2 Thor latency",
         "",
-        "| Implementation | Mean (ms) | P50 (ms) | P90 (ms) | "
-        "P99 (ms) | Std (ms) | Peak allocated (GiB) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Implementation | PatchEmbed | Attention | CUDA Graph | Mean (ms) | "
+        "P50 (ms) | P90 (ms) | P99 (ms) | Std (ms) | Peak allocated (GiB) |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
+        graph = "on" if row["use_cuda_graph"] else "off"
         lines.append(
-            f"| {row['implementation']} | {float(row['mean_ms']):.3f} | "
+            f"| {row['implementation']} | "
+            f"{row['vision_patch_embed_backend']} | "
+            f"{row['attention_backend']} | {graph} | "
+            f"{float(row['mean_ms']):.3f} | "
             f"{float(row['p50_ms']):.3f} | "
             f"{float(row['p90_ms']):.3f} | "
             f"{float(row['p99_ms']):.3f} | "
@@ -232,7 +261,7 @@ def write_outputs(
                 f"**{phyai_latency_change_text(summary)}**"
             ),
             "",
-            comparison_contract_text(official),
+            comparison_contract_text(official, phyai),
             "",
             "Official label means the official LingBot model code and native "
             "Robby MoE, with only the hard-coded FlashAttention2 selector "
