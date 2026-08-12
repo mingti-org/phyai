@@ -3,16 +3,15 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import types
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-
 from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.lingbot_v2 import LingBotV2Args, LingBotVLA2Config
 from phyai.utils import load_config
-
 from profile_lingbot_v2 import load_inputs, make_request, validate_contract
 
 
@@ -124,6 +123,21 @@ def run_backend(
         captures["vision"] = output[0].detach().cpu()
 
     model = engine.entry.model
+    patch_embed = model.vision.patch_embed
+    if backend == "conv3d":
+        original_forward = patch_embed.forward
+
+        def forward_without_cudnn(
+            _self,
+            hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+            with torch.backends.cudnn.flags(enabled=False):
+                return original_forward(hidden_states)
+
+        patch_embed.forward = types.MethodType(
+            forward_without_cudnn,
+            patch_embed,
+        )
     patch_handle = model.vision.patch_embed.register_forward_hook(capture_patch)
     vision_handle = model.vision.register_forward_hook(capture_vision)
     try:
@@ -199,7 +213,7 @@ def main() -> None:
         "input_metadata": input_metadata,
         "vision_dtype": str(vision_dtype),
         "linear_kernel": args.linear_kernel,
-        "reference_backend": "official_compatible_bf16_conv3d",
+        "reference_backend": "official_compatible_bf16_conv3d_cudnn_disabled",
         "candidate_backend": "phyai_replicated_linear_gemm",
         "cosine_threshold": args.cosine_threshold,
         "comparisons": comparisons,
