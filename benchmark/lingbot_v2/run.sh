@@ -9,6 +9,7 @@ INPUT="${LINGBOT_BENCH_INPUT:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU=0
 VISION_DTYPE="bf16"
+# Keep the official/PhyAI latency comparison operator-matched by default.
 PATCH_EMBED_BACKEND="conv3d"
 LINEAR_KERNEL="torch"
 N_WARMUP=10
@@ -34,7 +35,7 @@ Required:
 Options:
   -g, --gpu N                CUDA_VISIBLE_DEVICES index (default: 0)
       --vision-dtype DTYPE   bf16 or fp32 (default: bf16)
-      --patch-embed-backend  conv3d or gemm (default: conv3d)
+      --patch-embed-backend  conv3d or gemm (default: conv3d, matched comparison)
       --linear-kernel NAME   torch or flashinfer (default: torch)
       --n-warmup N           warmup engine steps (default: 10)
       --n-timed N            CUDA-event timed steps (default: 50)
@@ -191,6 +192,8 @@ fi
 CUDA_GRAPH_ARGS=()
 if [[ "${USE_CUDA_GRAPH}" -eq 1 ]]; then
   CUDA_GRAPH_ARGS+=(--use-cuda-graph)
+else
+  CUDA_GRAPH_ARGS+=(--no-cuda-graph)
 fi
 
 CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" \

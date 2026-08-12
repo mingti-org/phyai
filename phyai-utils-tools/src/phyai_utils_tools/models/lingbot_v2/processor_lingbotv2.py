@@ -108,6 +108,20 @@ def canonical_stats(
     return dataset_stats
 
 
+def stats_from_normalizer(
+    normalizer: NormalizerStep | UnnormalizerStep | None,
+) -> dict[str, dict[str, torch.Tensor]] | None:
+    """Reconstruct nested dataset statistics from a loaded sidecar state."""
+
+    if normalizer is None:
+        return None
+    nested: dict[str, dict[str, torch.Tensor]] = {}
+    for flat_key, tensor in normalizer.state_dict().items():
+        feature, statistic = flat_key.rsplit(".", 1)
+        nested.setdefault(feature, {})[statistic] = tensor.detach().cpu().clone()
+    return nested or None
+
+
 def features_for_stats(
     dataset_stats: dict[str, dict[str, Any]] | None,
 ) -> dict[str, dict[str, Any]]:
@@ -418,7 +432,7 @@ class LingBotV2Processor(BaseModelProcessor):
         obj.tokenizer_max_length = text_step.max_length
         obj.max_state_dim = state_step.max_state_dim
         obj.action_dim = slice_step.action_dim
-        obj.dataset_stats = None
+        obj.dataset_stats = stats_from_normalizer(normalizer)
         obj.normalization_mode = NormalizationMode(
             norm_map.get(
                 FeatureType.STATE.value,

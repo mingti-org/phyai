@@ -125,14 +125,14 @@ def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
     of patches and runs **block-diagonal** attention: each temporal frame (an
     ``h * w`` patch block) is its own window, so a patch only attends to patches
     of the *same* frame, never across frames. This returns the cumulative-offset
-    ``indptr`` marking those frame boundaries 鈥?exactly the ``cu_seqlens`` the
+    ``indptr`` marking those frame boundaries -- exactly the ``cu_seqlens`` the
     attention op consumes (``self.attn(..., cu_seqlens_q=cu, cu_seqlens_kv=cu)``).
 
     Parameters
     ----------
     grid_thw:
         ``(num_images, 3)`` int tensor; row ``i`` is ``(t, h, w)`` for image /
-        video ``i`` in **patch** units 鈥?``t`` temporal frames, each ``h * w``
+        video ``i`` in **patch** units -- ``t`` temporal frames, each ``h * w``
         patches. A still image has ``t = 1``; a video has ``t > 1``.
 
     Returns
@@ -144,7 +144,7 @@ def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
     Example
     -------
-    ``grid_thw = [[1, 2, 2], [2, 2, 3]]`` 鈥?one image (1 frame, 2x2) plus one
+    ``grid_thw = [[1, 2, 2], [2, 2, 3]]`` -- one image (1 frame, 2x2) plus one
     video (2 frames, 2x3):
 
     1. ``grid_thw[:, 1] * grid_thw[:, 2]`` -> patches per frame, per image:
@@ -157,7 +157,7 @@ def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
     16 patches pack into 3 windows: frame 0 ``[0, 4)`` (image), frame 1 ``[4, 10)``
     and frame 2 ``[10, 16)`` (the video's two frames, mutually invisible). A
-    single-frame image collapses to ``[0, h*w]`` 鈥?one window, a no-op block mask.
+    single-frame image collapses to ``[0, h*w]`` -- one window, a no-op block mask.
     """
     # Patches per frame (h * w), repeated once per temporal frame (t), then
     # accumulated into running per-frame end-offsets.
@@ -412,7 +412,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         config: Qwen3VLVisionConfig,
         *,
         params_dtype: torch.dtype | None = None,
-        backend: str = "conv3d",
+        backend: str = "gemm",
         device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
@@ -716,15 +716,11 @@ class Qwen3VLVisionModel(nn.Module):
         params_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
-        patch_embed_backend: str = "conv3d",
+        patch_embed_backend: str = "gemm",
         device: torch.device | str | None = None,
         prefix: str = "visual",
     ) -> None:
         super().__init__()
-        # The official LingBot policy selects this mode during construction.
-        # In particular, its FP32 router is an autocast-disabled F.linear, not
-        # a strict IEEE reduction implemented by a custom Triton kernel.
-        torch.set_float32_matmul_precision("high")
         params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
@@ -744,7 +740,7 @@ class Qwen3VLVisionModel(nn.Module):
             device=device,
             prefix=f"{prefix}.patch_embed" if prefix else "",
         )
-        # Learned position embedding table 鈥?a plain replicated parameter,
+        # Learned position embedding table -- a plain replicated parameter,
         # indexed by bilinear corner ids (not a vocab-parallel token lookup).
         self.pos_embed_weight = nn.Parameter(
             torch.zeros(
@@ -1575,6 +1571,27 @@ class LingBotV2DualQuery(nn.Module):
         prefix: str = "model",
     ) -> None:
         super().__init__()
+        released_layout = {
+            "use_future_depth": True,
+            "use_future_video": True,
+            "use_future_video_patch": True,
+            "use_current_video_patch": True,
+            "share_future_depth_query": True,
+            "use_shared_future_task_proj": True,
+            "use_current_shared_task_proj": True,
+            "use_future_video_cls": False,
+        }
+        unsupported = [
+            f"{name}={getattr(config, name)!r} (expected {expected!r})"
+            for name, expected in released_layout.items()
+            if getattr(config, name) != expected
+        ]
+        if unsupported:
+            raise ValueError(
+                "LingBotV2DualQuery supports only the released four-seed-table "
+                "shared-projection layout; unsupported settings: "
+                + ", ".join(unsupported)
+            )
         self.config = config
         names = (
             "depth_align_embs",
@@ -1697,6 +1714,7 @@ def build_lingbot_v2_mrope_position_ids(
                     )
                 parts.append(part)
                 current_position += max(
+                    int(grid[0]),
                     int(grid[1]) // spatial_merge_size,
                     int(grid[2]) // spatial_merge_size,
                 )
@@ -1721,7 +1739,7 @@ class LingBotV2Model(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         vision_params_dtype: torch.dtype | None = None,
-        vision_patch_embed_backend: str = "conv3d",
+        vision_patch_embed_backend: str = "gemm",
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         device: torch.device | str | None = None,

@@ -49,10 +49,19 @@ def read_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def required_meta_string(meta: dict[str, Any], key: str) -> str:
+    """Return one required non-empty string from benchmark metadata."""
+
+    value = meta.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"meta.{key} must be a non-empty string")
+    return value.strip()
+
+
 def patch_embed_operator(meta: dict[str, Any]) -> str:
     """Canonicalize old and new report labels to Conv3D or GEMM."""
 
-    value = str(meta.get("vision_patch_embed_backend", "conv3d")).lower()
+    value = required_meta_string(meta, "vision_patch_embed_backend").lower()
     if "gemm" in value:
         return "gemm"
     if "conv3d" in value:
@@ -67,15 +76,29 @@ def validate_pair(
     official_meta = official["meta"]
     phyai_meta = phyai["meta"]
     mismatches: list[str] = []
+    patch_embed_operators: dict[str, str] = {}
+    for name, meta in (("official", official_meta), ("phyai", phyai_meta)):
+        try:
+            required_meta_string(meta, "attention_backend")
+        except ValueError as error:
+            mismatches.append(f"{name}.{error}")
+        try:
+            patch_embed_operators[name] = patch_embed_operator(meta)
+        except ValueError as error:
+            mismatches.append(f"{name}.{error}")
     for key in META_KEYS:
         if official_meta.get(key) != phyai_meta.get(key):
             mismatches.append(
                 f"meta.{key}: official={official_meta.get(key)!r}, "
                 f"phyai={phyai_meta.get(key)!r}"
             )
-    official_patch_embed = patch_embed_operator(official_meta)
-    phyai_patch_embed = patch_embed_operator(phyai_meta)
-    if official_patch_embed != phyai_patch_embed:
+    official_patch_embed = patch_embed_operators.get("official")
+    phyai_patch_embed = patch_embed_operators.get("phyai")
+    if (
+        official_patch_embed is not None
+        and phyai_patch_embed is not None
+        and official_patch_embed != phyai_patch_embed
+    ):
         mismatches.append(
             "meta.vision_patch_embed_backend: "
             f"official={official_patch_embed!r}, phyai={phyai_patch_embed!r}"
@@ -136,7 +159,7 @@ def implementation_row(
         "peak_allocated_gib": (int(checks["allocated_peak_bytes"]) / 2**30),
         "params_dtype": meta["params_dtype"],
         "vision_dtype": meta["vision_dtype"],
-        "attention_backend": meta.get("attention_backend", "PHYAI"),
+        "attention_backend": required_meta_string(meta, "attention_backend"),
         "moe_backend": meta.get("moe_backend", meta.get("linear_kernel")),
         "input_sha256": meta["input_sha256"],
     }
@@ -147,6 +170,26 @@ def phyai_latency_change_text(summary: dict[str, Any]) -> str:
     if change >= 0:
         return f"+{change:.2f}% slower"
     return f"{-change:.2f}% faster"
+
+
+def comparison_contract_text(report: dict[str, Any]) -> str:
+    """Render the already-validated comparison contract from report data."""
+
+    meta = report["meta"]
+    contract = meta["contract"]
+    graph = "on" if bool(meta["use_cuda_graph"]) else "off"
+    compile_mode = "on" if bool(meta["torch_compile"]) else "off"
+    return (
+        "Comparison contract: "
+        f"B={contract['batch_size']}, {contract['num_images']} active views, "
+        f"{contract['patches_per_image']} patches/view, "
+        f"parameters={meta['params_dtype']}, vision={meta['vision_dtype']}, "
+        "prompt IDs identical, "
+        f"chunk={contract['chunk_size']}, "
+        f"{contract['num_inference_steps']} Euler steps, "
+        f"CUDA Graph {graph}, torch.compile {compile_mode}, and identical "
+        f"input SHA256={meta['input_sha256']}."
+    )
 
 
 def write_outputs(
@@ -201,10 +244,7 @@ def write_outputs(
                 f"**{phyai_latency_change_text(summary)}**"
             ),
             "",
-            "Comparison contract: B=1, three views, 256 patches/view, "
-            "BF16 parameters and ViT, prompt IDs identical, chunk=50, "
-            "10 Euler steps, CUDA Graph off, torch.compile off, and the "
-            "same fixed input SHA256.",
+            comparison_contract_text(official),
             "",
             "Official label means the official LingBot model code and native "
             "Robby MoE, with only the hard-coded FlashAttention2 selector "

@@ -77,7 +77,7 @@ class LingBotV2Args(EntryArgs):
     weight_remap: _WeightRemap = None
     weight_strict: bool = True
     vision_params_dtype: torch.dtype | None = None
-    vision_patch_embed_backend: str = "conv3d"
+    vision_patch_embed_backend: str = "gemm"
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:
@@ -111,12 +111,27 @@ class LingBotV2Entry(Entry):
     def __init__(self) -> None:
         self.model: LingBotV2Model | None = None
         self.scheduler: LingBotV2WS1Scheduler | None = None
+        self._previous_matmul_precision: str | None = None
 
     def setup(self, args: LingBotV2Args) -> None:
         """Resolve config, load weights, and prepare the WS1 scheduler."""
 
         if self.model is not None or self.scheduler is not None:
             raise RuntimeError("LingBotV2Entry.setup may only be called once.")
+
+        # The released FP32 router uses PyTorch matmul precision "high". Keep
+        # this process-wide policy at the engine boundary and restore it when
+        # this entry is closed or setup fails.
+        self._previous_matmul_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("high")
+        try:
+            self._setup(args)
+        except BaseException:
+            self._restore_matmul_precision()
+            raise
+
+    def _setup(self, args: LingBotV2Args) -> None:
+        """Construct the model and scheduler after process policy is installed."""
 
         engine_config = get_engine_config()
         if args.config is not None:
@@ -164,10 +179,19 @@ class LingBotV2Entry(Entry):
         return self.scheduler.step(request)
 
     def close(self) -> None:
-        if self.scheduler is not None:
-            self.scheduler.close()
+        try:
+            if self.scheduler is not None:
+                self.scheduler.close()
+        finally:
             self.scheduler = None
-        self.model = None
+            self.model = None
+            self._restore_matmul_precision()
+
+    def _restore_matmul_precision(self) -> None:
+        previous = self._previous_matmul_precision
+        if previous is not None:
+            torch.set_float32_matmul_precision(previous)
+            self._previous_matmul_precision = None
 
     def dump_targets(self) -> dict[str, torch.nn.Module]:
         """Expose model leaves to the engine's optional tensor dumper."""

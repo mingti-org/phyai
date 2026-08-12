@@ -114,6 +114,11 @@ def component_profile_is_valid(profile: dict) -> bool:
 
 
 def detail_profile_is_valid(profile: dict) -> bool:
+    if profile.get("meta", {}).get("detail_profile_available") is False:
+        return False
+    details = profile.get("detail_gpu_ms")
+    if not isinstance(details, dict) or any(key not in details for key in DETAILS):
+        return False
     diagnostics = profile.get("detail_profile_diagnostics")
     if diagnostics is None:
         return component_profile_is_valid(profile)
@@ -311,7 +316,7 @@ def write_summary(profiles: list[dict], out_dir: Path) -> None:
         writer.writeheader()
         for profile in profiles:
             component_valid = component_profile_is_valid(profile)
-            diagnostics = profile.get("profile_diagnostics", {})
+            diagnostics = profile.get("profile_diagnostics") or {}
             writer.writerow(
                 {
                     "gpu": profile["hardware"]["name"],

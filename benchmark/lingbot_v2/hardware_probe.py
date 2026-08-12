@@ -2,9 +2,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 
 import torch
+
+
+def validate_measurement_args(*, warmup: int, iters: int) -> None:
+    """Reject loop counts that cannot produce one timed measurement."""
+
+    if warmup < 0:
+        raise ValueError(f"warmup must be non-negative, got {warmup}.")
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}.")
+
+
+def require_positive_duration(seconds: float, operation: str) -> float:
+    """Return a usable elapsed time or fail with a diagnostic error."""
+
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise RuntimeError(
+            f"{operation} produced a non-positive measured duration: {seconds!r}"
+        )
+    return seconds
 
 
 def device_slug(name: str) -> str:
@@ -40,6 +60,10 @@ def measure_bf16_peak_tflops(
 ) -> float:
     """Measure sustained BF16 dense-GEMM throughput."""
 
+    validate_measurement_args(warmup=warmup, iters=iters)
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}.")
+
     dev = torch.device(f"cuda:{device}")
     a = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
     b = torch.randn(size, size, dtype=torch.bfloat16, device=dev)
@@ -57,6 +81,7 @@ def measure_bf16_peak_tflops(
         end.record()
         torch.cuda.synchronize(dev)
         best_seconds = min(best_seconds, start.elapsed_time(end) / 1e3)
+    best_seconds = require_positive_duration(best_seconds, "BF16 GEMM")
     return flop / best_seconds / 1e12
 
 
@@ -68,6 +93,12 @@ def measure_memory_bandwidth_tb_s(
     device: int = 0,
 ) -> float:
     """Measure large device-copy bandwidth, counting read plus write traffic."""
+
+    validate_measurement_args(warmup=warmup, iters=iters)
+    if nbytes < torch.tensor([], dtype=torch.bfloat16).element_size():
+        raise ValueError(
+            f"nbytes must hold at least one BF16 element (2 bytes), got {nbytes}."
+        )
 
     dev = torch.device(f"cuda:{device}")
     n_elems = nbytes // 2
@@ -87,6 +118,7 @@ def measure_memory_bandwidth_tb_s(
         end.record()
         torch.cuda.synchronize(dev)
         best_seconds = min(best_seconds, start.elapsed_time(end) / 1e3)
+    best_seconds = require_positive_duration(best_seconds, "device copy")
     return moved / best_seconds / 1e12
 
 
@@ -99,6 +131,14 @@ def measure_roofline(
     iters: int = 50,
 ) -> dict:
     """Return device facts and measured BF16 roofline values."""
+
+    validate_measurement_args(warmup=warmup, iters=iters)
+    if gemm_size <= 0:
+        raise ValueError(f"gemm_size must be positive, got {gemm_size}.")
+    if copy_bytes < 2:
+        raise ValueError(
+            f"copy_bytes must hold at least one BF16 element, got {copy_bytes}."
+        )
 
     info = probe_device(device)
     peak = measure_bf16_peak_tflops(
@@ -113,6 +153,10 @@ def measure_roofline(
         iters=iters,
         device=device,
     )
+    if bandwidth <= 0:
+        raise RuntimeError(
+            f"measured memory bandwidth must be positive, got {bandwidth!r}"
+        )
     info.update(
         {
             "peak_bf16_tflops": round(peak, 1),

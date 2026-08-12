@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patch-embed-backend",
         choices=("conv3d", "gemm"),
-        default="conv3d",
+        default="gemm",
     )
     parser.add_argument(
         "--linear-kernel",

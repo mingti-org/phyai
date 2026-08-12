@@ -87,6 +87,89 @@ def resolve_checkpoint_keys(
     return resolved, weight_map
 
 
+def load_checkpoint_moe_config(checkpoint: Path) -> tuple[int, float]:
+    """Load the routed-MoE contract recorded by the checkpoint."""
+
+    config_path = checkpoint / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"checkpoint config is missing: {config_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise TypeError(f"checkpoint config must be a JSON object: {config_path}")
+
+    root_containers = [config]
+    for parent_key in ("model", "model_config"):
+        parent = config.get(parent_key)
+        if isinstance(parent, dict):
+            root_containers.append(parent)
+    moe_containers = []
+    for parent in root_containers:
+        for moe_key in ("moe", "moe_config"):
+            moe = parent.get(moe_key)
+            if isinstance(moe, dict):
+                moe_containers.append(moe)
+
+    top_k = next(
+        (
+            container["token_top_k"]
+            for container in root_containers
+            if "token_top_k" in container
+        ),
+        None,
+    )
+    if top_k is None:
+        top_k = next(
+            (
+                container[key]
+                for container in moe_containers
+                for key in ("top_k", "token_top_k")
+                if key in container
+            ),
+            None,
+        )
+    routed_scaling_factor = next(
+        (
+            container["routed_scaling_factor"]
+            for container in (*root_containers, *moe_containers)
+            if "routed_scaling_factor" in container
+        ),
+        None,
+    )
+    missing = [
+        name
+        for name, value in (
+            ("token_top_k/top_k", top_k),
+            ("routed_scaling_factor", routed_scaling_factor),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"checkpoint config {config_path} is missing required MoE fields: "
+            + ", ".join(missing)
+        )
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise TypeError(f"checkpoint MoE top_k must be an integer, got {top_k!r}")
+    if top_k <= 0:
+        raise ValueError(
+            f"checkpoint MoE top_k must be a positive integer, got {top_k!r}"
+        )
+    if isinstance(routed_scaling_factor, bool) or not isinstance(
+        routed_scaling_factor, (int, float)
+    ):
+        raise TypeError(
+            "checkpoint routed_scaling_factor must be numeric, "
+            f"got {routed_scaling_factor!r}"
+        )
+    routed_scaling_factor = float(routed_scaling_factor)
+    if routed_scaling_factor <= 0:
+        raise ValueError(
+            "checkpoint routed_scaling_factor must be positive, "
+            f"got {routed_scaling_factor!r}"
+        )
+    return top_k, routed_scaling_factor
+
+
 def load_layer0_weights(
     checkpoint: Path,
     device: torch.device,
@@ -410,6 +493,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required for the LingBot V2 MoE benchmark.")
     device = torch.device(args.device)
     torch.cuda.set_device(device)
+    top_k, routed_scaling_factor = load_checkpoint_moe_config(args.checkpoint)
     weights, checkpoint_keys = load_layer0_weights(args.checkpoint, device)
     robby_moe_forward, robby_source = load_robby_moe(args.official_repo)
     hidden_size = int(weights["router"].shape[1])
@@ -425,8 +509,8 @@ def main() -> None:
             hidden,
             weights,
             robby_moe_forward,
-            top_k=6,
-            routed_scaling_factor=1.0,
+            top_k=top_k,
+            routed_scaling_factor=routed_scaling_factor,
             n_warmup=args.n_warmup,
             n_timed=args.n_timed,
         )
@@ -463,6 +547,10 @@ def main() -> None:
             "triton": package_version("triton"),
         },
         "checkpoint": str(args.checkpoint),
+        "moe_config": {
+            "top_k": top_k,
+            "routed_scaling_factor": routed_scaling_factor,
+        },
         "checkpoint_keys": checkpoint_keys,
         "robby_source": str(robby_source),
         "robby_source_sha256": sha256_file(robby_source),

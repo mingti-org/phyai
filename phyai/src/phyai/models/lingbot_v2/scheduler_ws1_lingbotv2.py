@@ -344,9 +344,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                     device=self.device,
                 )
             else:
-                x_t = request.noise.to(
-                    device=self.device, dtype=self.params_dtype
-                ).clone()
+                x_t = request.noise.to(device=self.device, dtype=self.params_dtype)
             x_t = self.expert_runner.forward_euler(state, x_t)
         # A captured graph owns static output storage that is overwritten on
         # its next replay. Return an independent action tensor to the caller.

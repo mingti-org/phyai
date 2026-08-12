@@ -11,6 +11,7 @@ from phyai_utils_tools.models.lingbot_v2 import (
     LingBotV2Processor,
     make_lingbot_v2_processors,
 )
+from phyai_utils_tools.processing.steps import NormalizerStep
 
 
 class StubTokenizer:
@@ -276,3 +277,45 @@ def test_save_and_from_pretrained_roundtrip():
     assert result.input_ids.shape == (1, 10)
     assert result.state.shape == (1, 8)
     assert loaded.postprocess(torch.rand(1, 3, 8)).shape == (1, 3, 5)
+
+
+def test_from_pretrained_preserves_stats_for_pipeline_rebuild():
+    stats = {
+        "norm_stats": {
+            "observation.state": {
+                "q01": [0.0] * 4,
+                "q99": [2.0] * 4,
+            },
+            "action": {
+                "q01": [-1.0] * 5,
+                "q99": [1.0] * 5,
+            },
+        }
+    }
+    processor, tokenizer, image_processor = make_processor(dataset_stats=stats)
+    with TemporaryDirectory() as directory:
+        processor.save_pretrained(directory)
+        loaded = LingBotV2Processor.from_pretrained(
+            directory,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            device="cpu",
+            params_dtype=torch.float32,
+        )
+
+    assert loaded.dataset_stats is not None
+    torch.testing.assert_close(
+        loaded.dataset_stats["observation.state"]["q99"],
+        torch.full((4,), 2.0),
+    )
+    rebuilt_normalizer = next(
+        step
+        for step in loaded.build_preprocessor().steps
+        if isinstance(step, NormalizerStep)
+    )
+    assert set(rebuilt_normalizer.state_dict()) == {
+        "observation.state.q01",
+        "observation.state.q99",
+        "action.q01",
+        "action.q99",
+    }

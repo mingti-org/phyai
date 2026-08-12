@@ -36,9 +36,8 @@ Single-image pipeline check::
         --task "pick up the object" \
         --output /workspace/data/lingbot_v2_single_image_actions.pt
 
-Conv3D is the released PatchEmbed operator and the default. On targets where
-the required BF16 Conv3D kernel is unavailable or slow, select the validated
-mathematically equivalent path with ``--patch-embed-backend gemm``.
+PhyAI defaults to the validated GEMM PatchEmbed path. To reproduce the released
+operator exactly, select ``--patch-embed-backend conv3d``.
 """
 
 from __future__ import annotations
@@ -122,10 +121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patch-embed-backend",
         choices=("conv3d", "gemm"),
-        default="conv3d",
+        default="gemm",
         help=(
-            "Vision PatchEmbed backend. Conv3D matches the released model; "
-            "GEMM is a mathematically equivalent optimized option."
+            "Vision PatchEmbed backend. GEMM is the PhyAI default; Conv3D "
+            "matches the released operator."
         ),
     )
     parser.add_argument(

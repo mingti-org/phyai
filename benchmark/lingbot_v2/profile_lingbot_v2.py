@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patch-embed-backend",
         choices=("conv3d", "gemm"),
-        default="conv3d",
+        default="gemm",
     )
     parser.add_argument(
         "--linear-kernel",
@@ -766,12 +766,16 @@ def main() -> None:
     e2e_achieved = achieved_tflops(flop["e2e_compute"], latency["mean"])
     e2e_mfu = 100.0 * e2e_achieved / peak if peak else None
     diagnostics = pm.profile_diagnostics(latency["mean"], stages)
-    detail_diagnostics = pm.profile_diagnostics(
-        latency["mean"],
-        detail_parent_stages,
+    detail_profile_available = not args.use_cuda_graph
+    detail_diagnostics = (
+        pm.profile_diagnostics(latency["mean"], detail_parent_stages)
+        if detail_profile_available
+        else None
     )
     profile_valid = bool(diagnostics["valid"])
-    detail_profile_valid = bool(detail_diagnostics["valid"])
+    detail_profile_valid = bool(
+        detail_diagnostics is not None and detail_diagnostics["valid"]
+    )
     stage_share = pm.normalized_share_pct(stages)
     profiled_stage_sum = float(diagnostics["profiled_stage_sum_ms"])
     detail_share = {
@@ -795,6 +799,7 @@ def main() -> None:
             "contract": contract,
             "params_dtype": str(params_dtype),
             "vision_dtype": str(vision_dtype),
+            "attention_backend": engine.config.backends.attn,
             "vision_patch_embed_backend": args.patch_embed_backend,
             "linear_kernel": args.linear_kernel,
             "use_cuda_graph": args.use_cuda_graph,
@@ -806,7 +811,7 @@ def main() -> None:
             "profile_backend": "cuda_events",
             "profile_with_stack": False,
             "profile_passes": 1 if args.use_cuda_graph else 2,
-            "detail_profile_available": not args.use_cuda_graph,
+            "detail_profile_available": detail_profile_available,
         },
         "software": {
             "python": sys.version,
@@ -820,10 +825,14 @@ def main() -> None:
         "latency_ms": latency,
         "stage_gpu_ms": stages,
         "stage_latency_share_pct": stage_share,
-        "detail_gpu_ms": details,
-        "detail_cuda_event_raw_ms": raw_details,
-        "detail_profile_stage_gpu_ms": detail_parent_stages,
-        "detail_latency_share_pct": detail_share,
+        "detail_gpu_ms": details if detail_profile_available else None,
+        "detail_cuda_event_raw_ms": (raw_details if detail_profile_available else None),
+        "detail_profile_stage_gpu_ms": (
+            detail_parent_stages if detail_profile_available else None
+        ),
+        "detail_latency_share_pct": (
+            detail_share if detail_profile_available else None
+        ),
         "stage_sum_ms": stage_sum,
         "unattributed_ms": latency["mean"] - stage_sum,
         "profile_diagnostics": diagnostics,
@@ -832,7 +841,11 @@ def main() -> None:
         "flop_per_sample": flop,
         "achieved_tflops": {
             **achieved,
-            **detail_achieved,
+            **(
+                detail_achieved
+                if detail_profile_available
+                else {stage: None for stage in detail_achieved}
+            ),
             "e2e": e2e_achieved,
         },
         "mfu_pct_bf16_peak": {
@@ -864,6 +877,7 @@ def main() -> None:
     print(f"\nGPU                 : {hardware['name']}")
     print(f"input SHA256        : {result['meta']['input_sha256']}")
     print(f"vision dtype        : {vision_dtype}")
+    print(f"attention backend   : {result['meta']['attention_backend']}")
     print(f"PatchEmbed backend  : {args.patch_embed_backend}")
     print(f"linear kernel       : {args.linear_kernel}")
     print(
@@ -890,19 +904,20 @@ def main() -> None:
         f"ratio={float(diagnostics['overhead_ratio']):.3f}  "
         f"valid={profile_valid}"
     )
-    print(
-        "detail stage/baseline : "
-        f"{float(detail_diagnostics['profiled_stage_sum_ms']):.3f} / "
-        f"{latency['mean']:.3f} ms  "
-        f"ratio={float(detail_diagnostics['overhead_ratio']):.3f}  "
-        f"valid={detail_profile_valid}"
-    )
+    if detail_diagnostics is not None:
+        print(
+            "detail stage/baseline : "
+            f"{float(detail_diagnostics['profiled_stage_sum_ms']):.3f} / "
+            f"{latency['mean']:.3f} ms  "
+            f"ratio={float(detail_diagnostics['overhead_ratio']):.3f}  "
+            f"valid={detail_profile_valid}"
+        )
     if not profile_valid:
         print(
             "WARNING: component latency and component MFU are diagnostic only; "
             "instrumentation perturbation exceeded the 15% validity limit."
         )
-    if not detail_profile_valid:
+    if detail_profile_available and not detail_profile_valid:
         print(
             "WARNING: detailed latency and detailed MFU are diagnostic only; "
             "detail-hook perturbation exceeded the 15% validity limit."
@@ -916,17 +931,20 @@ def main() -> None:
             f"{stage:<29}: {stages[stage]:>10.3f} ms  "
             f"{stage_share[stage]:>7.2f}%{mfu_text}"
         )
-    print("\nDetailed model components")
-    for stage in DETAIL_STAGES:
-        label = stage.removeprefix("lingbot_v2.detail.")
-        detail_mfu_value = result["mfu_pct_bf16_peak"][stage]
-        mfu_text = (
-            f"  MFU={detail_mfu_value:>7.2f}%" if detail_mfu_value is not None else ""
-        )
-        print(
-            f"{label:<29}: {details[stage]:>10.3f} ms  "
-            f"{detail_share[stage]:>7.2f}%{mfu_text}"
-        )
+    if detail_profile_available:
+        print("\nDetailed model components")
+        for stage in DETAIL_STAGES:
+            label = stage.removeprefix("lingbot_v2.detail.")
+            detail_mfu_value = result["mfu_pct_bf16_peak"][stage]
+            mfu_text = (
+                f"  MFU={detail_mfu_value:>7.2f}%"
+                if detail_mfu_value is not None
+                else ""
+            )
+            print(
+                f"{label:<29}: {details[stage]:>10.3f} ms  "
+                f"{detail_share[stage]:>7.2f}%{mfu_text}"
+            )
     print(f"{'unattributed':<29}: {result['unattributed_ms']:>10.3f} ms")
     print("Euler per denoise step: " f"{result['euler_step_mean_ms']:.3f} ms")
     if peak:

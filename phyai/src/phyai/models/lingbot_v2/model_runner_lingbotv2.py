@@ -727,7 +727,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         if self._time_schedule is None or self._dt is None:
             raise RuntimeError("setup must run before the LingBot V2 Euler loop.")
         batch_size = int(state.shape[0])
-        x_t = noise
+        x_t = noise.clone()
         for step in range(self.num_inference_steps):
             velocity = self._forward_with_runtime(
                 state=state,
