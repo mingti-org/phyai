@@ -799,7 +799,7 @@ def main() -> None:
             "contract": contract,
             "params_dtype": str(params_dtype),
             "vision_dtype": str(vision_dtype),
-            "attention_backend": engine.config.backends.attn,
+            "attention_backend": "vision=flashinfer; prefix/expert=official_eager",
             "vision_patch_embed_backend": args.patch_embed_backend,
             "linear_kernel": args.linear_kernel,
             "use_cuda_graph": args.use_cuda_graph,
