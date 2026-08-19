@@ -117,6 +117,12 @@ class Entry(abc.ABC):
     def step(self, request: Any) -> Any:
         """Run one inference round. Request / response shape is plugin-defined."""
 
+    def rollout_step(self, request: Any) -> Any:
+        """Run one RL rollout round when the plugin supports trajectory output."""
+        raise NotImplementedError(
+            f"plugin {self.name!r} does not implement rollout_step()."
+        )
+
     def close(self) -> None:
         """Release pinned GPU resources. Default: no-op."""
         return None
@@ -352,6 +358,13 @@ class Engine:
         entry returns.
         """
         result = self.entry.step(request)
+        if self._dumper is not None:
+            self._dumper.flush_pass()
+        return result
+
+    def rollout_step(self, request: Any) -> Any:
+        """Run one RL rollout round; forwards to the registered entry."""
+        result = self.entry.rollout_step(request)
         if self._dumper is not None:
             self._dumper.flush_pass()
         return result

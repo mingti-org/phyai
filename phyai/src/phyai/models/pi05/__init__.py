@@ -1,4 +1,4 @@
-"""phyai.models.pi05 — pi0.5 inference (vision + text + action expert + flow-matching).
+"""phyai.models.pi05 — pi0.5 inference and RL rollout support.
 
 The package ships the full pi0.5 inference path:
 
@@ -15,7 +15,8 @@ The package ships the full pi0.5 inference path:
   pi0.5-specific batch-layout helpers (cu_seqlens, write-indices,
   padded prefix layout, joint paged_kv_indices interleave).
 
-Training is not in scope here; this package is inference-only.
+RL actor training remains outside phyai. The rollout API provides stochastic
+trajectory sampling and policy data for external RL frameworks.
 """
 
 from __future__ import annotations
@@ -47,6 +48,12 @@ from phyai.models.pi05.modeling_pi05 import (
     VisionTowerWrapper,
     create_sinusoidal_pos_embedding,
 )
+from phyai.models.pi05.scheduler_ws1_pi05 import (
+    PI05Request,
+    PI05RolloutOutput,
+    PI05RolloutRequest,
+    PI05WS1Scheduler,
+)
 
 
 __all__ = [
@@ -67,6 +74,10 @@ __all__ = [
     "PI05ExpertLayer",
     "PI05ExpertStack",
     "PI05Model",
+    "PI05Request",
+    "PI05RolloutOutput",
+    "PI05RolloutRequest",
+    "PI05WS1Scheduler",
     "PI05VisionTower",
     "PositionEmbedding",
     "SIGLIP_NORM_HF_NAMES",
