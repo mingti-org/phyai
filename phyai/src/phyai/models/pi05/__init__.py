@@ -40,6 +40,7 @@ from phyai.models.pi05.modeling_pi05 import (
     PI05ExpertLayer,
     PI05ExpertStack,
     PI05Model,
+    PI05ValueHead,
     PI05VisionTower,
     PositionEmbedding,
     SiglipVisionEmbeddings,
@@ -54,7 +55,6 @@ from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05RolloutRequest,
     PI05WS1Scheduler,
 )
-
 
 __all__ = [
     # Configuration
@@ -77,6 +77,7 @@ __all__ = [
     "PI05Request",
     "PI05RolloutOutput",
     "PI05RolloutRequest",
+    "PI05ValueHead",
     "PI05WS1Scheduler",
     "PI05VisionTower",
     "PositionEmbedding",

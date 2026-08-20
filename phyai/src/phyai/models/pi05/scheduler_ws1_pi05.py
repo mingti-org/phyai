@@ -49,14 +49,13 @@ from phyai.models.pi05.model_runner_pi05 import (
     PI05LLMRunner,
     PI05VisionRunner,
 )
-from phyai.models.pi05.modeling_pi05 import PI05Model
+from phyai.models.pi05.modeling_pi05 import PI05Model, value_from_prefix
 from phyai.payload import (
     LLMForwardBatch,
     VisionForwardBatch,
 )
 from phyai.runtime.schedule import Scheduler
 from phyai.utils.profile import event_scope
-
 
 # ============================================================================ #
 # Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
@@ -232,10 +231,10 @@ class PI05RolloutOutput:
     ``actions`` is ``(B, chunk, action_dim)``, ``chains`` is
     ``(B, num_steps + 1, chunk, action_dim)``, and ``denoise_inds`` is
     ``(B, num_steps)``. ``prev_logprobs`` uses the caller-requested action
-    crop. Pi0.5 in phyai currently has no critic/value head, so
-    ``prev_values`` is the same ``(B, 1)`` zero tensor RLinf returns when
-    ``add_value_head=False``. Environment-specific action unnormalization
-    intentionally remains in the caller's processor.
+    crop. ``prev_values`` is ``(B, 1)``: either one prefix-pooled value or the
+    mean suffix value over denoise steps, according to ``value_after_vlm``;
+    it is zero when values are not requested. Environment-specific action
+    unnormalization intentionally remains in the caller's processor.
     """
 
     actions: torch.Tensor
@@ -257,9 +256,10 @@ class _PI05Layout:
     syncs that used to serialize the pipeline (``int(real_lens.sum())``,
     ``int(cu_full[-1])``, the ``lang_lens.tolist()`` pack loop).
 
-    ``lang_mask`` is the ``(max_B, tokenizer_max_length)`` bool mask used
-    by the vectorized prefix pack (real lang positions True, padding
-    False). ``n_real_total`` is the host-side count of real prefix tokens.
+    ``lang_mask`` is the per-bucket bool mask used by the vectorized prefix
+    pack. ``prefix_mask`` extends it with valid image tokens and is the exact
+    mask used by RLinf-compatible prefix value pooling. ``n_real_total`` is
+    the host-side count of real prefix tokens.
     """
 
     n_real_total: int
@@ -267,8 +267,17 @@ class _PI05Layout:
     position_ids: torch.Tensor
     write_indices: torch.Tensor
     lang_mask: torch.Tensor
+    prefix_mask: torch.Tensor
     prefix_meta: ARAttnMetadata
     joint_meta: DiffusionAttnMetadata
+
+
+@dataclass
+class _PI05PreparedPrefix:
+    """Request-local result of prefix preparation."""
+
+    actual_batch_size: int
+    prefix_values: torch.Tensor | None = None
 
 
 class PI05WS1Scheduler(Scheduler):
@@ -382,6 +391,10 @@ class PI05WS1Scheduler(Scheduler):
             max_action_dim=cfg.max_action_dim,
             params_dtype=self.params_dtype,
             device=self.device,
+            suffix_value_head=(model.value_head if not cfg.value_after_vlm else None),
+            critic_action_chunk=cfg.critic_action_chunk,
+            chunk_critic_input=cfg.chunk_critic_input,
+            detach_critic_input=cfg.detach_critic_input,
             use_cuda_graph=use_cuda_graph,
             capture_rollout=capture_rollout,
             max_paged_kv_indices=self.max_batch_size
@@ -462,7 +475,7 @@ class PI05WS1Scheduler(Scheduler):
     # Step (one inference)                                               #
     # ------------------------------------------------------------------ #
 
-    def _prepare_prefix(self, request: PI05Request) -> int:
+    def _prepare_prefix(self, request: PI05Request) -> _PI05PreparedPrefix:
         """Validate inputs, populate prefix K/V, and plan expert attention."""
         cfg = self.cfg
         device = self.device
@@ -560,7 +573,25 @@ class PI05WS1Scheduler(Scheduler):
                 position_ids=layout.position_ids,
                 write_indices=layout.write_indices,
             )
-            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
+            prefix_out = self.llm_runner.forward(
+                llm_batch, n_per_sample=layout.n_per_sample
+            )
+
+        with event_scope("pi05.prefix_value"):
+            prefix_values = None
+            if (
+                isinstance(request, PI05RolloutRequest)
+                and request.compute_values
+                and cfg.value_after_vlm
+            ):
+                assert self.model.value_head is not None  # checked by validation
+                prefix_out_3d = prefix_out.view(max_B, layout.n_per_sample, -1)
+                prefix_values = value_from_prefix(
+                    self.model.value_head,
+                    prefix_out_3d[:actual_B],
+                    layout.prefix_mask[:actual_B],
+                    mode=cfg.value_vlm_mode,
+                )
 
         # 5. Plan the expert joint-attention metadata — same gating as the
         # prefix: only re-plan when the layout changed.
@@ -569,7 +600,7 @@ class PI05WS1Scheduler(Scheduler):
                 self.expert_runner.plan_inference(layout.joint_meta)
         self._last_layout_key = key
 
-        return actual_B
+        return _PI05PreparedPrefix(actual_B, prefix_values)
 
     @torch.no_grad()
     def step(self, request: PI05Request) -> torch.Tensor:
@@ -577,7 +608,8 @@ class PI05WS1Scheduler(Scheduler):
         cfg = self.cfg
         device = self.device
         dtype = self.params_dtype
-        actual_B = self._prepare_prefix(request)
+        prepared = self._prepare_prefix(request)
+        actual_B = prepared.actual_batch_size
         max_B = self.max_batch_size
 
         with event_scope("pi05.expert_loop"):
@@ -617,7 +649,8 @@ class PI05WS1Scheduler(Scheduler):
         random inputs explicitly, and returns the trajectory data required to
         recompute policy log probabilities during actor training.
         """
-        actual_B = self._prepare_prefix(request)
+        prepared = self._prepare_prefix(request)
+        actual_B = prepared.actual_batch_size
 
         noise = self._prepare_rollout_noise(request, actual_B)
         step_noise = self._prepare_step_noise(request, actual_B)
@@ -628,14 +661,16 @@ class PI05WS1Scheduler(Scheduler):
         )
 
         with event_scope("pi05.expert_rollout_loop"):
-            actions, chains, transition_logprobs = self.expert_runner.forward_rollout(
-                noise, step_noise, sigmas, safe_logprob
+            actions, chains, transition_logprobs, step_values = (
+                self.expert_runner.forward_rollout(
+                    noise, step_noise, sigmas, safe_logprob
+                )
             )
 
         action_chunk = (
             request.action_chunk
             if request.action_chunk is not None
-            else self.cfg.chunk_size
+            else self.cfg.critic_action_chunk
         )
         action_dim = (
             request.action_dim
@@ -652,6 +687,16 @@ class PI05WS1Scheduler(Scheduler):
         else:
             batch_indices = torch.arange(actual_B, device=self.device)
             prev_logprobs = cropped[batch_indices, denoise_inds[:actual_B, 0]]
+        if request.compute_values:
+            if self.cfg.value_after_vlm:
+                assert prepared.prefix_values is not None
+                prev_values = prepared.prefix_values[:, None]
+            else:
+                prev_values = step_values[:actual_B].mean(dim=-1, keepdim=True)
+        else:
+            prev_values = torch.zeros(
+                actual_B, 1, dtype=torch.float32, device=self.device
+            )
 
         # Clone every graph-backed result before a subsequent replay can
         # overwrite its static output buffers.
@@ -660,9 +705,7 @@ class PI05WS1Scheduler(Scheduler):
             chains=chains[:actual_B].clone(),
             denoise_inds=denoise_inds[:actual_B].clone(),
             prev_logprobs=prev_logprobs.clone(),
-            prev_values=torch.zeros(
-                actual_B, 1, dtype=torch.float32, device=self.device
-            ),
+            prev_values=prev_values.clone(),
         )
 
     def _prepare_rollout_noise(
@@ -875,6 +918,9 @@ class PI05WS1Scheduler(Scheduler):
         lang_mask = (
             torch.arange(lang_bucket, device=device)[None, :] < lang_lens_t[:, None]
         )
+        prefix_mask = torch.zeros(max_B, n_ps, dtype=torch.bool, device=device)
+        prefix_mask[:actual_B, :n_img] = True
+        prefix_mask[:, n_img:] = lang_mask
 
         # --- Prefix (LLM self-attention) layout ---
         cu_q_prefix = torch.arange(
@@ -949,6 +995,7 @@ class PI05WS1Scheduler(Scheduler):
             position_ids=position_ids,
             write_indices=write_indices,
             lang_mask=lang_mask,
+            prefix_mask=prefix_mask,
             prefix_meta=prefix_meta,
             joint_meta=joint_meta,
         )
@@ -1002,13 +1049,14 @@ class PI05WS1Scheduler(Scheduler):
             )
         if req.ignore_last and cfg.num_inference_steps < 2:
             raise ValueError("ignore_last=True requires at least two inference steps.")
-        if req.compute_values:
-            raise NotImplementedError(
-                "pi0.5 rollout value prediction requires a value head, which "
-                "is not part of the current phyai PI05Model."
+        if req.compute_values and self.model.value_head is None:
+            raise ValueError(
+                "compute_values=True requires PI05Config(add_value_head=True)."
             )
         action_chunk = (
-            req.action_chunk if req.action_chunk is not None else cfg.chunk_size
+            req.action_chunk
+            if req.action_chunk is not None
+            else cfg.critic_action_chunk
         )
         action_dim = (
             req.action_dim if req.action_dim is not None else cfg.max_action_dim

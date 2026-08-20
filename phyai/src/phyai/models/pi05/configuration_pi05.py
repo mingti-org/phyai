@@ -20,6 +20,7 @@ explicitly when overriding from defaults.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from phyai.models.configuration import PretrainedConfig
 
@@ -222,6 +223,17 @@ class PI05Config(PretrainedConfig):
     max_period: float = 4.0
     tokenizer_max_length: int = 200
 
+    # RL critic. ``value_after_vlm`` selects the prefix or suffix residual
+    # stream. ``action_chunk`` only affects suffix pooling when
+    # ``chunk_critic_input=True``; ``None`` means the full action horizon.
+    config_name: str = "pi05_base"
+    action_chunk: int | None = None
+    detach_critic_input: bool = False
+    chunk_critic_input: bool = False
+    add_value_head: bool = False
+    value_after_vlm: bool = False
+    value_vlm_mode: Literal["mean_token"] = "mean_token"
+
     # Engine runtime knobs pi0.5 was tuned against; applied by
     # PI05Entry.setup (user/env overrides still win). Not part of the
     # upstream checkpoint config.json — defaults are used when absent.
@@ -265,11 +277,46 @@ class PI05Config(PretrainedConfig):
             raise ValueError(
                 f"num_inference_steps must be positive, got {self.num_inference_steps}."
             )
+        if (
+            self.action_chunk is not None
+            and not 1 <= self.action_chunk <= self.chunk_size
+        ):
+            raise ValueError(
+                f"action_chunk must be in [1, {self.chunk_size}], got "
+                f"{self.action_chunk}."
+            )
+        if self.value_vlm_mode != "mean_token":
+            raise ValueError(
+                f"value_vlm_mode must be 'mean_token', got {self.value_vlm_mode!r}."
+            )
 
     @property
     def num_layers(self) -> int:
         """Layer count for the joint stack — text and expert share it."""
         return self.text.num_hidden_layers
+
+    @property
+    def critic_action_chunk(self) -> int:
+        """Number of suffix tokens used by chunk-restricted critic pooling."""
+        return self.action_chunk if self.action_chunk is not None else self.chunk_size
+
+    @property
+    def value_head_hidden_sizes(self) -> tuple[int, int, int]:
+        """RLinf-compatible hidden widths for this pi0.5 configuration."""
+        if self.config_name in {
+            "pi05_maniskill",
+            "pi05_libero",
+            "pi05_droid_polaris",
+        }:
+            return (1024, 512, 256)
+        return (512, 256, 128)
+
+    @property
+    def value_head_input_dim(self) -> int:
+        """Residual-stream width consumed by the configured critic."""
+        if self.value_after_vlm:
+            return self.text.hidden_size
+        return self.expert.hidden_size
 
 
 __all__ = [
