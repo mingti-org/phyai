@@ -30,7 +30,11 @@ from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Entry, _compose_remap
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_wn_pi05 import PI05WNScheduler, _dp_rank_size
-from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request, PI05WS1Scheduler
+from phyai.models.pi05.scheduler_ws1_pi05 import (
+    PI05Request,
+    PI05RolloutRequest,
+    PI05WS1Scheduler,
+)
 from phyai.utils import load_config, this_rank_log
 from phyai.weights import load_pretrained
 
@@ -117,11 +121,21 @@ class PI05WNEntry(Entry):
         )
 
     def step(self, request: PI05Request) -> torch.Tensor:  # type: ignore[override]
+        if isinstance(request, PI05RolloutRequest):
+            raise TypeError(
+                "PI05RolloutRequest must be passed to rollout_step(), not step()."
+            )
         if self.scheduler is None:
             raise RuntimeError(
                 "PI05WNEntry.step called before setup; the scheduler is None."
             )
         return self.scheduler.step(request)
+
+    def rollout_step(self, request: PI05RolloutRequest) -> None:
+        raise NotImplementedError(
+            "pi05_wn does not support rollout_step(); launch one single-card "
+            "pi05 rollout engine per RLinf rollout rank."
+        )
 
     def close(self) -> None:
         if self.scheduler is not None:

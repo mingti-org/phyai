@@ -10,10 +10,9 @@ single card. It owns:
   own captured CUDA graph (when the engine backend supports paged
   attention).
 
-A single ``step()`` call runs the full inference: vision tower per
-camera-stack (replayed once per real robot), prefix forward writing K/V
-into the pool, then a 10-step Euler loop reading those K/V plus the
-freshly-computed suffix K/V.
+A single ``step()`` call runs deterministic inference. ``rollout_step()``
+reuses the same prefix path and runs an RLinf-compatible ODE/SDE trajectory,
+returning action chains and policy log probabilities for RL training.
 
 Multi-batch support — fixed ``max_batch_size`` at construction; each
 ``step()`` accepts any ``B ∈ [1, max_batch_size]``. Smaller batches pad
@@ -30,7 +29,10 @@ batching, preemption, and tensor parallel are out of scope here.
 
 from __future__ import annotations
 
+import math
+import random
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -47,14 +49,13 @@ from phyai.models.pi05.model_runner_pi05 import (
     PI05LLMRunner,
     PI05VisionRunner,
 )
-from phyai.models.pi05.modeling_pi05 import PI05Model
+from phyai.models.pi05.modeling_pi05 import PI05Model, value_from_prefix
 from phyai.payload import (
     LLMForwardBatch,
     VisionForwardBatch,
 )
 from phyai.runtime.schedule import Scheduler
 from phyai.utils.profile import event_scope
-
 
 # ============================================================================ #
 # Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
@@ -191,6 +192,59 @@ class PI05Request:
 
 
 @dataclass
+class PI05RolloutRequest(PI05Request):
+    """Pi0.5 trajectory-sampling request for an RL rollout backend.
+
+    The canonical model inputs are inherited from :class:`PI05Request`.
+    ``noise`` is the initial Gaussian action state. ``step_noise`` supplies
+    one standard-normal sample per denoise transition and makes a rollout
+    exactly reproducible when provided.
+
+    RLinf's default pi0.5 policy uses ``flow_sde`` at one randomly selected
+    denoise step and ordinary flow ODE updates elsewhere. The selected step
+    is shared by the request batch, matching RLinf's rollout implementation.
+    Supplying ``denoise_inds`` accepts either that scalar step or RLinf's
+    expanded ``(B, num_steps)`` representation.
+
+    ``action_chunk`` and ``action_dim`` only crop ``prev_logprobs``; the
+    returned model action and chains always retain the full model-space
+    ``(chunk_size, max_action_dim)`` geometry needed by actor recomputation.
+    """
+
+    step_noise: torch.Tensor | None = None
+    denoise_inds: int | torch.Tensor | None = None
+    noise_method: Literal["flow_ode", "flow_sde"] = "flow_sde"
+    noise_level: float = 0.5
+    action_chunk: int | None = None
+    action_dim: int | None = None
+    joint_logprob: bool = False
+    ignore_last: bool = False
+    safe_get_logprob: bool = False
+    compute_values: bool = False
+
+
+@dataclass
+class PI05RolloutOutput:
+    """Model-space trajectory data produced by :meth:`rollout_step`.
+
+    Field names, shapes, and reductions match RLinf's OpenPI rollout output:
+    ``actions`` is ``(B, chunk, action_dim)``, ``chains`` is
+    ``(B, num_steps + 1, chunk, action_dim)``, and ``denoise_inds`` is
+    ``(B, num_steps)``. ``prev_logprobs`` uses the caller-requested action
+    crop. ``prev_values`` is ``(B, 1)``: either one prefix-pooled value or the
+    mean suffix value over denoise steps, according to ``value_after_vlm``;
+    it is zero when values are not requested. Environment-specific action
+    unnormalization intentionally remains in the caller's processor.
+    """
+
+    actions: torch.Tensor
+    chains: torch.Tensor
+    denoise_inds: torch.Tensor
+    prev_logprobs: torch.Tensor
+    prev_values: torch.Tensor
+
+
+@dataclass
 class _PI05Layout:
     """Per-``(actual_B, lang_lens)`` attention layout, cached across steps.
 
@@ -202,9 +256,10 @@ class _PI05Layout:
     syncs that used to serialize the pipeline (``int(real_lens.sum())``,
     ``int(cu_full[-1])``, the ``lang_lens.tolist()`` pack loop).
 
-    ``lang_mask`` is the ``(max_B, tokenizer_max_length)`` bool mask used
-    by the vectorized prefix pack (real lang positions True, padding
-    False). ``n_real_total`` is the host-side count of real prefix tokens.
+    ``lang_mask`` is the per-bucket bool mask used by the vectorized prefix
+    pack. ``prefix_mask`` extends it with valid image tokens and is the exact
+    mask used by RLinf-compatible prefix value pooling. ``n_real_total`` is
+    the host-side count of real prefix tokens.
     """
 
     n_real_total: int
@@ -212,8 +267,17 @@ class _PI05Layout:
     position_ids: torch.Tensor
     write_indices: torch.Tensor
     lang_mask: torch.Tensor
+    prefix_mask: torch.Tensor
     prefix_meta: ARAttnMetadata
     joint_meta: DiffusionAttnMetadata
+
+
+@dataclass
+class _PI05PreparedPrefix:
+    """Request-local result of prefix preparation."""
+
+    actual_batch_size: int
+    prefix_values: torch.Tensor | None = None
 
 
 class PI05WS1Scheduler(Scheduler):
@@ -227,6 +291,7 @@ class PI05WS1Scheduler(Scheduler):
         num_images: int = 3,
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
+        capture_rollout: bool = False,
     ) -> None:
         cfg: PI05Config = model.config
         if device is None:
@@ -326,7 +391,12 @@ class PI05WS1Scheduler(Scheduler):
             max_action_dim=cfg.max_action_dim,
             params_dtype=self.params_dtype,
             device=self.device,
+            suffix_value_head=(model.value_head if not cfg.value_after_vlm else None),
+            critic_action_chunk=cfg.critic_action_chunk,
+            chunk_critic_input=cfg.chunk_critic_input,
+            detach_critic_input=cfg.detach_critic_input,
             use_cuda_graph=use_cuda_graph,
+            capture_rollout=capture_rollout,
             max_paged_kv_indices=self.max_batch_size
             * (self.n_per_sample + cfg.chunk_size),
         )
@@ -374,7 +444,7 @@ class PI05WS1Scheduler(Scheduler):
         # fixed across inferences, so a one-time precompute keeps those
         # matmuls out of the captured Euler loop.
         N = self.cfg.num_inference_steps
-        ts = 1.0 + torch.arange(N, dtype=torch.float32, device=self.device) * (-1.0 / N)
+        ts = torch.linspace(1.0, 1.0 / N, N, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
         # Bind the schedule before the expert runner captures: its graph
@@ -405,21 +475,16 @@ class PI05WS1Scheduler(Scheduler):
     # Step (one inference)                                               #
     # ------------------------------------------------------------------ #
 
-    @torch.no_grad()
-    def step(self, request: PI05Request) -> torch.Tensor:
-        """Run one inference; return the action chunk ``(actual_B, chunk, action_dim)``.
-
-        ``actual_B`` is ``request.pixel_values.shape[0]`` and may be any
-        value in ``[1, max_batch_size]``. The internal forward passes
-        run at the full ``max_batch_size`` shape (constant captured
-        graphs); the padded tail is sliced off before returning.
-        """
+    def _prepare_prefix(self, request: PI05Request) -> _PI05PreparedPrefix:
+        """Validate inputs, populate prefix K/V, and plan expert attention."""
         cfg = self.cfg
         device = self.device
         dtype = self.params_dtype
         self._validate(request)
 
         actual_B = int(request.pixel_values.shape[0])
+        if isinstance(request, PI05RolloutRequest):
+            self._validate_rollout(request, actual_B)
         max_B = self.max_batch_size
 
         # Resolve the attention layout for this request shape. It depends
@@ -508,7 +573,25 @@ class PI05WS1Scheduler(Scheduler):
                 position_ids=layout.position_ids,
                 write_indices=layout.write_indices,
             )
-            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
+            prefix_out = self.llm_runner.forward(
+                llm_batch, n_per_sample=layout.n_per_sample
+            )
+
+        with event_scope("pi05.prefix_value"):
+            prefix_values = None
+            if (
+                isinstance(request, PI05RolloutRequest)
+                and request.compute_values
+                and cfg.value_after_vlm
+            ):
+                assert self.model.value_head is not None  # checked by validation
+                prefix_out_3d = prefix_out.view(max_B, layout.n_per_sample, -1)
+                prefix_values = value_from_prefix(
+                    self.model.value_head,
+                    prefix_out_3d[:actual_B],
+                    layout.prefix_mask[:actual_B],
+                    mode=cfg.value_vlm_mode,
+                )
 
         # 5. Plan the expert joint-attention metadata — same gating as the
         # prefix: only re-plan when the layout changed.
@@ -517,11 +600,18 @@ class PI05WS1Scheduler(Scheduler):
                 self.expert_runner.plan_inference(layout.joint_meta)
         self._last_layout_key = key
 
-        # 6. Sample noise (or use the user's, padded) and run the whole
-        # Euler loop as one captured-graph replay. The expert runner
-        # unrolls all N denoise steps internally — reading the bound
-        # time-embedding table in-graph and applying ``x_t <- x_t + dt*v_t``
-        # — so the scheduler just hands it the initial noise.
+        return _PI05PreparedPrefix(actual_B, prefix_values)
+
+    @torch.no_grad()
+    def step(self, request: PI05Request) -> torch.Tensor:
+        """Run deterministic inference and return the full model action chunk."""
+        cfg = self.cfg
+        device = self.device
+        dtype = self.params_dtype
+        prepared = self._prepare_prefix(request)
+        actual_B = prepared.actual_batch_size
+        max_B = self.max_batch_size
+
         with event_scope("pi05.expert_loop"):
             if self.time_emb_table is None:
                 raise RuntimeError(
@@ -549,6 +639,229 @@ class PI05WS1Scheduler(Scheduler):
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
         return x_t[:actual_B].clone()
+
+    @torch.no_grad()
+    def rollout_step(self, request: PI05RolloutRequest) -> PI05RolloutOutput:
+        """Sample an RL trajectory with RLinf-compatible flow semantics.
+
+        Prefix preparation and attention planning are identical to ordinary
+        inference. The expert phase keeps fp32 integration state, injects all
+        random inputs explicitly, and returns the trajectory data required to
+        recompute policy log probabilities during actor training.
+        """
+        prepared = self._prepare_prefix(request)
+        actual_B = prepared.actual_batch_size
+
+        noise = self._prepare_rollout_noise(request, actual_B)
+        step_noise = self._prepare_step_noise(request, actual_B)
+        denoise_inds = self._resolve_denoise_inds(request, actual_B)
+        sigmas = self._build_rollout_sigmas(request, denoise_inds, actual_B)
+        safe_logprob = torch.tensor(
+            request.safe_get_logprob, dtype=torch.bool, device=self.device
+        )
+
+        with event_scope("pi05.expert_rollout_loop"):
+            actions, chains, transition_logprobs, step_values = (
+                self.expert_runner.forward_rollout(
+                    noise, step_noise, sigmas, safe_logprob
+                )
+            )
+
+        action_chunk = (
+            request.action_chunk
+            if request.action_chunk is not None
+            else self.cfg.critic_action_chunk
+        )
+        action_dim = (
+            request.action_dim
+            if request.action_dim is not None
+            else self.cfg.max_action_dim
+        )
+        cropped = transition_logprobs[:actual_B, :, :action_chunk, :action_dim]
+        if request.joint_logprob:
+            initial_noise = noise[:actual_B, :action_chunk, :action_dim]
+            initial = self._initial_logprob(
+                initial_noise, safe=request.safe_get_logprob
+            )
+            prev_logprobs = torch.cat([initial[:, None], cropped], dim=1).mean(dim=1)
+        else:
+            batch_indices = torch.arange(actual_B, device=self.device)
+            prev_logprobs = cropped[batch_indices, denoise_inds[:actual_B, 0]]
+        if request.compute_values:
+            if self.cfg.value_after_vlm:
+                assert prepared.prefix_values is not None
+                prev_values = prepared.prefix_values[:, None]
+            else:
+                prev_values = step_values[:actual_B].mean(dim=-1, keepdim=True)
+        else:
+            prev_values = torch.zeros(
+                actual_B, 1, dtype=torch.float32, device=self.device
+            )
+
+        # Clone every graph-backed result before a subsequent replay can
+        # overwrite its static output buffers.
+        return PI05RolloutOutput(
+            actions=actions[:actual_B].clone(),
+            chains=chains[:actual_B].clone(),
+            denoise_inds=denoise_inds[:actual_B].clone(),
+            prev_logprobs=prev_logprobs.clone(),
+            prev_values=prev_values.clone(),
+        )
+
+    def _prepare_rollout_noise(
+        self, request: PI05RolloutRequest, actual_B: int
+    ) -> torch.Tensor:
+        """Return fp32 initial noise padded to the captured batch size."""
+        shape = (actual_B, self.cfg.chunk_size, self.cfg.max_action_dim)
+        if request.noise is None:
+            real_noise = torch.randn(shape, dtype=torch.float32, device=self.device)
+        else:
+            real_noise = request.noise.to(device=self.device, dtype=torch.float32)
+        noise = torch.zeros(
+            self.max_batch_size,
+            self.cfg.chunk_size,
+            self.cfg.max_action_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        noise[:actual_B] = real_noise
+        return noise
+
+    def _prepare_step_noise(
+        self, request: PI05RolloutRequest, actual_B: int
+    ) -> torch.Tensor:
+        """Return one fp32 standard-normal tensor per denoise transition."""
+        cfg = self.cfg
+        if request.step_noise is None:
+            # Separate draws mirror RLinf's one ``sample_noise`` call per step.
+            real_noise = torch.stack(
+                [
+                    torch.randn(
+                        actual_B,
+                        cfg.chunk_size,
+                        cfg.max_action_dim,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    for _ in range(cfg.num_inference_steps)
+                ],
+                dim=1,
+            )
+        else:
+            real_noise = request.step_noise.to(device=self.device, dtype=torch.float32)
+        step_noise = torch.zeros(
+            self.max_batch_size,
+            cfg.num_inference_steps,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        step_noise[:actual_B] = real_noise
+        return step_noise
+
+    def _resolve_denoise_inds(
+        self, request: PI05RolloutRequest, actual_B: int
+    ) -> torch.Tensor:
+        """Return RLinf's expanded ``(max_B, num_steps)`` index tensor."""
+        num_steps = self.cfg.num_inference_steps
+        provided = request.denoise_inds
+        if provided is None:
+            if request.joint_logprob:
+                real = torch.arange(num_steps, dtype=torch.int64)[None].expand(
+                    actual_B, -1
+                )
+            else:
+                last = num_steps - 2 if request.ignore_last else num_steps - 1
+                selected = random.randint(0, last)
+                real = torch.full((actual_B, num_steps), selected, dtype=torch.int64)
+        elif isinstance(provided, int):
+            real = torch.full((actual_B, num_steps), provided, dtype=torch.int64)
+        else:
+            real = provided.to(dtype=torch.int64, device="cpu")
+            if real.ndim == 0:
+                real = real.expand(actual_B, num_steps)
+            elif real.shape == (actual_B,):
+                real = real[:, None].expand(-1, num_steps)
+            elif real.shape != (actual_B, num_steps):
+                raise ValueError(
+                    "denoise_inds shape must be scalar, (B,), or "
+                    f"(B, num_steps)=({actual_B}, {num_steps}); got "
+                    f"{tuple(real.shape)}."
+                )
+
+        if bool(((real < 0) | (real >= num_steps)).any()):
+            raise ValueError(
+                f"denoise_inds must be in [0, {num_steps}), got {real.tolist()}."
+            )
+        if request.joint_logprob:
+            expected = torch.arange(num_steps, dtype=torch.int64)[None].expand(
+                actual_B, -1
+            )
+            if not torch.equal(real, expected):
+                raise ValueError(
+                    "joint_logprob=True requires denoise_inds to be "
+                    "arange(num_steps) for every sample."
+                )
+        elif not bool((real == real[0, 0]).all()):
+            raise ValueError(
+                "non-joint RLinf rollout requires one denoise index shared "
+                "across the entire request batch."
+            )
+        padded = torch.zeros(
+            self.max_batch_size,
+            num_steps,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        padded[:actual_B] = real.to(self.device)
+        return padded
+
+    def _build_rollout_sigmas(
+        self,
+        request: PI05RolloutRequest,
+        denoise_inds: torch.Tensor,
+        actual_B: int,
+    ) -> torch.Tensor:
+        """Build per-sample, per-step SDE sigmas using RLinf's schedule."""
+        num_steps = self.cfg.num_inference_steps
+        sigmas = torch.zeros(
+            self.max_batch_size,
+            num_steps,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if request.noise_method == "flow_ode" or request.noise_level == 0:
+            return sigmas
+
+        timesteps = torch.linspace(1.0, 1.0 / num_steps, num_steps, device=self.device)
+        timesteps = torch.cat([timesteps, torch.zeros(1, device=self.device)])
+        denominator = torch.where(timesteps == 1, timesteps[1], timesteps)
+        schedule = (
+            request.noise_level * torch.sqrt(timesteps / (1.0 - denominator))[:-1]
+        )
+        if request.joint_logprob:
+            sigmas[:actual_B] = schedule[None]
+        else:
+            step_ids = torch.arange(num_steps, device=self.device)[None]
+            selected = denoise_inds[:actual_B, :1]
+            sigmas[:actual_B] = torch.where(step_ids == selected, schedule[None], 0.0)
+        return sigmas
+
+    @staticmethod
+    def _standard_normal_logprob(sample: torch.Tensor) -> torch.Tensor:
+        """Elementwise log probability under a standard normal."""
+        return (
+            -0.5 * torch.log(torch.full_like(sample, 2.0 * torch.pi))
+            - 0.5 * sample.square()
+        )
+
+    @classmethod
+    def _initial_logprob(cls, sample: torch.Tensor, *, safe: bool) -> torch.Tensor:
+        """Match RLinf's initial joint-policy log-probability convention."""
+        if safe:
+            return -sample.square()
+        return cls._standard_normal_logprob(sample)
 
     # ------------------------------------------------------------------ #
     # Layout build + pack (cached, sync-free)                            #
@@ -605,6 +918,9 @@ class PI05WS1Scheduler(Scheduler):
         lang_mask = (
             torch.arange(lang_bucket, device=device)[None, :] < lang_lens_t[:, None]
         )
+        prefix_mask = torch.zeros(max_B, n_ps, dtype=torch.bool, device=device)
+        prefix_mask[:actual_B, :n_img] = True
+        prefix_mask[:, n_img:] = lang_mask
 
         # --- Prefix (LLM self-attention) layout ---
         cu_q_prefix = torch.arange(
@@ -679,6 +995,7 @@ class PI05WS1Scheduler(Scheduler):
             position_ids=position_ids,
             write_indices=write_indices,
             lang_mask=lang_mask,
+            prefix_mask=prefix_mask,
             prefix_meta=prefix_meta,
             joint_meta=joint_meta,
         )
@@ -717,6 +1034,53 @@ class PI05WS1Scheduler(Scheduler):
     # ------------------------------------------------------------------ #
     # Validation                                                         #
     # ------------------------------------------------------------------ #
+
+    def _validate_rollout(self, req: PI05RolloutRequest, actual_B: int) -> None:
+        """Validate rollout-only sampling controls and tensor shapes."""
+        cfg = self.cfg
+        if req.noise_method not in ("flow_ode", "flow_sde"):
+            raise ValueError(
+                "noise_method must be 'flow_ode' or 'flow_sde', got "
+                f"{req.noise_method!r}."
+            )
+        if not math.isfinite(req.noise_level) or req.noise_level < 0:
+            raise ValueError(
+                f"noise_level must be finite and non-negative, got {req.noise_level}."
+            )
+        if req.ignore_last and cfg.num_inference_steps < 2:
+            raise ValueError("ignore_last=True requires at least two inference steps.")
+        if req.compute_values and self.model.value_head is None:
+            raise ValueError(
+                "compute_values=True requires PI05Config(add_value_head=True)."
+            )
+        action_chunk = (
+            req.action_chunk
+            if req.action_chunk is not None
+            else cfg.critic_action_chunk
+        )
+        action_dim = (
+            req.action_dim if req.action_dim is not None else cfg.max_action_dim
+        )
+        if not 1 <= action_chunk <= cfg.chunk_size:
+            raise ValueError(
+                f"action_chunk must be in [1, {cfg.chunk_size}], got {action_chunk}."
+            )
+        if not 1 <= action_dim <= cfg.max_action_dim:
+            raise ValueError(
+                f"action_dim must be in [1, {cfg.max_action_dim}], got {action_dim}."
+            )
+        expected_step_noise = (
+            actual_B,
+            cfg.num_inference_steps,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+        )
+        if req.step_noise is not None and req.step_noise.shape != expected_step_noise:
+            raise ValueError(
+                f"step_noise shape {tuple(req.step_noise.shape)} != "
+                f"(B, num_steps, chunk_size, max_action_dim)="
+                f"{expected_step_noise}."
+            )
 
     def _validate(self, req: PI05Request) -> None:
         """Strictly validate the canonical request tensors.
@@ -776,4 +1140,9 @@ class PI05WS1Scheduler(Scheduler):
             )
 
 
-__all__ = ["PI05Request", "PI05WS1Scheduler"]
+__all__ = [
+    "PI05Request",
+    "PI05RolloutOutput",
+    "PI05RolloutRequest",
+    "PI05WS1Scheduler",
+]
