@@ -3,6 +3,11 @@
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from phyai_kernel import jit_utils
+from phyai_kernel.cuda import (
+    nvfp4_scale_shape,
+    pi05_thor_nvfp4_geglu,
+    supports_pi05_thor_nvfp4_geglu,
+)
 from phyai_kernel.jit_utils import jit
 from phyai_kernel.triton import (
     adarmsnorm,
@@ -35,7 +40,10 @@ __all__ = [
     "jit_utils",
     "layernorm",
     "masked_embedding_lookup",
+    "nvfp4_scale_shape",
+    "pi05_thor_nvfp4_geglu",
     "rmsnorm",
     "rmsnorm_hf",
     "rmsnorm_silu_mul",
+    "supports_pi05_thor_nvfp4_geglu",
 ]
