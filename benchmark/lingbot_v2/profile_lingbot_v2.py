@@ -24,7 +24,7 @@ import profile_metrics as pm
 
 from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
-import phyai.models.lingbot_v2.scheduler_ws1_lingbotv2 as scheduler_module
+import phyai.models.lingbot_v2.scheduler_lingbotv2 as scheduler_module
 from phyai.models.lingbot_v2 import (
     LingBotV2Args,
     LingBotV2Request,

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 from datetime import UTC, datetime
 from importlib import metadata
@@ -162,9 +163,9 @@ def load_checkpoint_moe_config(checkpoint: Path) -> tuple[int, float]:
             f"got {routed_scaling_factor!r}"
         )
     routed_scaling_factor = float(routed_scaling_factor)
-    if routed_scaling_factor <= 0:
+    if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
         raise ValueError(
-            "checkpoint routed_scaling_factor must be positive, "
+            "checkpoint routed_scaling_factor must be finite and positive, "
             f"got {routed_scaling_factor!r}"
         )
     return top_k, routed_scaling_factor

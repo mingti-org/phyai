@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable, ClassVar
 
 import torch
@@ -16,7 +17,7 @@ from phyai.models.lingbot_v2.modeling_lingbotv2 import (
     LingBotV2Model,
     lingbot_v2_weight_remap,
 )
-from phyai.models.lingbot_v2.scheduler_ws1_lingbotv2 import (
+from phyai.models.lingbot_v2.scheduler_lingbotv2 import (
     LingBotV2Request,
     LingBotV2WS1Scheduler,
 )
@@ -25,6 +26,41 @@ from phyai.weights import load_pretrained
 
 
 _WeightRemap = Callable[[str], str | None] | dict[str, str] | None
+
+
+class _MatmulPrecisionManager:
+    """Keep the LingBot FP32 matmul policy active across overlapping entries."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._active_entries = 0
+        self._previous_precision: str | None = None
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self._active_entries == 0:
+                previous = torch.get_float32_matmul_precision()
+                torch.set_float32_matmul_precision("high")
+                self._previous_precision = previous
+            self._active_entries += 1
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active_entries == 0:
+                raise RuntimeError("matmul precision lease is not active.")
+            if self._active_entries > 1:
+                self._active_entries -= 1
+                return
+
+            previous = self._previous_precision
+            if previous is None:
+                raise RuntimeError("previous matmul precision was not recorded.")
+            torch.set_float32_matmul_precision(previous)
+            self._active_entries = 0
+            self._previous_precision = None
+
+
+_MATMUL_PRECISION_MANAGER = _MatmulPrecisionManager()
 
 
 def compose_lingbot_v2_weight_remap(
@@ -111,19 +147,23 @@ class LingBotV2Entry(Entry):
     def __init__(self) -> None:
         self.model: LingBotV2Model | None = None
         self.scheduler: LingBotV2WS1Scheduler | None = None
-        self._previous_matmul_precision: str | None = None
+        self._owns_matmul_precision = False
 
     def setup(self, args: LingBotV2Args) -> None:
         """Resolve config, load weights, and prepare the WS1 scheduler."""
 
-        if self.model is not None or self.scheduler is not None:
+        if (
+            self.model is not None
+            or self.scheduler is not None
+            or self._owns_matmul_precision
+        ):
             raise RuntimeError("LingBotV2Entry.setup may only be called once.")
 
         # The released FP32 router uses PyTorch matmul precision "high". Keep
-        # this process-wide policy at the engine boundary and restore it when
-        # this entry is closed or setup fails.
-        self._previous_matmul_precision = torch.get_float32_matmul_precision()
-        torch.set_float32_matmul_precision("high")
+        # this process-wide policy active until the last overlapping entry
+        # closes, then restore the policy that preceded the first entry.
+        _MATMUL_PRECISION_MANAGER.acquire()
+        self._owns_matmul_precision = True
         try:
             self._setup(args)
         except BaseException:
@@ -188,10 +228,9 @@ class LingBotV2Entry(Entry):
             self._restore_matmul_precision()
 
     def _restore_matmul_precision(self) -> None:
-        previous = self._previous_matmul_precision
-        if previous is not None:
-            torch.set_float32_matmul_precision(previous)
-            self._previous_matmul_precision = None
+        if self._owns_matmul_precision:
+            _MATMUL_PRECISION_MANAGER.release()
+            self._owns_matmul_precision = False
 
     def dump_targets(self) -> dict[str, torch.nn.Module]:
         """Expose model leaves to the engine's optional tensor dumper."""

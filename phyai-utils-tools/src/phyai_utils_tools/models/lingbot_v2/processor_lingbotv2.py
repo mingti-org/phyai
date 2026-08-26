@@ -168,6 +168,7 @@ class LingBotV2Processor(BaseModelProcessor):
         action_dim: int | None = 55,
         dataset_stats: dict[str, Any] | None = None,
         normalization_mode: str | NormalizationMode = NormalizationMode.QUANTILES,
+        normalization_eps: float = 1e-6,
         use_chat_template: bool = True,
         convert_unit_float_to_uint8: bool = True,
         device: torch.device | str = "cpu",
@@ -182,6 +183,8 @@ class LingBotV2Processor(BaseModelProcessor):
             raise ValueError("max_state_dim must be positive.")
         if action_dim is not None and action_dim <= 0:
             raise ValueError("action_dim must be positive when provided.")
+        if normalization_eps <= 0:
+            raise ValueError("normalization_eps must be positive.")
 
         (
             self.processor,
@@ -204,6 +207,7 @@ class LingBotV2Processor(BaseModelProcessor):
         self.action_dim = action_dim
         self.dataset_stats = canonical_stats(dataset_stats)
         self.normalization_mode = NormalizationMode(normalization_mode)
+        self.normalization_eps = float(normalization_eps)
         self.use_chat_template = bool(use_chat_template)
         self.convert_unit_float_to_uint8 = bool(convert_unit_float_to_uint8)
         self.device = device
@@ -273,6 +277,7 @@ class LingBotV2Processor(BaseModelProcessor):
                 norm_map=self.norm_map(),
                 stats=self.dataset_stats,
                 device=self.device,
+                eps=self.normalization_eps,
             ),
             LingBotV2PadStateStep(max_state_dim=self.max_state_dim),
             LingBotV2PromptPrepareStep(
@@ -303,6 +308,7 @@ class LingBotV2Processor(BaseModelProcessor):
                 norm_map=self.norm_map(),
                 stats=self.dataset_stats,
                 device=self.device,
+                eps=self.normalization_eps,
             ),
             LingBotV2DeviceStep(
                 device="cpu",
@@ -439,6 +445,7 @@ class LingBotV2Processor(BaseModelProcessor):
                 NormalizationMode.QUANTILES.value,
             )
         )
+        obj.normalization_eps = float(norm_config.get("eps", 1e-6))
         obj.use_chat_template = prompt_step.use_chat_template
         obj.convert_unit_float_to_uint8 = image_step.convert_unit_float_to_uint8
         obj.device = device

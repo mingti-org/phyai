@@ -463,8 +463,9 @@ class LingBotV2DualQueryConfig(PretrainedConfig):
     Teacher checkpoint paths and auxiliary loss coefficients are deliberately
     excluded.  The learned seed tables and shared projections remain part of
     the released inference graph because their eight-token current/future
-    summaries are appended to the Qwen3-VL prefix.  Current queries condition
-    the action suffix; the released masks hide future queries from the suffix.
+    summaries are appended to the Qwen3-VL prefix.  The released RoboTwin
+    training config leaves both future-query suffix masks disabled, so the
+    action stream can attend to the shared future query tokens.
     """
 
     nested_sources = {
@@ -497,8 +498,8 @@ class LingBotV2DualQueryConfig(PretrainedConfig):
     use_shared_future_task_proj: bool = True
     use_current_shared_task_proj: bool = True
     use_future_video_cls: bool = False
-    block_future_depth_to_action: bool = True
-    block_suffix_to_future_video: bool = True
+    block_future_depth_to_action: bool = False
+    block_suffix_to_future_video: bool = False
     fusion_bias: bool = True
 
     def __post_init__(self) -> None:

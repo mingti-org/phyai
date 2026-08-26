@@ -15,11 +15,17 @@ from phyai.utils import load_config
 from profile_lingbot_v2 import load_inputs, make_request, validate_contract
 
 
+def reference_backend_name(vision_dtype: str) -> str:
+    """Describe the precision used by the official-compatible reference."""
+
+    return f"official_compatible_{vision_dtype}_conv3d_cudnn_disabled"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare the official-compatible BF16 Conv3D PatchEmbed with the "
-            "mathematically equivalent PHYAI BF16 GEMM path."
+            "Compare the official-compatible Conv3D PatchEmbed with the "
+            "mathematically equivalent PHYAI GEMM path."
         )
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -213,7 +219,7 @@ def main() -> None:
         "input_metadata": input_metadata,
         "vision_dtype": str(vision_dtype),
         "linear_kernel": args.linear_kernel,
-        "reference_backend": "official_compatible_bf16_conv3d_cudnn_disabled",
+        "reference_backend": reference_backend_name(args.vision_dtype),
         "candidate_backend": "phyai_replicated_linear_gemm",
         "cosine_threshold": args.cosine_threshold,
         "comparisons": comparisons,
@@ -228,7 +234,8 @@ def main() -> None:
     print(f"Report: {args.out}")
     if not passed:
         raise RuntimeError(
-            "BF16 GEMM PatchEmbed did not meet the requested parity threshold."
+            f"{args.vision_dtype.upper()} GEMM PatchEmbed did not meet the "
+            "requested parity threshold."
         )
 
 
