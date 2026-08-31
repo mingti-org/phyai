@@ -80,6 +80,8 @@ def raw_action_to_canonical(action: Any) -> np.ndarray:
 
 
 def load_robotwin_stats(path: str | Path) -> dict[str, Any]:
+    """Load the official RoboTwin normalization JSON document."""
+
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
@@ -135,6 +137,8 @@ class RoboTwinLingBotV2Adapter:
     use_length: int = 50
 
     def prepare_observation(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Convert one RoboTwin observation to canonical processor fields."""
+
         images = [_to_numpy(observation[key]) for key in ROBOTWIN_CAMERA_KEYS]
         state = raw_state_to_canonical(observation[ROBOTWIN_STATE_KEY])
         if state.ndim == 1:
@@ -146,6 +150,8 @@ class RoboTwinLingBotV2Adapter:
         }
 
     def format_action_chunk(self, canonical_action: Any) -> dict[str, np.ndarray]:
+        """Convert a canonical action chunk back to RoboTwin joint order."""
+
         action = _to_numpy(canonical_action, dtype=np.float32)
         if action.ndim == 3:
             action = action[0]

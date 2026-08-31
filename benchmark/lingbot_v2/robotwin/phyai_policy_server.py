@@ -52,6 +52,8 @@ ROBOTWIN_MODEL_FEATURE_DIM = ROBOTWIN_MODEL_EFFECTOR_END
 
 
 def str_to_bool(value: str | bool) -> bool:
+    """Parse the boolean spellings accepted by the deployment CLI."""
+
     if isinstance(value, bool):
         return value
     normalized = value.lower()
@@ -63,6 +65,8 @@ def str_to_bool(value: str | bool) -> bool:
 
 
 def required_path(value: str | None, *, name: str) -> Path:
+    """Resolve a required path argument and fail with a useful message."""
+
     if not value:
         raise ValueError(f"{name} is required (argument or environment variable).")
     path = Path(value)
@@ -72,6 +76,8 @@ def required_path(value: str | None, *, name: str) -> Path:
 
 
 def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and Torch for repeatable policy requests."""
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -245,9 +251,13 @@ class LingBotV2RoboTwinPolicy:
         }
 
     def close(self) -> None:
+        """Release the in-process PHYAI engine."""
+
         self.engine.close()
 
     def reset(self, robo_name: str) -> None:
+        """Reset the engine after validating the requested RoboTwin mapping."""
+
         if robo_name not in {"robotwin", "robotwin_clean_and_aug"}:
             raise ValueError(
                 "this policy server only supports the RoboTwin mapping, got "
@@ -301,6 +311,8 @@ class LingBotV2RoboTwinPolicy:
         return self.adapter.format_action_chunk(canonical_action)
 
     def infer(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Handle one legacy request and return an unnormalized action chunk."""
+
         if observation.get("reset"):
             self.reset(str(observation.get("robo_name", "robotwin")))
             return {"action": None}
@@ -313,6 +325,8 @@ class LingBotV2RoboTwinPolicy:
 
 
 class RoboTwinWebSocketServer:
+    """Serve the PHYAI policy over the legacy MessagePack WebSocket protocol."""
+
     def __init__(self, policy: LingBotV2RoboTwinPolicy, *, host: str, port: int):
         self.policy = policy
         self.host = host
@@ -348,6 +362,8 @@ class RoboTwinWebSocketServer:
                 raise
 
     async def run(self) -> None:
+        """Bind the configured WebSocket endpoint and serve until cancelled."""
+
         from websockets.asyncio.server import serve
 
         async with serve(
@@ -361,6 +377,8 @@ class RoboTwinWebSocketServer:
             await server.serve_forever()
 
     def serve_forever(self) -> None:
+        """Run the asynchronous server and close policy resources on exit."""
+
         try:
             asyncio.run(self.run())
         finally:
@@ -368,6 +386,8 @@ class RoboTwinWebSocketServer:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse model, processor, normalization, and server CLI options."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model_path",
@@ -409,6 +429,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Construct the policy and serve RoboTwin requests until shutdown."""
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

@@ -856,18 +856,26 @@ class LingBotVLA2Config(PretrainedConfig):
 
     @property
     def action_dim(self) -> int:
+        """Number of action coordinates emitted for each time step."""
+
         return self.flow_matching.action_dim
 
     @property
     def max_action_dim(self) -> int:
+        """Maximum action width reserved by the checkpoint configuration."""
+
         return self.flow_matching.max_action_dim
 
     @property
     def max_state_dim(self) -> int:
+        """Width of the padded state vector consumed by the model."""
+
         return self.flow_matching.max_state_dim
 
     @property
     def chunk_size(self) -> int:
+        """Number of actions generated in one diffusion chunk."""
+
         return self.flow_matching.chunk_size
 
     @property
@@ -878,6 +886,8 @@ class LingBotVLA2Config(PretrainedConfig):
 
     @property
     def num_inference_steps(self) -> int:
+        """Number of Euler steps used to sample one action chunk."""
+
         return self.flow_matching.num_inference_steps
 
     @property
@@ -888,6 +898,8 @@ class LingBotVLA2Config(PretrainedConfig):
 
     @property
     def n_obs_steps(self) -> int:
+        """Number of observation frames represented by one request."""
+
         return self.flow_matching.num_observation_steps
 
     @property

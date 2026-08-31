@@ -65,6 +65,8 @@ from phyai_utils_tools.models.lingbot_v2 import LingBotV2Processor
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse checkpoint, input asset, and output settings for the example."""
+
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -142,6 +144,8 @@ def load_camera_images(
     *,
     repeat_single_image: bool,
 ) -> tuple[list[torch.Tensor], list[Path], list[tuple[int, int]]]:
+    """Load one or three RGB images in the model's camera order."""
+
     if len(paths) == 1:
         if not repeat_single_image:
             raise ValueError(
@@ -168,6 +172,8 @@ def load_camera_images(
 
 
 def load_state(path: Path | None, *, max_state_dim: int) -> torch.Tensor:
+    """Load and pad one state vector, or return an all-zero default."""
+
     if path is None:
         return torch.zeros(1, max_state_dim, dtype=torch.float32)
     if not path.is_file():
@@ -204,6 +210,8 @@ def load_state(path: Path | None, *, max_state_dim: int) -> torch.Tensor:
 
 
 def load_stats(path: Path | None) -> dict[str, Any] | None:
+    """Load optional normalization statistics from a JSON object."""
+
     if path is None:
         return None
     if not path.is_file():
@@ -215,6 +223,8 @@ def load_stats(path: Path | None) -> dict[str, Any] | None:
 
 
 def main() -> None:
+    """Run one fixed LingBot V2 inference example and save its actions."""
+
     args = parse_args()
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative.")

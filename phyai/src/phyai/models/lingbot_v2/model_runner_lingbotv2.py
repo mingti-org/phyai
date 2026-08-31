@@ -231,6 +231,8 @@ class _LingBotV2OfficialARBackend(ARAttentionBackend):
     name = "lingbot-v2-official-eager"
 
     def init_forward_metadata(self, meta: ARAttnMetadata) -> ARAttnPlanHandle:
+        """Create an eager plan for one autoregressive attention layout."""
+
         return _build_eager_plan(meta)
 
     def forward(
@@ -241,6 +243,8 @@ class _LingBotV2OfficialARBackend(ARAttentionBackend):
         v: torch.Tensor,
         ctx: ARAttnCtx,
     ) -> torch.Tensor:
+        """Execute the official eager autoregressive attention path."""
+
         return _official_eager_paged_attention(layer, q, k, v, ctx)
 
 
@@ -258,6 +262,8 @@ class _LingBotV2OfficialDiffusionBackend(DiffusionAttentionBackend):
         self,
         meta: DiffusionAttnMetadata,
     ) -> DiffusionAttnPlanHandle:
+        """Create an eager plan for one diffusion attention layout."""
+
         return _build_eager_plan(meta)
 
     def forward(
@@ -268,6 +274,8 @@ class _LingBotV2OfficialDiffusionBackend(DiffusionAttentionBackend):
         v: torch.Tensor,
         ctx: DiffusionAttnCtx,
     ) -> torch.Tensor:
+        """Execute the official eager diffusion attention path."""
+
         return _official_eager_paged_attention(layer, q, k, v, ctx)
 
 
@@ -290,6 +298,8 @@ class LingBotV2VisionRunner(ModelRunner):
         self.device = torch.device(device)
 
     def setup(self) -> None:
+        """Initialize the eager attention backend and vision model state."""
+
         all_ranks_log(
             logger,
             logging.INFO,
@@ -305,6 +315,8 @@ class LingBotV2VisionRunner(ModelRunner):
     def forward(
         self, batch: LingBotV2VisionForwardBatch
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Encode packed image patches and return features with rotary inputs."""
+
         return self.vision_model(
             batch.pixel_values.to(device=self.device, dtype=self.params_dtype),
             batch.image_grid_thw.to(device=self.device, dtype=torch.int64),
@@ -367,6 +379,8 @@ class LingBotV2PrefixRunner(ModelRunner):
         self._vision_end: torch.Tensor | None = None
 
     def setup(self) -> None:
+        """Allocate prefix attention metadata and model caches."""
+
         all_ranks_log(logger, logging.INFO, "Entering LingBotV2PrefixRunner.setup")
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.max_batch_size,
@@ -452,9 +466,13 @@ class LingBotV2PrefixRunner(ModelRunner):
         )
 
     def plan_inference(self, metadata: ARAttnMetadata) -> None:
+        """Build the attention plan for the next prefix request."""
+
         self._plan = self.attn_backend.init_forward_metadata(metadata)
 
     def forward(self, batch: LingBotV2PrefixForwardBatch) -> None:
+        """Run the prefix transformer and write its key/value cache."""
+
         if self._plan is None:
             raise RuntimeError("plan_inference must be called before prefix forward.")
         cos, sin = self.mrope.get_cos_sin(batch.position_ids)
@@ -477,6 +495,8 @@ class LingBotV2PrefixRunner(ModelRunner):
         return None
 
     def close(self) -> None:
+        """Release prefix attention resources and clear cached tensors."""
+
         self.reset()
         _close_backend(self.attn_backend)
         self._current_query = None
@@ -543,6 +563,8 @@ class LingBotV2ExpertRunner(ModelRunner):
         self._failed_graph_keys: set[tuple[object, ...]] = set()
 
     def setup(self) -> None:
+        """Initialize expert attention backends and lazy graph bookkeeping."""
+
         all_ranks_log(logger, logging.INFO, "Entering LingBotV2ExpertRunner.setup")
         common = dict(
             max_batch_size=self.max_batch_size,
@@ -599,6 +621,8 @@ class LingBotV2ExpertRunner(ModelRunner):
         state_metadata: DiffusionAttnMetadata,
         action_metadata: DiffusionAttnMetadata,
     ) -> None:
+        """Plan state and action attention for one diffusion inference."""
+
         if state_metadata.position_ids is None or action_metadata.position_ids is None:
             raise ValueError("LingBot expert metadata requires 3-D MRoPE position_ids.")
         if (
@@ -614,6 +638,8 @@ class LingBotV2ExpertRunner(ModelRunner):
         self._action_plan = self.action_backend.init_forward_metadata(action_metadata)
 
     def forward(self, batch: LingBotV2ExpertForwardBatch) -> torch.Tensor:
+        """Run the expert stack and return the predicted action chunk."""
+
         required = (
             self._state_plan,
             self._action_plan,
@@ -792,7 +818,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         state_write_indices = self._state_write_indices.clone()
         action_write_indices = self._action_write_indices.clone()
 
-        def captured_loop(*, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        def _captured_loop(*, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
             return self._euler_loop(
                 state=state,
                 noise=noise,
@@ -805,7 +831,7 @@ class LingBotV2ExpertRunner(ModelRunner):
             )
 
         graph = CudaGraph()
-        graph.capture(captured_loop, {"state": state, "noise": noise})
+        graph.capture(_captured_loop, {"state": state, "noise": noise})
         return _LingBotV2EulerGraphState(
             graph=graph,
             state_plan=captured_state_plan,
@@ -925,6 +951,8 @@ class LingBotV2ExpertRunner(ModelRunner):
         return len(self._failed_graph_keys)
 
     def close(self) -> None:
+        """Release expert backends, graph captures, and request metadata."""
+
         self.reset()
         self._euler_graphs.clear()
         self._failed_graph_keys.clear()

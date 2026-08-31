@@ -14,6 +14,8 @@ import numpy as np
 
 
 def pack_array(value: Any) -> Any:
+    """Encode NumPy arrays and scalars in the official MessagePack format."""
+
     if isinstance(value, (np.ndarray, np.generic)) and value.dtype.kind in (
         "V",
         "O",
@@ -37,6 +39,8 @@ def pack_array(value: Any) -> Any:
 
 
 def unpack_array(value: dict[Any, Any]) -> Any:
+    """Decode one MessagePack extension mapping back to a NumPy value."""
+
     if b"__ndarray__" in value:
         return np.ndarray(
             buffer=value[b"data"],

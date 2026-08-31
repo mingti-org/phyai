@@ -248,13 +248,19 @@ class LingBotV2Processor(BaseModelProcessor):
 
     @staticmethod
     def action_to_transition(action: torch.Tensor) -> Transition:
+        """Wrap an action tensor in the processor transition mapping."""
+
         return {ACTION: action}
 
     @staticmethod
     def transition_to_action(transition: Transition) -> torch.Tensor:
+        """Extract the action tensor produced by the postprocessor."""
+
         return transition[ACTION]
 
     def norm_map(self) -> dict[str, str]:
+        """Return normalization modes for visual, state, and action features."""
+
         return {
             FeatureType.VISUAL.value: NormalizationMode.IDENTITY.value,
             FeatureType.STATE.value: self.normalization_mode.value,
@@ -262,6 +268,8 @@ class LingBotV2Processor(BaseModelProcessor):
         }
 
     def build_preprocessor(self) -> ProcessorPipeline:
+        """Build the ordered pipeline from raw observations to model inputs."""
+
         steps = [
             Qwen3VLImagePackStep(
                 image_processor=self.image_processor,
@@ -301,6 +309,8 @@ class LingBotV2Processor(BaseModelProcessor):
         )
 
     def build_postprocessor(self) -> ProcessorPipeline:
+        """Build the pipeline that slices, unnormalizes, and exports actions."""
+
         steps = [
             SliceActionStep(action_dim=self.action_dim),
             UnnormalizerStep(

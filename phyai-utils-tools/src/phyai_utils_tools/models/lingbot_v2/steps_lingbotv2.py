@@ -285,6 +285,8 @@ class Qwen3VLImagePackStep(ProcessorStep):
         return out
 
     def get_config(self) -> dict[str, Any]:
+        """Serialize image packing options for pipeline reconstruction."""
+
         return {
             "processor_name": self.processor_name,
             "num_images": self.num_images,
@@ -326,6 +328,8 @@ class LingBotV2PadStateStep(ProcessorStep):
         return out
 
     def get_config(self) -> dict[str, Any]:
+        """Serialize the state padding width."""
+
         return {"max_state_dim": self.max_state_dim}
 
 
@@ -369,6 +373,8 @@ class LingBotV2PromptPrepareStep(ProcessorStep):
         return out
 
     def get_config(self) -> dict[str, Any]:
+        """Serialize prompt formatting options."""
+
         return {
             "use_chat_template": self.use_chat_template,
             "bos_token": self.bos_token,
@@ -408,6 +414,8 @@ class LingBotV2DeviceStep(ProcessorStep):
         return out
 
     def get_config(self) -> dict[str, Any]:
+        """Serialize device and floating-point conversion options."""
+
         dtype = self.resolved_float_dtype
         return {
             "device": str(self.device).replace("torch.device", "").strip("()'\""),

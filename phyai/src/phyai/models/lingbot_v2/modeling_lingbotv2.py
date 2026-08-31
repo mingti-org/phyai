@@ -269,6 +269,8 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         )
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """Return axial rotary frequencies for the supplied patch positions."""
+
         # position_ids: (num_patches, 2) -> freqs (num_patches, 2 * (dim//2)).
         freqs = position_ids.unsqueeze(-1) * self.inv_freq.to(position_ids.device)
         return freqs.flatten(1)
@@ -318,6 +320,8 @@ class LingBotV2VisionLayerNorm(nn.Module):
             self.bias.weight_loader = replicated()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize vision activations using FP32 statistics."""
+
         input_dtype = hidden_states.dtype
         hidden_states_fp32 = hidden_states.float()
         mean = hidden_states_fp32.mean(dim=-1, keepdim=True)
@@ -350,6 +354,8 @@ class LingBotV2RMSNorm(nn.Module):
             self.weight.weight_loader = replicated()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize activations with the checkpoint's RMSNorm convention."""
+
         input_dtype = hidden_states.dtype
         hidden_states_fp32 = hidden_states.float()
         variance = hidden_states_fp32.square().mean(dim=-1, keepdim=True)
@@ -375,7 +381,7 @@ def _attach_fused_qkv_loaders(
     local_sizes = tuple(layer.output_partition_sizes)
     rank = layer.tp_rank
 
-    def load_fused_qkv(
+    def _load_fused_qkv(
         parameter: nn.Parameter,
         loaded: torch.Tensor,
         _shard_id=None,
@@ -398,10 +404,10 @@ def _attach_fused_qkv_loaders(
             destination_offset += local_size
 
     layer.weight.hf_keys = [(f"{checkpoint_prefix}.weight", None)]
-    layer.weight.weight_loader = load_fused_qkv
+    layer.weight.weight_loader = _load_fused_qkv
     if layer.bias is not None:
         layer.bias.hf_keys = [(f"{checkpoint_prefix}.bias", None)]
-        layer.bias.weight_loader = load_fused_qkv
+        layer.bias.weight_loader = _load_fused_qkv
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
@@ -452,7 +458,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
                 prefix=projection_prefix,
             )
 
-            def load_conv3d_weight_as_gemm(
+            def _load_conv3d_weight_as_gemm(
                 parameter: nn.Parameter,
                 loaded: torch.Tensor,
                 _shard_id=None,
@@ -464,9 +470,11 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
                     )
                 parameter.data.copy_(loaded.reshape(parameter.shape))
 
-            self.proj.weight.weight_loader = load_conv3d_weight_as_gemm
+            self.proj.weight.weight_loader = _load_conv3d_weight_as_gemm
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the selected Conv3D or flattened GEMM patch projection."""
+
         target_dtype = self.proj.weight.dtype
         if self.backend == "gemm":
             hidden_states = hidden_states.reshape(-1, self.patch_vector_dim)
@@ -538,6 +546,8 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project and merge each spatial patch group into one token."""
+
         x = self.norm(x.view(-1, self.merged_dim) if self.use_postshuffle_norm else x)
         x = x.view(-1, self.merged_dim)
         x, _ = self.linear_fc1(x)
@@ -576,6 +586,8 @@ class Qwen3VLVisionMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the two-layer vision feed-forward network."""
+
         x, _ = self.linear_fc1(x)
         x = F.gelu(x, approximate="tanh")
         x, _ = self.linear_fc2(x)
@@ -583,6 +595,8 @@ class Qwen3VLVisionMLP(nn.Module):
 
 
 class Qwen3VLVisionAttention(nn.Module):
+    """Non-causal self-attention for ragged Qwen3-VL image grids."""
+
     def __init__(
         self,
         config: Qwen3VLVisionConfig,
@@ -631,6 +645,8 @@ class Qwen3VLVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        """Apply rotary self-attention independently to each image sequence."""
+
         seq_length = hidden_states.shape[0]
         qkv, _ = self.qkv(hidden_states)
         q, k, v = (
@@ -697,6 +713,8 @@ class Qwen3VLVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        """Run one residual vision transformer block."""
+
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -794,6 +812,8 @@ class Qwen3VLVisionModel(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
+        """Return the dtype used by the learned vision parameters."""
+
         return self.pos_embed_weight.dtype
 
     def forward(
@@ -892,6 +912,8 @@ class Qwen3VLTextBlock(TransformerBlock):
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run one text transformer block with the supplied attention context."""
+
         residual = x
         hidden_states = self.input_norm(x)
         fused, _ = self.qkv_proj(hidden_states)
@@ -1099,6 +1121,8 @@ class LingBotV2AdaRMSNorm(nn.Module):
                 self.beta.bias.zero_()
 
     def forward(self, hidden_states: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization modulated by the diffusion condition."""
+
         input_dtype = hidden_states.dtype
         normed = hidden_states.float()
         variance = normed.square().mean(dim=-1, keepdim=True)
@@ -1261,6 +1285,8 @@ class LingBotV2TokenMoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Route tokens through selected experts and the shared expert path."""
+
         original_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, original_shape[-1])
         router_logits = _fp32_router_linear(
@@ -1392,6 +1418,8 @@ class LingBotV2ExpertLayer(nn.Module):
         sin: torch.Tensor,
         attn_ctx: DiffusionAttnCtx,
     ) -> torch.Tensor:
+        """Apply joint diffusion attention, normalization, and the MLP path."""
+
         residual = hidden_states
         normed = self.input_layernorm(hidden_states, cond)
         fused, _ = self.qkv_proj(normed)
@@ -1531,12 +1559,16 @@ class LingBotV2ActionTimeHeads(nn.Module):
         )
 
     def embed_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Project padded model state into the action expert width."""
+
         out, _ = self.state_proj(state.to(self.state_proj.weight.dtype))
         return out
 
     def embed_action_time(
         self, actions: torch.Tensor, time: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed noisy actions and diffusion time into expert inputs."""
+
         action_emb, _ = self.action_in_proj(
             actions.to(self.action_in_proj.weight.dtype)
         )
@@ -1553,6 +1585,8 @@ class LingBotV2ActionTimeHeads(nn.Module):
         return fused, cond
 
     def project_action(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project expert hidden states back to action coordinates."""
+
         out, _ = self.action_out_proj(
             hidden_states.to(self.action_out_proj.weight.dtype)
         )
@@ -1642,6 +1676,8 @@ class LingBotV2DualQuery(nn.Module):
         ).mean(dim=1)
 
     def forward(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return broadcast current and future learned task-query tokens."""
+
         current_depth = self._pool(self.depth_align_embs)
         current_video = self._pool(self.current_video_align_embs)
         current, _ = self.current_shared_task_proj(
@@ -1799,12 +1835,18 @@ class LingBotV2Model(nn.Module):
 
     @property
     def mrope(self) -> InterleavedMRotaryEmbedding:
+        """Expose the text tower's interleaved multimodal rotary embedding."""
+
         return self.text.rotary_emb
 
     def embed_language(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs with the language model's vocabulary table."""
+
         return self.text.embed_tokens(input_ids)
 
     def embed_special(self, token_id: int) -> torch.Tensor:
+        """Embed one special token ID for prefix construction."""
+
         token = torch.tensor(
             [token_id], dtype=torch.int64, device=self.text.embed_tokens.weight.device
         )

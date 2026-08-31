@@ -19,6 +19,8 @@ INVALID_LOG_MARKERS = ("Policy rollout error:",)
 
 @dataclass(frozen=True)
 class TaskResult:
+    """Completed success counts and source log for one evaluated task."""
+
     task: str
     success: int
     episodes: int
@@ -26,10 +28,14 @@ class TaskResult:
 
     @property
     def rate(self) -> float:
+        """Return the task's successful-episode fraction."""
+
         return self.success / self.episodes
 
 
 def collect_results(root: Path) -> tuple[dict[str, TaskResult], list[Path]]:
+    """Collect completed task results and identify incomplete log files."""
+
     if not root.is_dir():
         raise FileNotFoundError(f"result directory does not exist: {root}")
     results: dict[str, TaskResult] = {}
@@ -69,6 +75,8 @@ def collect_results(root: Path) -> tuple[dict[str, TaskResult], list[Path]]:
 
 
 def aggregate(results: dict[str, TaskResult]) -> tuple[float, float, int, int]:
+    """Compute macro accuracy, micro accuracy, and aggregate counts."""
+
     if not results:
         raise ValueError("cannot aggregate an empty result set.")
     total_success = sum(result.success for result in results.values())
@@ -83,6 +91,8 @@ def write_csv(
     official: dict[str, TaskResult],
     phyai: dict[str, TaskResult],
 ) -> None:
+    """Write per-task Official/PHYAI results as a CSV table."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tasks = sorted(set(official) | set(phyai))
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -125,6 +135,8 @@ def write_markdown(
     official: dict[str, TaskResult],
     phyai: dict[str, TaskResult],
 ) -> None:
+    """Write the paired backend comparison as a Markdown report."""
+
     left_macro, left_micro, left_success, left_episodes = aggregate(official)
     right_macro, right_micro, right_success, right_episodes = aggregate(phyai)
     lines = [
@@ -162,6 +174,8 @@ def write_markdown(
 
 
 def main() -> None:
+    """Parse result directories and write both summary report formats."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--official-dir", type=Path, required=True)
     parser.add_argument("--phyai-dir", type=Path, required=True)

@@ -38,6 +38,8 @@ CAMERA_ALIASES = {
 
 
 def camera_color(vision: Mapping[str, Any], aliases: Sequence[str]) -> np.ndarray:
+    """Find an RGB HWC image under the supplied camera aliases."""
+
     for name in aliases:
         if name not in vision:
             continue
@@ -59,6 +61,8 @@ def camera_color(vision: Mapping[str, Any], aliases: Sequence[str]) -> np.ndarra
 
 
 def state_field(state: Mapping[str, Any], key: str, *, expected_dim: int) -> np.ndarray:
+    """Read and validate one flat floating-point state field."""
+
     value = np.asarray(state[key], dtype=np.float32).reshape(-1)
     if value.shape != (expected_dim,):
         raise ValueError(
@@ -68,6 +72,8 @@ def state_field(state: Mapping[str, Any], key: str, *, expected_dim: int) -> np.
 
 
 def observation_prompt(observation: Mapping[str, Any]) -> str:
+    """Extract the non-empty instruction used by the legacy policy protocol."""
+
     instruction = observation.get("instruction")
     if not instruction:
         instructions = observation.get("instructions")
@@ -183,6 +189,8 @@ class DirectWebSocketPolicyClient:
         )
 
     def infer(self, observation: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Send one MessagePack observation and decode the policy response."""
+
         self.connection.send(self.packer.pack(dict(observation)))
         response = self.connection.recv()
         if isinstance(response, str):
@@ -191,9 +199,13 @@ class DirectWebSocketPolicyClient:
         return result
 
     def reset(self) -> None:
+        """Reset the remote legacy policy session."""
+
         self.infer({"reset": True, "robo_name": "robotwin"})
 
     def close(self) -> None:
+        """Close the direct policy WebSocket connection."""
+
         self.connection.close()
 
 
@@ -219,6 +231,8 @@ class LingBotV2LegacyBridge:
         self.request_index = 0
 
     def prepare_case(self, case_meta: Mapping[str, Any] | None = None) -> None:
+        """Clear per-case state and record task metadata for diagnostics."""
+
         self.observation = None
         self.request_index = 0
         if case_meta:
@@ -232,14 +246,20 @@ class LingBotV2LegacyBridge:
             )
 
     def reset(self) -> None:
+        """Reset both bridge bookkeeping and the remote policy session."""
+
         self.observation = None
         self.request_index = 0
         self.client.reset()
 
     def update_obs(self, observation: Mapping[str, Any]) -> None:
+        """Store the latest XPolicyLab observation for ``get_action``."""
+
         self.observation = observation
 
     def get_action(self) -> np.ndarray:
+        """Convert the observation, request a chunk, and return raw actions."""
+
         if self.observation is None:
             raise RuntimeError("update_obs must be called before get_action.")
         legacy_observation = xpolicylab_to_legacy_observation(self.observation)
@@ -273,6 +293,8 @@ class LingBotV2LegacyBridge:
         return action
 
     def trial_end(self, result: Mapping[str, Any] | None = None) -> None:
+        """Discard per-trial state after the evaluator records its result."""
+
         if result:
             LOGGER.info(
                 "trial end task=%s seed=%s success=%s",
@@ -284,13 +306,19 @@ class LingBotV2LegacyBridge:
         self.request_index = 0
 
     def on_trial_end(self, result: Mapping[str, Any] | None = None) -> None:
+        """Compatibility callback forwarding to :meth:`trial_end`."""
+
         self.trial_end(result)
 
     def close(self) -> None:
+        """Close the bridge's underlying direct policy client."""
+
         self.client.close()
 
 
 def add_xpolicylab_paths(robotwin_root: Path) -> None:
+    """Add RoboTwin and its XPolicyLab checkout to the import search path."""
+
     xpolicylab_root = robotwin_root / "XPolicyLab"
     for path in (robotwin_root, xpolicylab_root):
         value = str(path)
@@ -299,6 +327,8 @@ def add_xpolicylab_paths(robotwin_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line settings for the transport-only bridge."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--backend-host", default="127.0.0.1")
@@ -323,6 +353,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Start an XPolicyLab-compatible bridge for one direct policy server."""
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

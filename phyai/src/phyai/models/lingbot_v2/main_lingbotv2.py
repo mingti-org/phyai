@@ -37,6 +37,8 @@ class _MatmulPrecisionManager:
         self._previous_precision: str | None = None
 
     def acquire(self) -> None:
+        """Acquire the process-wide high-precision matmul policy."""
+
         with self._lock:
             if self._active_entries == 0:
                 previous = torch.get_float32_matmul_precision()
@@ -45,6 +47,8 @@ class _MatmulPrecisionManager:
             self._active_entries += 1
 
     def release(self) -> None:
+        """Release one policy lease and restore the previous setting last."""
+
         with self._lock:
             if self._active_entries == 0:
                 raise RuntimeError("matmul precision lease is not active.")
@@ -73,18 +77,18 @@ def compose_lingbot_v2_weight_remap(
 
     if callable(user_remap):
 
-        def chained(key: str) -> str | None:
+        def _chained(key: str) -> str | None:
             mapped = lingbot_v2_weight_remap(key)
             if mapped is None:
                 return None
             return user_remap(mapped)
 
-        return chained
+        return _chained
 
     if isinstance(user_remap, dict):
         rules = tuple(user_remap.items())
 
-        def chained_dict(key: str) -> str | None:
+        def _chained_dict(key: str) -> str | None:
             mapped = lingbot_v2_weight_remap(key)
             if mapped is None:
                 return None
@@ -93,7 +97,7 @@ def compose_lingbot_v2_weight_remap(
                     mapped = mapped.replace(source, target)
             return mapped
 
-        return chained_dict
+        return _chained_dict
 
     raise TypeError(
         "weight_remap must be callable, dict, or None; "
@@ -219,6 +223,8 @@ class LingBotV2Entry(Entry):
         return self.scheduler.step(request)
 
     def close(self) -> None:
+        """Release scheduler resources and the shared matmul precision lease."""
+
         try:
             if self.scheduler is not None:
                 self.scheduler.close()

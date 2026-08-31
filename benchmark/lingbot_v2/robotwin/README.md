@@ -56,16 +56,6 @@ checkpoint. The official server also expects the training-run layout: its
 checkpoint is below `checkpoints/global_step_*/hf_ckpt`, while
 `lingbotvla_cli.yaml` is stored at the training-run root.
 
-Before loading weights, verify the PHYAI boundary adapter against the official
-statistics:
-
-```bash
-export PYTHONPATH=/workspace/phyai/src:/workspace/phyai-kernel:/workspace/phyai-utils-tools/src:/workspace/phyai-ext/src:/workspace/phyai-model-optimizer/src
-
-python3 benchmark/lingbot_v2/robotwin/check_adapter_parity.py \
-  --stats-json /models/lingbot-v2-robotwin-run/assets/norm_stats/robotwin.json
-```
-
 ## Start the direct policy servers
 
 Start the official server on one port:
@@ -160,33 +150,3 @@ Each backend output also contains `protocol.env`. A result directory is
 rejected when its recorded instruction split, simulator source hash, seed, or
 task config differs from the requested run. This prevents `--resume` from
 mixing results produced under different simulator contracts.
-
-## Audit against the released table
-
-The released table reports 100 accepted episodes per task. The released
-LingBot launcher references `script/eval_polict_client_openpi.py`, which is not
-present in the public RoboTwin revisions inspected here, and current RoboTwin
-uses a later XPolicyLab evaluator. Consequently this harness is suitable for a
-paired Official/PHYAI implementation comparison, but it is not by itself an
-exact reproduction of the model-card protocol. Audit a completed Official
-result directory before interpreting an absolute gap:
-
-```bash
-python3 benchmark/lingbot_v2/robotwin/audit_success_gap.py \
-  --model-card /models/lingbot-vla-v2-6b-robotwin/README.md \
-  --results-dir /results/official \
-  --lingbot-root /workspace/official-lingbot \
-  --robotwin-root /workspace/RoboTwin \
-  --json /results/official-model-card-audit.json
-```
-
-The audit reports exact per-task binomial tests, Wilson intervals, observed
-instruction split, episode-count mismatches, RoboTwin revision provenance, and
-whether the legacy Official client/harness files are present. A low p-value
-shows that sampling noise alone is not a sufficient explanation; it does not
-prove that a model implementation is wrong when the published evaluator or
-simulator revision is missing.
-
-The report includes micro Avg Acc across all episodes and macro Avg Acc across
-tasks. Incomplete or mismatched task sets fail by default instead of producing
-a partial comparison.

@@ -257,6 +257,8 @@ class LingBotV2WS1Scheduler(Scheduler):
         )
 
     def setup(self) -> None:
+        """Initialize the vision, prefix, and expert runners in order."""
+
         self.vision_runner.setup()
         self.prefix_runner.setup()
         self.expert_runner.setup()
