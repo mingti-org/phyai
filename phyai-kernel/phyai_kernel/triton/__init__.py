@@ -5,6 +5,7 @@ from phyai_kernel.triton.causal_conv1d import causal_conv1d_silu_split_qkv
 from phyai_kernel.triton.layer_norm import layernorm
 from phyai_kernel.triton.masked_embedding import masked_embedding_lookup
 from phyai_kernel.triton.paged_kv_indices import create_paged_kv_indices
+from phyai_kernel.triton.router_gemm import fp32_router_gemm
 from phyai_kernel.triton.rms_norm import (
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
@@ -19,6 +20,7 @@ __all__ = [
     "causal_conv1d_silu_split_qkv",
     "create_paged_kv_indices",
     "fused_add_rmsnorm",
+    "fp32_router_gemm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "layernorm",
