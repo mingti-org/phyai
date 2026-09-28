@@ -26,7 +26,6 @@ import os
 
 
 
-TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
 MODEL_NAME = "pi05"
 REGISTRATION_RETRY_SECONDS = 5
 IMAGE_NAMES = ("agentview", "robot0_eye_in_hand")
@@ -147,7 +146,7 @@ class ModelRegistryReporter:
 
 
 class PI05Runtime:
-    def __init__(self,checkpoint_dir):
+    def __init__(self,checkpoint_dir,tokenizer_dir):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for PI0.5 inference")
 
@@ -158,13 +157,13 @@ class PI05Runtime:
 
         logging.info("Loading PI0.5 checkpoint from %s", checkpoint_dir)
         tokenizer = get_tokenizer(
-            str(TOKENIZER_DIR),
+            str(tokenizer_dir),
             local_files_only=True,
         )
         self.processor = PI05Processor.from_pretrained(
             checkpoint_dir,
             tokenizer=tokenizer,
-            tokenizer_name=str(TOKENIZER_DIR),
+            tokenizer_name=str(tokenizer_dir),
             image_size=self.config.vision.image_size,
             num_channels=self.config.vision.num_channels,
             num_images=len(IMAGE_NAMES),
@@ -499,6 +498,7 @@ def serve(
     listen: str | None = None,
     advertised_endpoint: str | None = None,
     gateway_registry: str | None = None,
+    tokenizer_dir: str | None=None,
 ):
     if checkpoint_dir is None:
         raise ValueError("Need checkpoint_dir")
@@ -516,7 +516,7 @@ def serve(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    runtime = PI05Runtime(checkpoint_dir=checkpoint_dir)
+    runtime = PI05Runtime(checkpoint_dir=checkpoint_dir,tokenizer_dir=tokenizer_dir)
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=8),
         options=[
@@ -581,12 +581,17 @@ def main():
         "--checkpoint-dir",
         default="/data/share/pi05_libero_finetuned_v044",
     )
+    parser.add_argument(
+            "--tokenizer-dir",
+            default="/data/share/paligemma-3b-pt-224",
+        )
 
     args = parser.parse_args()
     if args.port is not None and args.port < 1:
         parser.error("--port must be positive")
     serve(
         checkpoint_dir=args.checkpoint_dir,
+        tokenizer_dir=args.tokenizer_dir,
         port=args.port,
         listen=args.listen,
         advertised_endpoint=args.advertised_endpoint,

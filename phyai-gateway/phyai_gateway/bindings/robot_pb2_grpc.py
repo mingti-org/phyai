@@ -26,7 +26,7 @@ if _version_not_supported:
 
 
 class RobotInferenceStub:
-    """----- 定义 RPC 服务 -----
+    """----- RPC service definition -----
     """
 
     def __init__(self, channel):
@@ -43,11 +43,11 @@ class RobotInferenceStub:
 
 
 class RobotInferenceServicer:
-    """----- 定义 RPC 服务 -----
+    """----- RPC service definition -----
     """
 
     def Communicate(self, request_iterator, context):
-        """一元 RPC：发送传感器数据，返回动作指令
+        """Unary RPC: send sensor data and return action commands
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -70,7 +70,7 @@ def add_RobotInferenceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class RobotInference:
-    """----- 定义 RPC 服务 -----
+    """----- RPC service definition -----
     """
 
     @staticmethod

@@ -294,15 +294,15 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
 
 
         """
-         检验设置不太合理，如果LeRobotclient使用不同的robot可能就不能直接兼容;
-         可能需要对不同的robot做adapter但是也不合理，
-         虽然PolicySetup能够一定程度上动态注册，但是一个gateway可能就只能同时兼容一种robot
+        The current setup is not sufficiently generic: a LeRobot client using a
+        different robot may not be directly compatible. Adding a separate adapter
+        for every robot would also be undesirable. Although PolicySetup provides
+        some dynamic registration, one Gateway may still support only one robot
+        configuration at a time.
 
-         解决方案：
-            维护不同的robot状态表，然后扫描表格兼容 比如：dict{
-            "Libero-robot": {libero-features},
-            .....
-            }
+        Possible solution:
+            Maintain a table of robot state layouts and match against it, for example:
+            {"Libero-robot": {libero-features}, ...}
         """
         if state_value is None:
             if len(state_names) != 8:
