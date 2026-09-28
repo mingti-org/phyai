@@ -53,8 +53,7 @@ def create_http_app(model_client):
         print(
             f"HTTP request received: client_type={client_type}, "
             f"content_type={request.headers.get('content-type')}, "
-            f"body_bytes={len(body)}, "
-            f"body={body}",
+            f"body_bytes={len(body)}, ",
             flush=True,
         )
         return JSONResponse(
