@@ -833,3 +833,4 @@ from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E4
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
     main_minicpm_gr00t as _main_minicpm_gr00t,
 )
+from phyai.models.dreamzero import main_dreamzero as _main_dreamzero  # noqa: E402, F401

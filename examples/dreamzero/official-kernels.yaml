@@ -1,0 +1,9 @@
+schema: phyai.kernel/v1
+profile: static
+overrides:
+  - id: dreamzero-official-layernorm
+    match: {op: layernorm}
+    use: torch.layernorm
+  - id: dreamzero-official-linear
+    match: {op: gemm, quant.format: bf16}
+    use: torch.gemm.bf16
