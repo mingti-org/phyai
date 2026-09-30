@@ -38,7 +38,6 @@ from phyai.models.pi05.scheduler_pi05 import PI05Request
 from phyai.server import WorkerSupervisorConfig
 from phyai.utils import load_config
 
-
 def make_raw_request(
     *,
     batch_size: int,
