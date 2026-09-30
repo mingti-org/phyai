@@ -130,6 +130,33 @@ uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi0.5
 
 脚本会打印每阶段的 latency 统计(3 次预热 + 30 次计时的 mean / median / std / min / max)以及等价性检查的 `PASS` 行。把 `--checkpoint` 后的路径改成你本地的 checkpoint 路径即可。
 
+# 训练 rollout 集成
+
+外部 RL controller 可以读取 diffusion trajectory，也可以替换内存中的 Actor 权重，无需重建 engine。使用完整 checkpoint 初始化 engine，并在构造 `PI05Args` 时设置 `capture_rollout=True`；训练期间的更新可以只包含 controller 选择的参数。
+
+Controller 负责管理更新事务：
+
+```python
+engine.begin_weight_update()
+try:
+    for weight_batch in actor_weight_batches:
+        engine.update_weights(weight_batch)
+    engine.finish_weight_update(version=actor_version)
+except Exception:
+    engine.abort_weight_update()
+    raise
+
+rollout = engine.rollout_step(request)
+```
+
+每个 `weight_batch` 都是 HuggingFace 参数名到 tensor 的映射。每次完成更新后都会刷新依赖权重的 scheduler 状态，并重新捕获 rollout graph。`rollout_step` 接收 `PI05RolloutRequest`，返回 `PI05RolloutOutput`，其中包含 action、denoising chain、逐 transition log probability 和可选的 value。请求必须提供 `sigmas`；`noise` 和 `step_noise` 是可选的确定性输入，未提供时由 runtime 内部采样。
+
+RLinf BF16 集成使用可选的兼容策略 `examples/configs/kernel_policies/pi05/rlinf_bf16.yaml`。应通过 controller 配置或 `PHYAI_KERNEL_CONFIG` 显式选择；PI0.5 默认不会自动加载该策略。
+
+<Warning>
+  部分权重写入后如果更新失败，不要继续用这个 `Engine` 推理。此时参数可能混合了两个版本，`Engine` 会把实例标记为不可用。终止事务后重新创建 engine。
+</Warning>
+
 # 当前限制
 
 - 仅支持单卡。Tensor parallel、continuous batching、preemption 都不在 `PI05Scheduler` 的范围内。

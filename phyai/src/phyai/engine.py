@@ -5,11 +5,14 @@ from __future__ import annotations
 import abc
 import os
 import time
+import threading
 from concurrent.futures import Future
+from collections.abc import Iterable, Mapping
 from typing import Any, ClassVar, Generator
 from datetime import timedelta
 from contextlib import contextmanager
 from dataclasses import replace, dataclass
+from enum import Enum
 
 import torch
 import torch.distributed as dist
@@ -165,9 +168,41 @@ class Entry(abc.ABC):
     def step(self, request: Any) -> Any:
         """Run one inference round. Request / response shape is plugin-defined."""
 
+    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
+        """Run an opt-in training rollout round with plugin-specific state."""
+        del request, kwargs
+        raise NotImplementedError(
+            f"Plugin {self.name!r} does not support training rollout output."
+        )
+
     def close(self) -> None:
         """Release pinned GPU resources. Default: no-op."""
         return None
+
+    def begin_weight_update(self) -> None:
+        """Begin one streamed in-memory weight update."""
+        raise NotImplementedError(
+            f"Plugin {self.name!r} does not support hot weight updates."
+        )
+
+    def update_weights(
+        self,
+        weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Apply one named-tensor batch to the active update session."""
+        del weights
+        raise NotImplementedError(
+            f"Plugin {self.name!r} does not support hot weight updates."
+        )
+
+    def finish_weight_update(self) -> Any:
+        """Finalize the active update and refresh derived runtime state."""
+        raise NotImplementedError(
+            f"Plugin {self.name!r} does not support hot weight updates."
+        )
+
+    def abort_weight_update(self) -> None:
+        """Discard bookkeeping for an interrupted update session."""
 
     def dump_targets(self) -> dict[str, nn.Module]:
         """Return the root modules that should be included in tensor dumps."""
@@ -181,6 +216,15 @@ class EngineArgs:
     plugin: str
     plugin_args: EntryArgs
     config: EngineConfig | None = None
+
+
+class _WeightUpdateState(Enum):
+    """Lifecycle state for streamed in-memory weight updates."""
+
+    IDLE = "idle"
+    UPDATING_CLEAN = "updating_clean"
+    UPDATING_DIRTY = "updating_dirty"
+    POISONED = "poisoned"
 
 
 class EngineCore:
@@ -335,6 +379,10 @@ class EngineCore:
         self.entry = entry_cls()
         with self._stage("plugin_setup"):
             self.entry.setup(args.plugin_args)
+        self._model_lock = threading.Lock()
+        self._weight_update_lock = threading.Lock()
+        self._weight_update_state = _WeightUpdateState.IDLE
+        self._version = 0
 
         # 9. Finalize kernel choices and attach debugging hooks.
         if self.config.runtime.freeze_kernel_choices:
@@ -399,34 +447,154 @@ class EngineCore:
 
     def step(self, request: Any) -> Any:
         """Run one inference round and flush tensor dumps when enabled."""
-        if self._closed:
-            raise EngineUnavailableError("cannot execute on a closed EngineCore.")
-        if self.entry is None:
-            raise RuntimeError("EngineCore plugin has not been initialized.")
-        result = self.entry.step(request)
-        if self._dumper is not None:
-            self._dumper.flush_pass()
-        return result
+        with self._model_lock:
+            self._require_usable()
+            if self._closed:
+                raise EngineUnavailableError("cannot execute on a closed EngineCore.")
+            assert self.entry is not None
+            result = self.entry.step(request)
+            if self._dumper is not None:
+                self._dumper.flush_pass()
+            return result
+
+    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
+        """Return plugin-specific training state without changing ``step``."""
+        with self._model_lock:
+            self._require_usable()
+            if self._closed:
+                raise EngineUnavailableError("cannot execute on a closed EngineCore.")
+            assert self.entry is not None
+            result = self.entry.rollout_step(request, **kwargs)
+            if self._dumper is not None:
+                self._dumper.flush_pass()
+            return result
+
+    @property
+    def version(self) -> int:
+        """Last fully committed in-memory weight version."""
+        return self._version
+
+    def _require_usable(self) -> None:
+        if self._weight_update_state is _WeightUpdateState.POISONED:
+            raise RuntimeError(
+                "Engine is unavailable after a partially applied weight update; "
+                "recreate it before further inference."
+            )
+
+    def begin_weight_update(self) -> None:
+        """Begin one streamed hot update on the active plugin."""
+        with self._weight_update_lock:
+            if self._closed:
+                raise EngineUnavailableError(
+                    "cannot update weights on a closed EngineCore."
+                )
+            if self._weight_update_state is not _WeightUpdateState.IDLE:
+                self._require_usable()
+                raise RuntimeError("A weight update is already active.")
+            self._model_lock.acquire()
+            try:
+                self._require_usable()
+                assert self.entry is not None
+                self.entry.begin_weight_update()
+                self._weight_update_state = _WeightUpdateState.UPDATING_CLEAN
+            except Exception:
+                self._model_lock.release()
+                raise
+
+    def update_weights(
+        self,
+        weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Forward one named-tensor batch to the active plugin."""
+        with self._weight_update_lock:
+            if self._weight_update_state not in (
+                _WeightUpdateState.UPDATING_CLEAN,
+                _WeightUpdateState.UPDATING_DIRTY,
+            ):
+                raise RuntimeError("begin_weight_update() must be called first.")
+            assert self.entry is not None
+            # An entry may mutate model state before reporting an error, so mark
+            # the session dirty before dispatching the batch.
+            self._weight_update_state = _WeightUpdateState.UPDATING_DIRTY
+            self.entry.update_weights(weights)
+
+    def finish_weight_update(self, version: int | None = None) -> Any:
+        """Finalize an update and commit its version only after validation."""
+        with self._weight_update_lock:
+            if self._weight_update_state not in (
+                _WeightUpdateState.UPDATING_CLEAN,
+                _WeightUpdateState.UPDATING_DIRTY,
+            ):
+                raise RuntimeError("No weight update is active.")
+            try:
+                assert self.entry is not None
+                report = self.entry.finish_weight_update()
+                self._version = self._version + 1 if version is None else int(version)
+                self._weight_update_state = _WeightUpdateState.IDLE
+                return report
+            except Exception:
+                self._weight_update_state = (
+                    _WeightUpdateState.POISONED
+                    if self._weight_update_state is _WeightUpdateState.UPDATING_DIRTY
+                    else _WeightUpdateState.IDLE
+                )
+                raise
+            finally:
+                self._model_lock.release()
+
+    def _abort_weight_update_locked(self) -> None:
+        """Abort an active update while ``_weight_update_lock`` is held."""
+        state = self._weight_update_state
+        if state not in (
+            _WeightUpdateState.UPDATING_CLEAN,
+            _WeightUpdateState.UPDATING_DIRTY,
+        ):
+            return
+        try:
+            assert self.entry is not None
+            self.entry.abort_weight_update()
+        finally:
+            self._weight_update_state = (
+                _WeightUpdateState.POISONED
+                if state is _WeightUpdateState.UPDATING_DIRTY
+                else _WeightUpdateState.IDLE
+            )
+            self._model_lock.release()
+
+    def abort_weight_update(self) -> None:
+        """Abort bookkeeping for the active plugin update."""
+        with self._weight_update_lock:
+            self._abort_weight_update_locked()
 
     def close(self) -> None:
         """Release plugin resources and process-level runtime services."""
-        if self._closed:
-            return
-        self._closed = True
         close_error: BaseException | None = None
-        if self._dumper is not None:
+        with self._weight_update_lock:
+            if self._closed:
+                return
+            self._closed = True
             try:
-                self._dumper.detach()
-            except BaseException as error:
+                self._abort_weight_update_locked()
+            except BaseException as error:  # noqa: BLE001
                 close_error = error
-            self._dumper = None
-        if self.entry is not None:
-            try:
-                self.entry.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-            self.entry = None
+            self._model_lock.acquire()
+        try:
+            if self._dumper is not None:
+                try:
+                    self._dumper.detach()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+                self._dumper = None
+            if self.entry is not None:
+                try:
+                    self.entry.close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+                self.entry = None
+        finally:
+            self._model_lock.release()
         try:
             # Release the collective backends P.init built (direct NCCL
             # communicators, bootstrap groups, the mesh/dispatcher
@@ -543,6 +711,68 @@ class Engine:
         if self._closed:
             raise EngineUnavailableError("cannot execute on a closed Engine.")
         return self._dispatcher.step(request)
+
+    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
+        """Run a training rollout on the local core."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        if self._core is None:
+            raise EngineUnavailableError(
+                "rollout_step requires an inline or single external core."
+            )
+        return self._core.rollout_step(request, **kwargs)
+
+    @property
+    def version(self) -> int:
+        """Return the last committed local weight version."""
+        if self._core is None:
+            raise EngineUnavailableError(
+                "weight versions require an inline or single external core."
+            )
+        return self._core.version
+
+    def begin_weight_update(self) -> None:
+        """Begin a streamed hot update on the local core."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        if self._core is None:
+            raise EngineUnavailableError(
+                "weight updates require an inline or single external core."
+            )
+        self._core.begin_weight_update()
+
+    def update_weights(
+        self,
+        weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Apply one named-tensor batch to the local core."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        if self._core is None:
+            raise EngineUnavailableError(
+                "weight updates require an inline or single external core."
+            )
+        self._core.update_weights(weights)
+
+    def finish_weight_update(self, version: int | None = None) -> Any:
+        """Finalize a streamed update on the local core."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        if self._core is None:
+            raise EngineUnavailableError(
+                "weight updates require an inline or single external core."
+            )
+        return self._core.finish_weight_update(version=version)
+
+    def abort_weight_update(self) -> None:
+        """Abort a streamed update on the local core."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        if self._core is None:
+            raise EngineUnavailableError(
+                "weight updates require an inline or single external core."
+            )
+        self._core.abort_weight_update()
 
     def setup(self) -> None:
         """Ensure a managed worker group is started; inline engines are ready."""

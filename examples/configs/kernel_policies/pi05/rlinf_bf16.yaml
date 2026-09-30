@@ -1,4 +1,4 @@
-# RLinf PI0.5 BF16 kernel policy.
+# RLinf PI0.5 BF16 compatibility policy.
 #
 # Model semantics:
 # - RLinf calls exact F.gelu in SigLIP and Gemma. The rules below select the
@@ -9,12 +9,13 @@
 #   path uses a TF32 GEMM. Softmax runs in fp32, then its output is cast to bf16
 #   for the value einsum.
 # - PhyAI uses paged bf16 attention. It implements the same attention operation
-#   with different rounding, so this policy does not override attention.
+#   with different rounding. FA2 is pinned for both prefix and expert paged
+#   attention so rollout training uses one stable kernel across engine versions.
 # - RLinf uses torch.compile to fuse exact GELU and the gate multiply. PhyAI
 #   uses the FlashInfer exact GELU kernel.
 # - RMSNorm reduction order, compiled RoPE, and GEMM selection add smaller
 #   numerical differences.
-# - The ten Euler updates can amplify these differences.
+# - Repeated Euler updates can amplify these differences.
 #
 # Author: chenghua.wang
 
@@ -24,6 +25,13 @@ defaults:
   fallback: error
 
 overrides:
+  - id: pi05-rlinf-paged-fa2
+    priority: 100
+    match:
+      op: attention_paged
+      model.family: pi05
+    use: flashinfer.attention_paged.fa2
+
   - id: pi05-rlinf-exact-geglu
     priority: 100
     match:

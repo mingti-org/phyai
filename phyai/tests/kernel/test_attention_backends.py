@@ -254,13 +254,21 @@ def test_rule_params_reach_the_pinned_row_and_only_the_pinned_row():
 
 
 # --------------------------------------------------------------------------- #
-# the optional pi0.5 policy example
+# optional pi0.5 policies
 # --------------------------------------------------------------------------- #
 
 #: Models do not load this file automatically. A user may select it through
 #: PHYAI_KERNEL_CONFIG; otherwise the catalog priority order is the fallback.
 PI05_EXAMPLE_POLICY = (
     Path(__file__).parents[3] / "examples" / "pi05" / "kernel_policy.yaml"
+)
+PI05_RLINF_BF16_POLICY = (
+    Path(__file__).parents[3]
+    / "examples"
+    / "configs"
+    / "kernel_policies"
+    / "pi05"
+    / "rlinf_bf16.yaml"
 )
 
 
@@ -302,6 +310,24 @@ def test_pi05_example_policy_pins_the_expert_on_sm90_and_nothing_else():
             other_device.select(_query("attention_paged", role="expert")).kernel_id
             == "flashinfer.attention_paged"
         )
+
+
+def test_pi05_rlinf_policy_pins_all_paged_attention_to_fa2():
+    """The RL rollout policy keeps prefix and expert kernels stable."""
+    policy = load_policy(PI05_RLINF_BF16_POLICY, build_catalog())
+    pi05 = _selector("nvidia:SM90", policy, model=ModelContext(family="pi05"))
+
+    for role in ("prefix", "expert"):
+        assert (
+            pi05.select(_query("attention_paged", role=role)).kernel_id
+            == "flashinfer.attention_paged.fa2"
+        )
+
+    other_model = _selector("nvidia:SM90", policy, model=ModelContext(family="cosmos3"))
+    assert (
+        other_model.select(_query("attention_paged", role="expert")).kernel_id
+        == "flashinfer.attention_paged"
+    )
 
 
 def test_fa2_row_raises_the_workspace_floor_and_the_old_env_var_names_the_rule():

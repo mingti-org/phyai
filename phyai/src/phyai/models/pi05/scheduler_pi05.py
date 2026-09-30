@@ -11,8 +11,9 @@ The scheduler is the model-side entry point for PI0.5 inference. It owns:
 
 A single ``step()`` call runs the full inference: vision tower per
 camera-stack (replayed once per real robot), prefix forward writing K/V
-into the pool, then a 10-step Euler loop reading those K/V plus the
-freshly-computed suffix K/V.
+into the pool, then the configured Euler loop reading those K/V plus the
+freshly-computed suffix K/V. ``rollout_step()`` reuses the prefix path and
+returns trajectory data for RL training.
 
 Multi-batch support — fixed ``max_batch_size`` at construction; each
 ``step()`` accepts any ``B ∈ [1, max_batch_size]``. Smaller batches pad
@@ -50,17 +51,20 @@ from phyai.models.pi05.model_runner_pi05 import (
     PI05LLMRunner,
     PI05VisionRunner,
 )
-from phyai.models.pi05.modeling_pi05 import PI05Model
+from phyai.models.pi05.modeling_pi05 import PI05Model, value_from_prefix
 from phyai.models.pi05.forward_batch_pi05 import (
     LLMForwardBatch,
     VisionForwardBatch,
 )
 from phyai.runtime.schedule import Scheduler
+from phyai.utils import get_logger
 from phyai.utils.profile import event_scope
+
+logger = get_logger(__name__)
 
 
 # ============================================================================ #
-# Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
+# Batch-layout helpers — pi0.5 specific, shared by step() and rollout_step(). #
 # ============================================================================ #
 
 
@@ -69,16 +73,15 @@ class PI05Request:
     """One pi0.5 inference request — canonical, already-preprocessed tensors.
 
     ``phyai`` is strict about inputs: image resize/normalize, tokenization, and
-    state discretization happen in the caller's processor
-    (``phyai_utils_tools.models.pi05.PI05Processor``), **not** here. The
-    scheduler accepts only the canonical tensors that processor produces:
+    state discretization happen in the caller's preprocessing pipeline, **not**
+    here. The scheduler accepts only the resulting canonical tensors:
 
     ``pixel_values`` is the stacked camera tensor
     ``(B, num_images, C, image_size, image_size)`` — already resized to the
-    SigLIP grid, on the model device/dtype. ``num_images`` is fixed at scheduler
-    construction; ``B`` may be any value in ``[1, max_batch_size]`` (the
-    scheduler pads up internally). H/W must equal ``image_size`` (validated; no
-    resize is performed).
+    SigLIP grid. The scheduler moves it to the model device as float32 for the
+    vision stem. ``num_images`` is fixed at scheduler construction; ``B`` may
+    be any value in ``[1, max_batch_size]`` (the scheduler pads up internally).
+    H/W must equal ``image_size`` (validated; no resize is performed).
 
     ``input_ids`` is the padded language-token tensor (``(B,
     tokenizer_max_length)`` int64); ``lang_lens`` carries the
@@ -96,20 +99,53 @@ class PI05Request:
 
 
 @dataclass
+class PI05RolloutRequest(PI05Request):
+    """Trajectory execution request with a caller-defined sigma schedule.
+
+    The canonical model inputs are inherited from :class:`PI05Request`.
+    ``noise`` and ``step_noise`` are optional deterministic inputs. Policy-level
+    choices such as the sigma schedule and output reduction belong to the caller.
+    """
+
+    step_noise: torch.Tensor | None = None
+    sigmas: torch.Tensor | None = None
+    compute_values: bool = False
+
+
+@dataclass
+class PI05RolloutOutput:
+    """Raw model-space execution results produced by :meth:`rollout_step`.
+
+    ``actions`` is ``(B, chunk, action_dim)``, ``chains`` is
+    ``(B, num_steps + 1, chunk, action_dim)``, and ``transition_logprobs`` is
+    ``(B, num_steps, chunk, action_dim)``. ``raw_values`` is ``None`` when
+    not requested, ``(B, 1)`` for prefix values, or ``(B, num_steps)`` for
+    suffix values. Any policy-specific reduction remains the caller's
+    responsibility.
+    """
+
+    actions: torch.Tensor
+    chains: torch.Tensor
+    transition_logprobs: torch.Tensor
+    raw_values: torch.Tensor | None
+
+
+@dataclass
 class _PI05Layout:
     """Per-``(actual_B, lang_lens)`` attention layout, cached across steps.
 
     Everything here depends only on the batch shape and the per-sample
     real lengths — not on the image/text *values* — so for a fixed
-    request shape it is identical on every ``step()`` and across the 10
+    request shape it is identical on every ``step()`` and across all
     Euler steps. Building it once and reusing it eliminates the
     per-step metadata rebuild and (more importantly) the host↔device
     syncs that used to serialize the pipeline (``int(real_lens.sum())``,
     ``int(cu_full[-1])``, the ``lang_lens.tolist()`` pack loop).
 
-    ``lang_mask`` is the ``(max_B, tokenizer_max_length)`` bool mask used
-    by the vectorized prefix pack (real lang positions True, padding
-    False). ``n_real_total`` is the host-side count of real prefix tokens.
+    ``lang_mask`` is the per-bucket bool mask used by the vectorized prefix
+    pack. ``prefix_mask`` extends it with valid image tokens and is the exact
+    mask used by prefix value pooling. ``n_real_total`` is
+    the host-side count of real prefix tokens.
     """
 
     n_real_total: int
@@ -117,6 +153,7 @@ class _PI05Layout:
     position_ids: torch.Tensor
     write_indices: torch.Tensor
     lang_mask: torch.Tensor
+    prefix_mask: torch.Tensor
     prefix_meta: PagedAttnMetadata
     joint_meta: PagedAttnMetadata
 
@@ -132,6 +169,7 @@ class PI05Scheduler(Scheduler):
         num_images: int = 3,
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
+        capture_rollout: bool = False,
     ) -> None:
         cfg: PI05Config = model.config
         if device is None:
@@ -233,7 +271,10 @@ class PI05Scheduler(Scheduler):
             max_action_dim=cfg.max_action_dim,
             params_dtype=self.params_dtype,
             device=self.device,
+            suffix_value_head=(model.value_head if not cfg.value_after_vlm else None),
+            critic_action_chunk=cfg.critic_action_chunk,
             use_cuda_graph=use_cuda_graph,
+            capture_rollout=capture_rollout,
             max_paged_kv_indices=self.max_batch_size
             * (self.n_per_sample + cfg.chunk_size),
         )
@@ -274,14 +315,14 @@ class PI05Scheduler(Scheduler):
         self.vision_runner.setup()
         self.llm_runner.setup(self._n_per_sample_buckets)
 
-        # Precompute the time-embedding table for the linear flow-matching
-        # schedule ``t = 1.0 + step * (-1/N)``. ``embed_time`` is the full
+        # Precompute the time-embedding table for the canonical flow-matching
+        # schedule spanning 1.0 to 1.0 / N. ``embed_time`` is the full
         # MLP (sinusoidal -> Linear -> SiLU -> Linear -> SiLU); its output
         # depends only on the time scalar and the time-MLP weights, both
         # fixed across inferences, so a one-time precompute keeps those
         # matmuls out of the captured Euler loop.
         N = self.cfg.num_inference_steps
-        ts = 1.0 + torch.arange(N, dtype=torch.float32, device=self.device) * (-1.0 / N)
+        ts = torch.linspace(1.0, 1.0 / N, N, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
         # Bind the schedule before the expert runner captures: its graph
@@ -308,23 +349,45 @@ class PI05Scheduler(Scheduler):
         # reads in-graph must already be bound above.
         self.expert_runner.setup()
 
-    # ------------------------------------------------------------------ #
-    # Step (one inference)                                               #
-    # ------------------------------------------------------------------ #
-
     @torch.no_grad()
-    def step(self, request: PI05Request) -> torch.Tensor:
-        """Run one inference; return the action chunk ``(actual_B, chunk, action_dim)``.
+    def refresh_weight_dependent_state(self) -> None:
+        """Refresh weight-dependent time/AdaRMS state after a hot update.
 
-        ``actual_B`` is ``request.pixel_values.shape[0]`` and may be any
-        value in ``[1, max_batch_size]``. The internal forward passes
-        run at the full ``max_batch_size`` shape (constant captured
-        graphs); the padded tail is sliced off before returning.
+        Captured expert execution must observe the refreshed state.
         """
+        num_steps = self.cfg.num_inference_steps
+        times = torch.linspace(
+            1.0,
+            1.0 / num_steps,
+            num_steps,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        updated_time_embeddings = self.model.heads.embed_time(times).contiguous()
+        if self.time_emb_table is not None:
+            self.time_emb_table.copy_(updated_time_embeddings)
+        else:
+            self.time_emb_table = updated_time_embeddings
+
+        self.expert_runner.bind_euler_schedule(
+            self.time_emb_table,
+            dt=-1.0 / num_steps,
+            num_steps=num_steps,
+        )
+        if self.expert_runner.recapture_after_weight_update():
+            logger.info(
+                "Recaptured PI05 expert CUDA graph after hot weight update.",
+            )
+
+    # ------------------------------------------------------------------ #
+    # Prefix preparation (shared by inference and rollout)               #
+    # ------------------------------------------------------------------ #
+
+    def _prepare_prefix(self, request: PI05Request) -> tuple[torch.Tensor, _PI05Layout]:
+        """Populate prefix K/V and plan expert attention."""
         cfg = self.cfg
         device = self.device
         dtype = self.params_dtype
-        self._validate(request)
 
         actual_B = int(request.pixel_values.shape[0])
         max_B = self.max_batch_size
@@ -332,7 +395,7 @@ class PI05Scheduler(Scheduler):
         # Resolve the attention layout for this request shape. It depends
         # only on (actual_B, per-sample real lengths) — not on the image /
         # text values — so a fixed request shape hits the cache on every
-        # step and across all 10 Euler steps. Reading ``lang_lens`` to the
+        # step and across all Euler steps. Reading ``lang_lens`` to the
         # host (one tiny sync for the key) replaces the several large syncs
         # the per-step rebuild used to incur; a cache hit rebuilds nothing.
         lang_lens_cpu = tuple(int(x) for x in request.lang_lens.tolist())
@@ -418,7 +481,9 @@ class PI05Scheduler(Scheduler):
                 position_ids=layout.position_ids,
                 write_indices=layout.write_indices,
             )
-            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
+            prefix_out = self.llm_runner.forward(
+                llm_batch, n_per_sample=layout.n_per_sample
+            )
 
         # 5. Plan the expert joint-attention metadata — same gating as the
         # prefix: only re-plan when the layout changed.
@@ -427,7 +492,30 @@ class PI05Scheduler(Scheduler):
                 self.expert_runner.plan_inference(layout.joint_meta)
         self._last_layout_key = key
 
-        # 6. Sample noise (or use the user's, padded) and run the whole
+        return prefix_out, layout
+
+    # ------------------------------------------------------------------ #
+    # Step (one inference)                                               #
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def step(self, request: PI05Request) -> torch.Tensor:
+        """Run one inference; return the action chunk ``(actual_B, chunk, action_dim)``.
+
+        ``actual_B`` is ``request.pixel_values.shape[0]`` and may be any
+        value in ``[1, max_batch_size]``. The internal forward passes
+        run at the full ``max_batch_size`` shape (constant captured
+        graphs); the padded tail is sliced off before returning.
+        """
+        cfg = self.cfg
+        device = self.device
+        self._validate(request)
+
+        actual_B = int(request.pixel_values.shape[0])
+        max_B = self.max_batch_size
+        self._prepare_prefix(request)
+
+        # Sample noise (or use the user's, padded) and run the whole
         # Euler loop as one captured-graph replay. The expert runner
         # unrolls all N denoise steps internally — reading the bound
         # time-embedding table in-graph and applying ``x_t <- x_t + dt*v_t``
@@ -461,6 +549,105 @@ class PI05Scheduler(Scheduler):
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
         return x_t[:actual_B].clone()
+
+    @torch.no_grad()
+    def rollout_step(self, request: PI05RolloutRequest) -> PI05RolloutOutput:
+        """Execute a trajectory under the caller's sigma schedule.
+
+        Gaussian inputs are sampled internally unless supplied for deterministic
+        comparison. Policy-specific output reduction remains with the caller.
+        """
+        self._validate(request)
+        actual_B = int(request.pixel_values.shape[0])
+        request_sigmas = self._validate_rollout(request, actual_B)
+        prefix_out, layout = self._prepare_prefix(request)
+
+        prefix_values = None
+        if request.compute_values and self.cfg.value_after_vlm:
+            assert self.model.value_head is not None  # checked by validation
+            with event_scope("pi05.prefix_value"):
+                prefix_out_3d = prefix_out.view(
+                    self.max_batch_size, layout.n_per_sample, -1
+                )
+                prefix_values = value_from_prefix(
+                    self.model.value_head,
+                    prefix_out_3d[:actual_B],
+                    layout.prefix_mask[:actual_B],
+                )
+
+        cfg = self.cfg
+        noise = torch.zeros(
+            self.max_batch_size,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if request.noise is None:
+            noise[:actual_B] = torch.randn(
+                actual_B,
+                cfg.chunk_size,
+                cfg.max_action_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            noise[:actual_B] = request.noise.to(device=self.device, dtype=torch.float32)
+        step_noise = torch.zeros(
+            self.max_batch_size,
+            cfg.num_inference_steps,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if request.step_noise is None:
+            step_noise[:actual_B] = torch.stack(
+                [
+                    torch.randn(
+                        actual_B,
+                        cfg.chunk_size,
+                        cfg.max_action_dim,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    for _ in range(cfg.num_inference_steps)
+                ],
+                dim=1,
+            )
+        else:
+            step_noise[:actual_B] = request.step_noise.to(
+                device=self.device, dtype=torch.float32
+            )
+        sigmas = torch.zeros(
+            self.max_batch_size,
+            cfg.num_inference_steps,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        sigmas[:actual_B] = request_sigmas.to(device=self.device, dtype=torch.float32)
+        with event_scope("pi05.expert_rollout_loop"):
+            actions, chains, transition_logprobs, step_values = (
+                self.expert_runner.forward_rollout(noise, step_noise, sigmas)
+            )
+
+        if request.compute_values:
+            if self.cfg.value_after_vlm:
+                assert prefix_values is not None
+                values = prefix_values[:, None]
+            else:
+                values = step_values[:actual_B]
+        else:
+            values = None
+
+        # Clone every graph-backed result before a subsequent replay can
+        # overwrite its static output buffers.
+        return PI05RolloutOutput(
+            actions=actions[:actual_B].clone(),
+            chains=chains[:actual_B].clone(),
+            transition_logprobs=transition_logprobs[:actual_B].clone(),
+            raw_values=None if values is None else values.clone(),
+        )
 
     # ------------------------------------------------------------------ #
     # Layout build + pack (cached, sync-free)                            #
@@ -517,6 +704,9 @@ class PI05Scheduler(Scheduler):
         lang_mask = (
             torch.arange(lang_bucket, device=device)[None, :] < lang_lens_t[:, None]
         )
+        prefix_mask = torch.zeros(max_B, n_ps, dtype=torch.bool, device=device)
+        prefix_mask[:actual_B, :n_img] = True
+        prefix_mask[:, n_img:] = lang_mask
 
         # --- Prefix (LLM self-attention) layout ---
         cu_q_prefix = torch.arange(
@@ -594,6 +784,7 @@ class PI05Scheduler(Scheduler):
             position_ids=position_ids,
             write_indices=write_indices,
             lang_mask=lang_mask,
+            prefix_mask=prefix_mask,
             prefix_meta=prefix_meta,
             joint_meta=joint_meta,
         )
@@ -633,6 +824,35 @@ class PI05Scheduler(Scheduler):
     # Validation                                                         #
     # ------------------------------------------------------------------ #
 
+    def _validate_rollout(self, req: PI05RolloutRequest, actual_B: int) -> torch.Tensor:
+        """Validate rollout execution tensors supplied by the caller."""
+        cfg = self.cfg
+        if req.sigmas is None:
+            raise ValueError("rollout execution requires caller-provided sigmas.")
+        if req.compute_values and self.model.value_head is None:
+            raise ValueError(
+                "compute_values=True requires PI05Config(add_value_head=True)."
+            )
+        expected_step_noise = (
+            actual_B,
+            cfg.num_inference_steps,
+            cfg.chunk_size,
+            cfg.max_action_dim,
+        )
+        if req.step_noise is not None and req.step_noise.shape != expected_step_noise:
+            raise ValueError(
+                f"step_noise shape {tuple(req.step_noise.shape)} != "
+                f"(B, num_steps, chunk_size, max_action_dim)="
+                f"{expected_step_noise}."
+            )
+        expected_sigmas = (actual_B, cfg.num_inference_steps)
+        if req.sigmas.shape != expected_sigmas:
+            raise ValueError(
+                f"sigmas shape {tuple(req.sigmas.shape)} != "
+                f"(B, num_steps)={expected_sigmas}."
+            )
+        return req.sigmas
+
     def _validate(self, req: PI05Request) -> None:
         """Strictly validate the canonical request tensors.
 
@@ -641,7 +861,7 @@ class PI05Scheduler(Scheduler):
         ``(B, num_images, C, image_size, image_size)``; this checks the camera
         count, H/W, batch-dim bound, and that the text / noise tensors agree
         with the batch size. Resizing non-square inputs is the caller's
-        processor's job (``phyai_utils_tools.models.pi05.PI05Processor``).
+        preprocessing responsibility.
         """
         cfg = self.cfg
         if req.pixel_values.dim() != 5:
@@ -667,7 +887,7 @@ class PI05Scheduler(Scheduler):
             raise ValueError(
                 f"pixel_values H/W {tuple(req.pixel_values.shape[-2:])} != "
                 f"(image_size, image_size)=({cfg.vision.image_size}, "
-                f"{cfg.vision.image_size}). Resize in the caller's processor."
+                f"{cfg.vision.image_size}). Resize in caller preprocessing."
             )
         if req.input_ids.shape != (actual_B, cfg.tokenizer_max_length):
             raise ValueError(
@@ -691,4 +911,9 @@ class PI05Scheduler(Scheduler):
             )
 
 
-__all__ = ["PI05Request", "PI05Scheduler"]
+__all__ = [
+    "PI05Request",
+    "PI05RolloutOutput",
+    "PI05RolloutRequest",
+    "PI05Scheduler",
+]

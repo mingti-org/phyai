@@ -42,6 +42,17 @@ def test_conv2d_compute_dtype_preserves_parameter_storage() -> None:
     assert layer._compute_bias is not None
     assert layer._compute_weight.dtype == torch.float32
     assert layer._compute_bias.dtype == torch.float32
+
+    compute_weight_ptr = layer._compute_weight.data_ptr()
+    compute_bias_ptr = layer._compute_bias.data_ptr()
+    layer.weight.copy_(torch.randn_like(layer.weight))
+    layer.bias.copy_(torch.randn_like(layer.bias))
+    layer.post_load()
+    assert layer._compute_weight.data_ptr() == compute_weight_ptr
+    assert layer._compute_bias.data_ptr() == compute_bias_ptr
+    torch.testing.assert_close(layer._compute_weight, layer.weight.float())
+    torch.testing.assert_close(layer._compute_bias, layer.bias.float())
+
     assert "_compute_weight" not in layer.state_dict()
     assert "_compute_bias" not in layer.state_dict()
     assert actual.dtype == torch.float32

@@ -130,6 +130,33 @@ uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi0.5
 
 The script prints per-phase latency stats (mean / median / std / min / max over 3 warmups + 30 timed runs) and a `PASS` line for the equivalence check. Just change the path after `--checkpoint` to your local checkpoint path.
 
+# Training rollout integration
+
+An external RL controller can request diffusion trajectories and replace the in-memory actor weights without rebuilding the engine. Initialize the engine from a complete checkpoint and construct `PI05Args` with `capture_rollout=True`. Training updates may then contain only the parameters selected by the controller.
+
+The controller owns the update transaction:
+
+```python
+engine.begin_weight_update()
+try:
+    for weight_batch in actor_weight_batches:
+        engine.update_weights(weight_batch)
+    engine.finish_weight_update(version=actor_version)
+except Exception:
+    engine.abort_weight_update()
+    raise
+
+rollout = engine.rollout_step(request)
+```
+
+Each `weight_batch` maps HuggingFace parameter names to tensors. Every completed update refreshes weight-dependent scheduler state and recaptures the rollout graph. `rollout_step` accepts `PI05RolloutRequest` and returns `PI05RolloutOutput` with actions, the denoising chain, per-transition log probabilities, and optional values. The request must provide `sigmas`; `noise` and `step_noise` are optional deterministic inputs and are sampled internally when omitted.
+
+The RLinf BF16 integration uses the optional compatibility policy at `examples/configs/kernel_policies/pi05/rlinf_bf16.yaml`. Select it explicitly through the controller configuration or `PHYAI_KERNEL_CONFIG`; PI0.5 does not load this policy by default.
+
+<Warning>
+  Do not run inference after a partially applied update fails. `Engine` marks that instance unavailable because its parameters may contain a mixture of versions. Abort the transaction and recreate the engine.
+</Warning>
+
 # Current limitations
 
 - Single GPU only. Tensor parallel, continuous batching, and preemption are all out of scope for `PI05Scheduler`.

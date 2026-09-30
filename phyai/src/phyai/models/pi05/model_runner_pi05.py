@@ -28,6 +28,8 @@ from phyai.models.pi05.modeling_pi05 import (
     PI05VisionTower,
     ExpertModulationTables,
     PaliGemmaLanguageModel,
+    PI05ValueHead,
+    value_from_suffix,
 )
 from phyai.runtime.cuda_graph_manager import CudaGraph
 
@@ -178,8 +180,9 @@ class PI05LLMRunner(ModelRunner):
     :meth:`replay_metadata` (graph) or
     :meth:`init_forward_metadata` (non-cuda-graph path).
 
-    Returns ``None`` from :meth:`forward` — the cache pool side-effect
-    is the only output the scheduler consumes.
+    :meth:`forward` returns the final prefix hidden states in addition to the
+    cache-pool side effect. Prefix-value rollout consumes those states; normal
+    inference simply ignores them.
     """
 
     def __init__(
@@ -383,12 +386,14 @@ class PI05LLMRunner(ModelRunner):
 
     def forward(
         self, batch: LLMForwardBatch, *, n_per_sample: int | None = None
-    ) -> None:
-        """Run the prefix forward for the given prefix-length bucket.
+    ) -> torch.Tensor:
+        """Run the prefix forward and return flattened final hidden states.
 
         ``n_per_sample`` selects which captured graph to replay (the
         scheduler builds ``batch`` at that bucket's length). ``None`` uses
-        the largest bucket. Ignored in the non-cuda-graph path.
+        the largest bucket. Ignored in the non-cuda-graph path. A captured
+        output aliases graph-static storage and must be consumed before the
+        next replay of the same bucket.
         """
         if self.use_cuda_graph and self.graphs:
             n_ps = n_per_sample if n_per_sample is not None else self.n_per_sample
@@ -398,21 +403,19 @@ class PI05LLMRunner(ModelRunner):
                     f"no captured LLM graph for n_per_sample={n_ps}; "
                     f"captured buckets: {sorted(self.graphs)}."
                 )
-            graph.replay(
+            return graph.replay(
                 {
                     "hidden_states": batch.hidden_states,
                     "position_ids": batch.position_ids,
                     "write_indices": batch.write_indices,
                 }
             )
-            return None
         # Non-cuda-graph path.
-        self._fwd(
+        return self._fwd(
             hidden_states=batch.hidden_states,
             position_ids=batch.position_ids,
             write_indices=batch.write_indices,
         )
-        return None
 
 
 # ============================================================================ #
@@ -460,7 +463,10 @@ class PI05ExpertRunner(ModelRunner):
         max_action_dim: int,
         params_dtype: torch.dtype,
         device: torch.device | str,
+        suffix_value_head: PI05ValueHead | None = None,
+        critic_action_chunk: int | None = None,
         use_cuda_graph: bool = True,
+        capture_rollout: bool = False,
         max_paged_kv_indices: int | None = None,
     ) -> None:
         self.expert_stack = expert_stack
@@ -473,6 +479,8 @@ class PI05ExpertRunner(ModelRunner):
         self.expert_hidden = int(heads.expert_hidden)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
+        self.suffix_value_head = suffix_value_head
+        self.critic_action_chunk = critic_action_chunk
         self.attn_proto: PagedAttention = _diffusion_attn_proto(expert_stack.layers)
         self.num_heads = self.attn_proto.num_heads
         self.num_kv_heads = self.attn_proto.num_kv_heads
@@ -516,9 +524,11 @@ class PI05ExpertRunner(ModelRunner):
             and self.attn_backend.supports_capture()
             and self.device.type == "cuda"
         )
+        self.capture_rollout = bool(capture_rollout)
 
         self._capture_plan: PagedAttnPlanHandle | None = None
         self.graph: CudaGraph | None = None
+        self.rollout_graph: CudaGraph | None = None
 
         # Euler schedule, bound by the scheduler via ``bind_euler_schedule``
         # *before* ``setup()``. The captured graph unrolls all
@@ -526,6 +536,7 @@ class PI05ExpertRunner(ModelRunner):
         # ``time_emb_table[step]`` in-graph (a constant lookup), so the
         # whole flow-matching loop is one replay instead of N.
         self._time_emb_table: torch.Tensor | None = None
+        self._timesteps: torch.Tensor | None = None
         self._dt: float = 0.0
         self._num_steps: int = 0
 
@@ -568,6 +579,23 @@ class PI05ExpertRunner(ModelRunner):
                 f"num_steps={num_steps}."
             )
         self._time_emb_table = time_emb_table
+        self._timesteps = torch.linspace(
+            1.0,
+            1.0 / num_steps,
+            num_steps,
+            dtype=torch.float32,
+            device=time_emb_table.device,
+        )
+        self._timesteps = torch.cat(
+            [
+                self._timesteps,
+                torch.zeros(
+                    1,
+                    dtype=torch.float32,
+                    device=time_emb_table.device,
+                ),
+            ]
+        )
         self._dt = float(dt)
         self._num_steps = int(num_steps)
         self._build_modulation_tables()
@@ -629,7 +657,38 @@ class PI05ExpertRunner(ModelRunner):
             self._capture_plan = self.attn_backend.init_capture_metadata(
                 self._capture_seed_metadata()
             )
+            if self.capture_rollout:
+                self._capture_rollout_graph()
+            else:
+                self._capture_graph()
+
+    def recapture_after_weight_update(self) -> bool:
+        """Rebuild expert graphs after their trainable weights change.
+
+        Vision and language-prefix graphs remain valid when an update changes
+        only the action expert and action/time heads.
+        """
+        had_inference_graph = self.graph is not None
+        had_rollout_graph = self.rollout_graph is not None
+        if not had_inference_graph and not had_rollout_graph:
+            return False
+
+        torch.cuda.synchronize(self.device)
+        if self.graph is not None:
+            self.graph.reset()
+            self.graph = None
+        if self.rollout_graph is not None:
+            self.rollout_graph.reset()
+            self.rollout_graph = None
+
+        self._capture_plan = self.attn_backend.init_capture_metadata(
+            self._capture_seed_metadata()
+        )
+        if had_inference_graph:
             self._capture_graph()
+        if had_rollout_graph:
+            self._capture_rollout_graph()
+        return True
 
     def _capture_seed_metadata(self) -> PagedAttnMetadata:
         # cu_q is fixed [0, chunk, 2*chunk, ...] across all inferences.
@@ -683,6 +742,34 @@ class PI05ExpertRunner(ModelRunner):
         self.graph = CudaGraph()
         self.graph.capture(self._fwd_loop, example)
 
+    def _capture_rollout_graph(self) -> None:
+        """Capture rollout with random inputs staged outside the graph."""
+        example = {
+            "noise": torch.zeros(
+                self.batch_size,
+                self.chunk_size,
+                self.max_action_dim,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "step_noise": torch.zeros(
+                self.batch_size,
+                self._num_steps,
+                self.chunk_size,
+                self.max_action_dim,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "sigmas": torch.zeros(
+                self.batch_size,
+                self._num_steps,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+        }
+        self.rollout_graph = CudaGraph()
+        self.rollout_graph.capture(self._fwd_rollout_loop, example)
+
     # ------------------------------------------------------------------ #
     # Forward path                                                       #
     # ------------------------------------------------------------------ #
@@ -691,8 +778,8 @@ class PI05ExpertRunner(ModelRunner):
         self,
         x_t: torch.Tensor,
         step: int,
-    ) -> torch.Tensor:
-        """One Euler denoise step: ``embed_action -> 18 layers -> project``.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one expert step and return velocity plus raw suffix features.
 
         ``step`` selects this step's AdaRMS modulation from the runner-held
         tables (built in :meth:`bind_euler_schedule`) and hands it to the
@@ -701,7 +788,7 @@ class PI05ExpertRunner(ModelRunner):
         """
         assert self._mod_tables is not None  # built in bind_euler_schedule()
         # RLinf keeps the Euler state in fp32 and casts only the model input to
-        # the embedding dtype. This avoids ten rounds of bf16 update error.
+        # the embedding dtype. This avoids repeated bf16 update error.
         action_emb = self.heads.embed_action(x_t.to(self.params_dtype))
         suffix_h = action_emb.reshape(self.batch_size * self.chunk_size, -1)
         ctx = PagedAttnCtx(
@@ -721,7 +808,19 @@ class PI05ExpertRunner(ModelRunner):
             modulation=self._mod_tables.step(step),
         )
         suffix_out_3d = suffix_out.view(self.batch_size, self.chunk_size, -1)
-        return self.heads.project_action(suffix_out_3d)
+        return self.heads.project_action(suffix_out_3d), suffix_out_3d
+
+    def _compute_suffix_value(self, suffix_out: torch.Tensor) -> torch.Tensor:
+        """Pool one step's suffix and run the configured value head."""
+        if self.suffix_value_head is None:
+            return torch.zeros(
+                self.batch_size, dtype=torch.float32, device=suffix_out.device
+            )
+        return value_from_suffix(
+            self.suffix_value_head,
+            suffix_out,
+            action_chunk=self.critic_action_chunk,
+        )
 
     def _fwd_loop(self, *, noise: torch.Tensor) -> torch.Tensor:
         """Run the full ``num_steps``-step Euler loop, returning final ``x_t``.
@@ -736,9 +835,70 @@ class PI05ExpertRunner(ModelRunner):
         assert self._time_emb_table is not None  # bound in setup()
         x_t = noise
         for step in range(self._num_steps):
-            v_t = self._one_step(x_t, step)
+            v_t, _ = self._one_step(x_t, step)
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
         return x_t
+
+    def _fwd_rollout_loop(
+        self,
+        *,
+        noise: torch.Tensor,
+        step_noise: torch.Tensor,
+        sigmas: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run stochastic flow sampling and retain the trajectory.
+
+        ``sigmas[:, step]`` is the SDE sigma before multiplication by
+        ``sqrt(delta)``. A zero sigma gives the ordinary Euler ODE update.
+        The returned transition log probabilities are per denoise step and
+        per action element; the caller owns any policy-specific reduction.
+        """
+        x_t = noise
+        chains = [x_t]
+        log_probs = []
+        values = []
+        assert self._timesteps is not None
+
+        for step in range(self._num_steps):
+            t = self._timesteps[step]
+            delta = t - self._timesteps[step + 1]
+            sqrt_delta = torch.sqrt(delta)
+            v_t, suffix_out = self._one_step(x_t, step)
+            v_t = v_t.to(torch.float32)
+            values.append(self._compute_suffix_value(suffix_out))
+
+            x0_pred = x_t - v_t * t
+            x1_pred = x_t + v_t * (1.0 - t)
+            sigma = sigmas[:, step, None, None]
+            x0_weight = 1.0 - (t - delta)
+            x1_weight = t - delta - sigma.square() * delta / (2.0 * t)
+            mean = x0_pred * x0_weight + x1_pred * x1_weight
+            std = sigma * sqrt_delta
+            x_t = mean + step_noise[:, step] * std
+
+            sample = x_t.to(torch.float32)
+            mean = mean.to(torch.float32)
+            std = std.to(torch.float32)
+            zero_std = std == 0
+            safe_std = torch.where(zero_std, torch.ones_like(std), std)
+            normal_log_prob = (
+                -torch.log(safe_std)
+                - 0.5 * torch.log(torch.full_like(sample, 2.0 * torch.pi))
+                - 0.5 * ((sample - mean) / safe_std).square()
+            )
+            log_probs.append(
+                torch.where(
+                    zero_std, torch.zeros_like(normal_log_prob), normal_log_prob
+                )
+            )
+            chains.append(x_t)
+
+        return (
+            x_t,
+            torch.stack(chains, dim=1),
+            torch.stack(log_probs, dim=1),
+            torch.stack(values, dim=1),
+        )
 
     def plan_inference(self, meta: PagedAttnMetadata) -> None:
         """Refresh metadata for one inference (all Euler steps share it).
@@ -767,6 +927,26 @@ class PI05ExpertRunner(ModelRunner):
         if self.graph is not None:
             return self.graph.replay({"noise": noise})
         return self._fwd_loop(noise=noise)
+
+    def forward_rollout(
+        self,
+        noise: torch.Tensor,
+        step_noise: torch.Tensor,
+        sigmas: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return final action, chains, logprobs, and per-step values.
+
+        Captured outputs alias static graph storage. Callers that retain them
+        across another replay must clone them.
+        """
+        inputs = {
+            "noise": noise,
+            "step_noise": step_noise,
+            "sigmas": sigmas,
+        }
+        if self.rollout_graph is not None:
+            return self.rollout_graph.replay(inputs)
+        return self._fwd_rollout_loop(**inputs)
 
 
 __all__ = [

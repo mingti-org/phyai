@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import pairwise
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ from phyai.layers.attention.paged import PagedAttention, PagedAttnCtx
 from phyai.layers.conv import Conv2d
 from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import (
+    Bf16Spec,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -974,6 +976,101 @@ class ActionTimeHeads(nn.Module):
         return F.silu(h)
 
 
+class _ValueLinear(ReplicatedLinear):
+    """ReplicatedLinear adapter for an ``nn.Sequential`` value MLP."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = super().forward(x)
+        return out
+
+
+class PI05ValueHead(nn.Module):
+    """RLinf-compatible MLP critic over pooled pi0.5 hidden features.
+
+    RLinf keeps the value head in fp32 outside the selectively converted
+    PaliGemma stack. The sequential indices match its checkpoint keys:
+    ``value_head.mlp.{0,2,4,6}.{weight,bias}``.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_sizes: tuple[int, ...],
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        self.params_dtype = torch.float32
+        widths = (input_dim, *hidden_sizes, 1)
+        layers: list[nn.Module] = []
+        for index, (in_features, out_features) in enumerate(pairwise(widths)):
+            linear_index = 2 * index
+            linear = _ValueLinear(
+                in_features=in_features,
+                out_features=out_features,
+                bias=True,
+                params_dtype=self.params_dtype,
+                spec=Bf16Spec(),
+                device=device,
+                prefix=f"value_head.mlp.{linear_index}",
+            )
+            layers.append(linear)
+            if index < len(widths) - 2:
+                layers.append(nn.ReLU())
+        self.mlp = nn.Sequential(*layers)
+        self._initialize_weights()
+
+    @torch.no_grad()
+    def _initialize_weights(self) -> None:
+        """Match RLinf's initialization when starting from an actor checkpoint."""
+        last = len(self.mlp) - 1
+        for index, module in enumerate(self.mlp):
+            if not isinstance(module, _ValueLinear):
+                continue
+            if index == last:
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            else:
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            # A base actor checkpoint has no critic. Strict loading may omit
+            # these initialized parameters until the RL worker synchronizes
+            # its ValueHead weights.
+            module.weight.optional = True
+            if module.bias is not None:
+                module.bias.optional = True
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.mlp(features.to(self.params_dtype))
+
+
+def value_from_prefix(
+    value_head: nn.Module,
+    prefix_out: torch.Tensor,
+    prefix_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Pool valid prefix tokens and return one fp32 value per sample."""
+    mask = prefix_mask.to(prefix_out.dtype).unsqueeze(-1)
+    pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    return value_head(pooled)[:, 0].to(torch.float32)
+
+
+def value_from_suffix(
+    value_head: nn.Module,
+    suffix_out: torch.Tensor,
+    *,
+    action_chunk: int | None = None,
+) -> torch.Tensor:
+    """Mean suffix features and return one fp32 value per sample."""
+    features = suffix_out.to(torch.float32)
+    if action_chunk is not None:
+        features = features[:, :action_chunk]
+    features = features.mean(dim=1)
+    return value_head(features)[:, 0].to(torch.float32)
+
+
 class PI05Model(nn.Module):
     """Full pi0.5 inference model — flat composition of forward-able sub-modules.
 
@@ -1096,6 +1193,15 @@ class PI05Model(nn.Module):
             config,
             params_dtype=params_dtype,
         )
+        self.value_head = (
+            PI05ValueHead(
+                config.value_head_input_dim,
+                config.value_head_hidden_sizes,
+                device=device,
+            )
+            if config.add_value_head
+            else None
+        )
 
 
 __all__ = [
@@ -1112,6 +1218,7 @@ __all__ = [
     "PI05ExpertLayer",
     "PI05ExpertStack",
     "PI05Model",
+    "PI05ValueHead",
     "PI05VisionTower",
     "PositionEmbedding",
     "SIGLIP_NORM_HF_NAMES",

@@ -190,6 +190,13 @@ class PI05Config(PretrainedConfig):
     max_period: float = 4.0
     tokenizer_max_length: int = 200
 
+    # RL critic. ``value_after_vlm`` selects the prefix or suffix residual
+    # stream. ``critic_action_chunk=None`` pools the full suffix horizon.
+    add_value_head: bool = False
+    value_after_vlm: bool = True
+    value_head_hidden_sizes: tuple[int, ...] = (1024, 512, 256)
+    critic_action_chunk: int | None = None
+
     def __post_init__(self) -> None:
         if self.vision.projection_dim != self.text.hidden_size:
             raise ValueError(
@@ -226,11 +233,32 @@ class PI05Config(PretrainedConfig):
             raise ValueError(
                 f"num_inference_steps must be positive, got {self.num_inference_steps}."
             )
+        if (
+            self.critic_action_chunk is not None
+            and not 1 <= self.critic_action_chunk <= self.chunk_size
+        ):
+            raise ValueError(
+                f"critic_action_chunk must be in [1, {self.chunk_size}], got "
+                f"{self.critic_action_chunk}."
+            )
+        if not self.value_head_hidden_sizes or any(
+            width <= 0 for width in self.value_head_hidden_sizes
+        ):
+            raise ValueError(
+                "value_head_hidden_sizes must contain positive layer widths."
+            )
 
     @property
     def num_layers(self) -> int:
         """Layer count for the joint stack — text and expert share it."""
         return self.text.num_hidden_layers
+
+    @property
+    def value_head_input_dim(self) -> int:
+        """Residual-stream width consumed by the configured critic."""
+        if self.value_after_vlm:
+            return self.text.hidden_size
+        return self.expert.hidden_size
 
 
 __all__ = [

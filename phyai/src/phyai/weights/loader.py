@@ -256,6 +256,118 @@ def _progress_disable(progress: bool | None) -> bool | None:
     return None
 
 
+def _build_weight_index(
+    model: nn.Module,
+) -> tuple[
+    dict[str, tuple[nn.Parameter, int | str | None, WeightLoader]],
+    set[str],
+]:
+    """Build the HF-name dispatch plan shared by file and memory loading."""
+    index: dict[str, tuple[nn.Parameter, int | str | None, WeightLoader]] = {}
+    optional: set[str] = set()
+    for parameter_name, parameter in model.named_parameters():
+        keys = getattr(parameter, "hf_keys", None)
+        if keys is None:
+            continue
+        loader: WeightLoader = getattr(parameter, "weight_loader", None) or replicated()
+        is_optional = bool(getattr(parameter, "optional", False))
+        for hf_key, shard_id in keys:
+            if hf_key in index:
+                raise RuntimeError(
+                    f"hf_key {hf_key!r} is claimed by two params; "
+                    f"second hit on {parameter_name!r}."
+                )
+            index[hf_key] = (parameter, shard_id, loader)
+            if is_optional:
+                optional.add(hf_key)
+    return index, optional
+
+
+class WeightLoadSession:
+    """Incrementally apply in-memory named tensors through weight loaders."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        remap: Callable[[str], str | None] | dict[str, str] | None = None,
+        source_label: str = "weights",
+    ) -> None:
+        self.model = model
+        self.remap = _resolve_remap(remap)
+        self.source_label = source_label
+        self.index, self.optional = _build_weight_index(model)
+        self.report = LoadReport()
+        self.seen: set[str] = set()
+        self.finished = False
+
+    @torch.no_grad()
+    def load(
+        self,
+        weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
+    ) -> LoadReport:
+        """Apply one batch while deferring validation and post-load hooks."""
+        if self.finished:
+            raise RuntimeError("Cannot load weights into a finished session.")
+        items = weights.items() if isinstance(weights, Mapping) else weights
+        for raw_name, tensor in items:
+            hf_key = self.remap(raw_name)
+            if hf_key is None:
+                continue
+            if hf_key in self.seen:
+                raise RuntimeError(
+                    f"weight key {hf_key!r} appears more than once after remap."
+                )
+            hit = self.index.get(hf_key)
+            if hit is None:
+                self.report.unexpected.append(hf_key)
+                continue
+            parameter, shard_id, loader = hit
+            if tensor.dtype != parameter.dtype:
+                self.report.casts.append((hf_key, tensor.dtype, parameter.dtype))
+            loader(parameter, tensor, shard_id)
+            self.seen.add(hf_key)
+            self.report.loaded.append(hf_key)
+        return self.report
+
+    @torch.no_grad()
+    def finish(self, *, strict: bool = True, require_all: bool = True) -> LoadReport:
+        """Validate the completed update and refresh derived module state."""
+        if self.finished:
+            raise RuntimeError("Weight load session is already finished.")
+        if require_all:
+            for hf_key in self.index:
+                if hf_key in self.seen:
+                    continue
+                if hf_key in self.optional:
+                    self.report.optional_missing.append(hf_key)
+                else:
+                    self.report.missing.append(hf_key)
+        if strict and (self.report.missing or self.report.unexpected):
+            raise RuntimeError(f"weight load strict failure: {self.report.summary()}")
+
+        for module in self.model.modules():
+            post_load = getattr(module, "post_load", None)
+            if callable(post_load):
+                post_load()
+
+        for hf_key, source_dtype, destination_dtype in self.report.casts[:10]:
+            _logger.warning_rank0(
+                "weight load dtype cast at %r: %s -> %s",
+                hf_key,
+                source_dtype,
+                destination_dtype,
+            )
+
+        _logger.info_rank0(
+            "weight load (%s): %s",
+            self.source_label,
+            self.report.summary(),
+        )
+        self.finished = True
+        return self.report
+
+
 def load_pretrained(
     model: nn.Module,
     source: str | Path | Iterable[str | Path],
@@ -311,23 +423,7 @@ def load_pretrained(
     paths = _resolve_source(source, revision=revision)
 
     # 1. Build dispatch index from data on params.
-    index: dict[str, tuple[nn.Parameter, "int | str | None", WeightLoader]] = {}
-    optional: set[str] = set()
-    for _name, param in model.named_parameters():
-        keys = getattr(param, "hf_keys", None)
-        if keys is None:
-            continue
-        loader: WeightLoader = getattr(param, "weight_loader", None) or replicated()
-        is_optional = bool(getattr(param, "optional", False))
-        for hf_key, shard_id in keys:
-            if hf_key in index:
-                raise RuntimeError(
-                    f"hf_key {hf_key!r} is claimed by two params; "
-                    f"second hit on {_name!r}."
-                )
-            index[hf_key] = (param, shard_id, loader)
-            if is_optional:
-                optional.add(hf_key)
+    index, optional = _build_weight_index(model)
 
     report = LoadReport()
     seen: set[str] = set()
@@ -420,5 +516,6 @@ __all__ = [
     "LoadReport",
     "checkpoint_format",
     "iter_checkpoint_tensors",
+    "WeightLoadSession",
     "load_pretrained",
 ]

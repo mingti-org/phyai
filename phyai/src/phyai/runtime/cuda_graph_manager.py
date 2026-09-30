@@ -168,8 +168,8 @@ class CudaGraph:
         """
         if self._captured:
             raise CudaGraphError(
-                "CudaGraph already captured; construct a new instance to "
-                "capture a different fn / shape."
+                "CudaGraph already captured; call reset() or construct a new "
+                "instance before capturing a different fn / shape."
             )
         if not torch.cuda.is_available():
             raise CudaGraphError(
@@ -259,6 +259,15 @@ class CudaGraph:
         assert self._graph is not None
         self._graph.replay()
         return self._output
+
+    def reset(self) -> None:
+        """Destroy the captured executable and release graph-held tensors."""
+        if self._graph is not None:
+            self._graph.reset()
+        self._captured = False
+        self._graph = None
+        self._input_buffers = {}
+        self._output = None
 
 
 class CudaGraphRegistry:

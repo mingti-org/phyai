@@ -153,13 +153,20 @@ class _ConvNd(nn.Module):
         self.register_buffer("_compute_bias", None, persistent=False)
 
     def post_load(self) -> None:
-        """Build compute-dtype parameter copies after checkpoint loading."""
+        """Build or refresh compute-dtype parameter copies after loading."""
         if self.compute_dtype is None:
             return
-        self._compute_weight = self.weight.detach().to(self.compute_dtype)
-        self._compute_bias = (
-            self.bias.detach().to(self.compute_dtype) if self.bias is not None else None
-        )
+        if self._compute_weight is None:
+            self._compute_weight = self.weight.detach().to(self.compute_dtype)
+        else:
+            self._compute_weight.copy_(self.weight.detach())
+
+        if self.bias is None:
+            self._compute_bias = None
+        elif self._compute_bias is None:
+            self._compute_bias = self.bias.detach().to(self.compute_dtype)
+        else:
+            self._compute_bias.copy_(self.bias.detach())
 
     @staticmethod
     def _build_reversed_pad(

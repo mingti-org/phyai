@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 import phyai.layers.linear as L
 from phyai.weights import (
     LoadReport,
+    WeightLoadSession,
     checkpoint_format,
     iter_checkpoint_tensors,
     load_pretrained,
@@ -75,6 +76,77 @@ def test_load_qkv_fused(tmp_path: Path, fake_mesh):
     assert torch.all(layer.weight.data[0:8] == 1.0)
     assert torch.all(layer.weight.data[8:16] == 2.0)
     assert torch.all(layer.weight.data[16:24] == 3.0)
+
+
+def test_incremental_weight_session_loads_fused_legs(fake_mesh):
+    fake_mesh(tp_size=1)
+    layer = L.QKVParallelLinear(
+        hidden_size=8,
+        head_dim=4,
+        num_heads=2,
+        num_kv_heads=2,
+        bias=False,
+        params_dtype=torch.float32,
+        prefix="model.layers.0.self_attn.qkv_proj",
+    )
+    session = WeightLoadSession(layer, source_label="test update")
+    session.load({"model.layers.0.self_attn.q_proj.weight": torch.full((8, 8), 1.0)})
+    session.load(
+        {
+            "model.layers.0.self_attn.k_proj.weight": torch.full((8, 8), 2.0),
+            "model.layers.0.self_attn.v_proj.weight": torch.full((8, 8), 3.0),
+        }
+    )
+
+    report = session.finish()
+
+    assert len(report.loaded) == 3
+    assert not report.missing
+    assert torch.all(layer.weight.data[0:8] == 1.0)
+    assert torch.all(layer.weight.data[8:16] == 2.0)
+    assert torch.all(layer.weight.data[16:24] == 3.0)
+
+
+def test_incremental_weight_session_allows_partial_hot_update(fake_mesh):
+    fake_mesh(tp_size=1)
+    layer = L.ReplicatedLinear(
+        in_features=4,
+        out_features=8,
+        bias=True,
+        params_dtype=torch.float32,
+        prefix="mod.fc",
+    )
+    original_bias = layer.bias.detach().clone()
+    updated_weight = torch.randn(8, 4)
+    session = WeightLoadSession(layer)
+    session.load({"mod.fc.weight": updated_weight})
+
+    report = session.finish(require_all=False)
+
+    assert report.loaded == ["mod.fc.weight"]
+    assert not report.missing
+    torch.testing.assert_close(layer.weight.cpu(), updated_weight)
+    torch.testing.assert_close(layer.bias, original_bias)
+
+
+def test_incremental_weight_session_rejects_duplicate_remap_before_write(fake_mesh):
+    fake_mesh(tp_size=1)
+    layer = L.ReplicatedLinear(
+        in_features=4,
+        out_features=8,
+        bias=False,
+        params_dtype=torch.float32,
+        prefix="mod.fc",
+    )
+    first = torch.randn(8, 4)
+    second = torch.randn(8, 4)
+    session = WeightLoadSession(layer, remap=lambda _name: "mod.fc.weight")
+
+    session.load({"upstream.a": first})
+    with pytest.raises(RuntimeError, match="appears more than once after remap"):
+        session.load({"upstream.b": second})
+
+    torch.testing.assert_close(layer.weight.cpu(), first)
 
 
 def test_missing_keys_raise_when_strict_and_are_reported_otherwise(

@@ -26,6 +26,7 @@ from phyai.weights.loader import (
     LoadReport,
     checkpoint_format,
     iter_checkpoint_tensors,
+    WeightLoadSession,
     load_pretrained,
 )
 from phyai.weights.shards import (
@@ -45,6 +46,7 @@ __all__ = [
     "checkpoint_format",
     "fused",
     "iter_checkpoint_tensors",
+    "WeightLoadSession",
     "load_pretrained",
     "replicated",
     "sharded",

@@ -1,4 +1,4 @@
-"""phyai.models.pi05 — pi0.5 inference (vision + text + action expert + flow-matching).
+"""phyai.models.pi05 — pi0.5 inference and RL rollout support.
 
 The package ships the full pi0.5 inference path:
 
@@ -15,7 +15,8 @@ The package ships the full pi0.5 inference path:
   pi0.5-specific batch-layout helpers (cu_seqlens, write-indices,
   padded prefix layout, joint paged_kv_indices interleave).
 
-Training is not in scope here; this package is inference-only.
+RL actor training remains outside phyai. The rollout API provides stochastic
+trajectory sampling and policy data for external RL frameworks.
 """
 
 from __future__ import annotations
