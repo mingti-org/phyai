@@ -26,8 +26,8 @@ if _version_not_supported:
 
 
 class ModelInferenceStub:
-    """Gateway -> Model Server 的统一推理服务。
-    一次 Unary RPC 对应一次 observation 推理。
+    """Unified inference service from the Gateway to the Model Server.
+    Each unary RPC performs inference for one observation.
     """
 
     def __init__(self, channel):
@@ -44,8 +44,8 @@ class ModelInferenceStub:
 
 
 class ModelInferenceServicer:
-    """Gateway -> Model Server 的统一推理服务。
-    一次 Unary RPC 对应一次 observation 推理。
+    """Unified inference service from the Gateway to the Model Server.
+    Each unary RPC performs inference for one observation.
     """
 
     def Infer(self, request, context):
@@ -71,8 +71,8 @@ def add_ModelInferenceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ModelInference:
-    """Gateway -> Model Server 的统一推理服务。
-    一次 Unary RPC 对应一次 observation 推理。
+    """Unified inference service from the Gateway to the Model Server.
+    Each unary RPC performs inference for one observation.
     """
 
     @staticmethod

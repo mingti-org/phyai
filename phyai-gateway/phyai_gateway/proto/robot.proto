@@ -2,38 +2,38 @@ syntax = "proto3";
 
 package robot;
 
-// ----- 机器人状态 -----
+// ----- Robot state -----
 message RobotState {
-    repeated double joint_angles = 1;   // 各关节角度（弧度）
-    repeated double joint_velocities = 2; // 各关节速度
-    double x = 3;                        // 末端位姿 x
-    double y = 4;                        // 末端位姿 y
-    double z = 5;                        // 末端位姿 z
-    double roll = 6;                     // 末端姿态 roll
-    double pitch = 7;                    // 末端姿态 pitch
-    double yaw = 8;                      // 末端姿态 yaw
+    repeated double joint_angles = 1;   // Joint angles (radians)
+    repeated double joint_velocities = 2; // Joint velocities
+    double x = 3;                        // End-effector pose x
+    double y = 4;                        // End-effector pose y
+    double z = 5;                        // End-effector pose z
+    double roll = 6;                     // End-effector orientation roll
+    double pitch = 7;                    // End-effector orientation pitch
+    double yaw = 8;                      // End-effector orientation yaw
 }
 
-// ----- 传感器数据 -----
+// ----- Sensor data -----
 message SensorData {
-    bytes image_rgb = 1;                 // RGB 图像原始二进制数据
-    bytes image_depth = 2;               // 深度图原始二进制数据
-    int64 timestamp_ns = 3;              // Unix 纳秒级时间戳
-    RobotState state = 4;                // 当前机器人状态（嵌套消息）
-    string language_instruction = 5;     //语言指令
+    bytes image_rgb = 1;                 // Raw binary RGB image data
+    bytes image_depth = 2;               // Raw binary depth image data
+    int64 timestamp_ns = 3;              // Unix timestamp in nanoseconds
+    RobotState state = 4;                // Current robot state (nested message)
+    string language_instruction = 5;     //Language instruction
 }
 
-// ----- 云端返回的动作指令 -----
+// ----- Action command returned by the server -----
 message ActionCmd {
-    repeated double target_joint_angles = 1;  // 目标关节角度
-    repeated double target_joint_velocities = 2; // 目标关节速度
-    double gripper_opening = 3;                // 夹爪开合度 [0, 1]
-    int64 timestamp_ns = 4;                    // 动作生成时间戳
+    repeated double target_joint_angles = 1;  // Target joint angles
+    repeated double target_joint_velocities = 2; // Target joint velocities
+    double gripper_opening = 3;                // Gripper opening [0, 1]
+    int64 timestamp_ns = 4;                    // Action generation timestamp
     int64 inference_time=5;
 }
 
-// ----- 定义 RPC 服务 -----
+// ----- RPC service definition -----
 service RobotInference {
-    // 一元 RPC：发送传感器数据，返回动作指令
+    // Unary RPC: send sensor data and return action commands
     rpc Communicate (stream SensorData) returns (stream ActionCmd) {}
 }

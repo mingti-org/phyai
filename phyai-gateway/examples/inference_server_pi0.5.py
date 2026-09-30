@@ -3,6 +3,7 @@ import threading
 from concurrent import futures
 from pathlib import Path
 import logging
+import math
 import time
 
 import grpc
@@ -22,20 +23,6 @@ from phyai.models.pi05.scheduler_pi05 import PI05Request
 from phyai.utils import load_config
 from phyai_utils_tools.models.pi05 import PI05Processor
 from phyai_utils_tools.tokenizer import get_tokenizer
-import os
-
-
-
-TOKENIZER_DIR = Path("/data/share/paligemma-3b-pt-224")
-MODEL_NAME = "pi05"
-REGISTRATION_RETRY_SECONDS = 5
-IMAGE_NAMES = ("agentview", "robot0_eye_in_hand")
-IMAGE_SHAPE = (360, 360, 3)
-STATE_SHAPE = (8,)
-ACTION_DIM = 7
-MAX_BATCH_SIZE = int(os.environ.get("PI05_MAX_BATCH_SIZE", "32"))
-if MAX_BATCH_SIZE < 1:
-    raise ValueError("PI05_MAX_BATCH_SIZE must be at least 1")
 
 
 def remap_lerobot_weight(key):
@@ -51,9 +38,11 @@ class ModelRegistryReporter:
         registry_address,
         endpoint,
         model_name,
+        registration_retry_seconds,
     ):
         self.endpoint = endpoint
         self.model_name = model_name
+        self.registration_retry_seconds = registration_retry_seconds
         self.channel = grpc.insecure_channel(registry_address)
         self.stub = model_inference_pb2_grpc.ModelRegistryStub(
             self.channel
@@ -114,7 +103,7 @@ class ModelRegistryReporter:
                     )
                 if registration is None:
                     self.stop_event.wait(
-                        REGISTRATION_RETRY_SECONDS
+                        self.registration_retry_seconds
                     )
                     continue
             server_id, heartbeat_interval = registration
@@ -147,28 +136,52 @@ class ModelRegistryReporter:
 
 
 class PI05Runtime:
-    def __init__(self,checkpoint_dir):
+    def __init__(
+        self,
+        checkpoint_dir,
+        tokenizer_dir,
+        image_names,
+        image_shape,
+        state_dim,
+        action_dim,
+        max_batch_size,
+    ):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for PI0.5 inference")
 
         self.device = torch.device("cuda")
         self.dtype = torch.bfloat16
+        self.image_names = image_names
+        self.image_shape = image_shape
+        self.state_shape = (state_dim,)
+        self.action_dim = action_dim
+        self.max_batch_size = max_batch_size
         self.config = load_config(checkpoint_dir, PI05Config)
+        if self.image_shape[2] != self.config.vision.num_channels:
+            raise ValueError(
+                "image channels must match PI0.5 vision config: "
+                f"{self.config.vision.num_channels}"
+            )
+        if self.action_dim > self.config.max_action_dim:
+            raise ValueError(
+                "action dimension exceeds PI0.5 maximum: "
+                f"{self.config.max_action_dim}"
+            )
         self.engine = None
 
         logging.info("Loading PI0.5 checkpoint from %s", checkpoint_dir)
         tokenizer = get_tokenizer(
-            str(TOKENIZER_DIR),
+            str(tokenizer_dir),
             local_files_only=True,
         )
         self.processor = PI05Processor.from_pretrained(
             checkpoint_dir,
             tokenizer=tokenizer,
-            tokenizer_name=str(TOKENIZER_DIR),
+            tokenizer_name=str(tokenizer_dir),
             image_size=self.config.vision.image_size,
             num_channels=self.config.vision.num_channels,
-            num_images=len(IMAGE_NAMES),
-            action_dim=ACTION_DIM,
+            num_images=len(self.image_names),
+            action_dim=self.action_dim,
             normalize_pixels=True,
             device=self.device,
             params_dtype=self.dtype,
@@ -179,11 +192,11 @@ class PI05Runtime:
                 plugin="pi05",
                 plugin_args=PI05Args(
                     checkpoint_dir=checkpoint_dir,
-                    max_batch_size=MAX_BATCH_SIZE,
+                    max_batch_size=self.max_batch_size,
                     weight_remap=remap_lerobot_weight,
                     inputs_image_shape=[
-                        list(IMAGE_SHAPE)
-                        for _ in IMAGE_NAMES
+                        list(self.image_shape)
+                        for _ in self.image_names
                     ],
                 ),
                 config=EngineConfig(
@@ -216,19 +229,19 @@ class PI05Runtime:
         images = [
             torch.zeros(
                 1,
-                IMAGE_SHAPE[2],
-                IMAGE_SHAPE[0],
-                IMAGE_SHAPE[1],
+                self.image_shape[2],
+                self.image_shape[0],
+                self.image_shape[1],
                 dtype=torch.float32,
             )
-            for _ in IMAGE_NAMES
+            for _ in self.image_names
         ]
         state = torch.zeros(
-            1, STATE_SHAPE[0], dtype=torch.float32
+            1, self.state_shape[0], dtype=torch.float32
         )
         request = self._make_request(images, state, ["warm up"])
         actions = self.engine.step(request)
-        self.processor.postprocess(actions[..., :ACTION_DIM])
+        self.processor.postprocess(actions[..., :self.action_dim])
         torch.cuda.synchronize()
 
     def infer(self, images, state, instructions, horizon):
@@ -239,12 +252,12 @@ class PI05Runtime:
         torch.cuda.synchronize()
         inference_time_us = (time.perf_counter_ns() - start_ns) // 1000
 
-        actions = self.processor.postprocess(actions[..., :ACTION_DIM])
+        actions = self.processor.postprocess(actions[..., :self.action_dim])
         batch_size = state.shape[0]
         if (
             actions.ndim != 3
             or actions.shape[0] != batch_size
-            or actions.shape[2] != ACTION_DIM
+            or actions.shape[2] != self.action_dim
         ):
             raise RuntimeError(
                 f"unexpected PI0.5 action shape: {tuple(actions.shape)}"
@@ -268,6 +281,10 @@ class PI05Runtime:
 class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
     def __init__(self, runtime):
         self.runtime = runtime
+        self.image_names = runtime.image_names
+        self.image_shape = runtime.image_shape
+        self.state_shape = runtime.state_shape
+        self.max_batch_size = runtime.max_batch_size
 
     def Infer(self, request, context):
         infer_start=time.perf_counter()
@@ -333,14 +350,13 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
             inference_time_us=inference_time_us,
         )
 
-    @staticmethod
-    def _validate_and_decode(request, context, max_action_horizon):
+    def _validate_and_decode(self, request, context, max_action_horizon):
         if not request.request_id:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "request_id is required")
-        if len(request.images) != len(IMAGE_NAMES):
+        if len(request.images) != len(self.image_names):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"exactly {len(IMAGE_NAMES)} images are required",
+                f"exactly {len(self.image_names)} images are required",
             )
         if not 1 <= request.requested_action_horizon <= max_action_horizon:
             context.abort(
@@ -352,7 +368,7 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
         batch_size = None
         is_batch = None
         for image in request.images:
-            if image.name not in IMAGE_NAMES:
+            if image.name not in self.image_names:
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"unknown image name: {image.name!r}",
@@ -379,22 +395,24 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
                 )
 
             image_shape = tuple(image.shape)
-            if image_shape == IMAGE_SHAPE:
+            if image_shape == self.image_shape:
                 image_is_batch = False
                 image_batch_size = 1
-            elif len(image_shape) == 4 and image_shape[1:] == IMAGE_SHAPE:
+            elif len(image_shape) == 4 and image_shape[1:] == self.image_shape:
                 image_is_batch = True
                 image_batch_size = image_shape[0]
-                if not 1 <= image_batch_size <= MAX_BATCH_SIZE:
+                if not 1 <= image_batch_size <= self.max_batch_size:
                     context.abort(
                         grpc.StatusCode.INVALID_ARGUMENT,
-                        f"image batch size must be between 1 and {MAX_BATCH_SIZE}",
+                        "image batch size must be between 1 and "
+                        f"{self.max_batch_size}",
                     )
             else:
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
-                    f"image {image.name!r} shape must be {list(IMAGE_SHAPE)} "
-                    f"or [B, {IMAGE_SHAPE[0]}, {IMAGE_SHAPE[1]}, {IMAGE_SHAPE[2]}]",
+                    f"image {image.name!r} shape must be {list(self.image_shape)} "
+                    f"or [B, {self.image_shape[0]}, {self.image_shape[1]}, "
+                    f"{self.image_shape[2]}]",
                 )
 
             if is_batch is None:
@@ -454,7 +472,9 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
                 "robot_state dtype must be FLOAT32",
             )
         expected_state_shape = (
-            (batch_size, *STATE_SHAPE) if is_batch else STATE_SHAPE
+            (batch_size, *self.state_shape)
+            if is_batch
+            else self.state_shape
         )
         if tuple(robot_state.shape) != expected_state_shape:
             context.abort(
@@ -468,7 +488,7 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
             )
 
         image_tensors = []
-        for image_name in IMAGE_NAMES:
+        for image_name in self.image_names:
             image = images_by_name[image_name]
             image_array = np.frombuffer(
                 image.data,
@@ -489,34 +509,50 @@ class ModelInferenceServicer(model_inference_pb2_grpc.ModelInferenceServicer):
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "robot_state must contain finite values",
             )
-        state_tensor = torch.from_numpy(state_array).reshape(batch_size, *STATE_SHAPE)
+        state_tensor = torch.from_numpy(state_array).reshape(
+            batch_size, *self.state_shape
+        )
         return image_tensors, state_tensor, instructions, is_batch
 
 
 def serve(
-    checkpoint_dir: str | None=None,
-    port: int | None = None,
-    listen: str | None = None,
-    advertised_endpoint: str | None = None,
-    gateway_registry: str | None = None,
+    checkpoint_dir,
+    tokenizer_dir,
+    model_name,
+    gateway_registry,
+    registration_retry_seconds,
+    image_names,
+    image_shape,
+    state_dim,
+    action_dim,
+    max_batch_size,
+    port=None,
+    listen=None,
+    advertised_endpoint=None,
 ):
-    if checkpoint_dir is None:
-        raise ValueError("Need checkpoint_dir")
-    if gateway_registry is None:
-        raise ValueError("Need gateway_registry_address")
+    if port is None and listen is None:
+        port = 50063
     if port is not None:
-        if listen is not None:
-            raise ValueError("use either --port or --listen, not both")
         listen = f"[::]:{port}"
         advertised_endpoint = advertised_endpoint or f"127.0.0.1:{port}"
-    if listen is None:
-        listen = "[::]:50063"
-    
+    elif advertised_endpoint is None:
+        raise ValueError(
+            "--advertised-endpoint is required when --listen is used"
+        )
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    runtime = PI05Runtime(checkpoint_dir=checkpoint_dir)
+    runtime = PI05Runtime(
+        checkpoint_dir=checkpoint_dir,
+        tokenizer_dir=tokenizer_dir,
+        image_names=image_names,
+        image_shape=image_shape,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        max_batch_size=max_batch_size,
+    )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=8),
         options=[
@@ -528,24 +564,27 @@ def serve(
         ModelInferenceServicer(runtime),
         server,
     )
-    server.add_insecure_port(listen)
+    bound_port = server.add_insecure_port(listen)
+    if bound_port == 0:
+        runtime.close()
+        raise RuntimeError(f"failed to bind gRPC server to {listen}")
 
     registry_reporter = ModelRegistryReporter(
         registry_address=gateway_registry,
         endpoint=advertised_endpoint,
-        model_name=MODEL_NAME,
+        model_name=model_name,
+        registration_retry_seconds=registration_retry_seconds,
     )
 
     server.start()
     logging.info("PI0.5 ModelInference Server listening on %s", listen)
-    
+
     registry_reporter.start()
     logging.info("registry_reporter started")
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:
         logging.info("Stopping PI0.5 ModelInference Server")
-        
     finally:
         registry_reporter.stop()
         server.stop(grace=2).wait()
@@ -554,16 +593,18 @@ def serve(
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(
         description="PI0.5 gRPC Model Server"
     )
-    parser.add_argument(
+    listen_group = parser.add_mutually_exclusive_group()
+    listen_group.add_argument(
         "--port",
         type=int,
-        default=50063,
-        help="Listen port, for example 30000",
+        default=None,
+        help="Listen port; defaults to 50063",
     )
-    parser.add_argument(
+    listen_group.add_argument(
         "--listen",
         default=None,
         help="Full gRPC listen address, for example [::]:50063",
@@ -571,7 +612,7 @@ def main():
     parser.add_argument(
         "--advertised-endpoint",
         default=None,
-        help="Endpoint registered in Gateway, for example 127.0.0.1:30000",
+        help="Endpoint registered in Gateway, for example 127.0.0.1:50063",
     )
     parser.add_argument(
         "--gateway-registry",
@@ -581,17 +622,100 @@ def main():
         "--checkpoint-dir",
         default="/data/share/pi05_libero_finetuned_v044",
     )
+    parser.add_argument(
+        "--tokenizer-dir",
+        default="/data/share/paligemma-3b-pt-224",
+    )
+    parser.add_argument(
+        "--model-name",
+        default="pi05",
+    )
+    parser.add_argument(
+        "--registration-retry-seconds",
+        type=float,
+        default=5,
+    )
+    parser.add_argument(
+        "--image-names",
+        nargs="+",
+        default=("agentview", "robot0_eye_in_hand"),
+    )
+    parser.add_argument(
+        "--image-shape",
+        type=int,
+        nargs=3,
+        metavar=("HEIGHT", "WIDTH", "CHANNELS"),
+        default=(360, 360, 3),
+    )
+    parser.add_argument(
+        "--state-dim",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--action-dim",
+        type=int,
+        default=7,
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=32,
+    )
 
     args = parser.parse_args()
-    if args.port is not None and args.port < 1:
-        parser.error("--port must be positive")
+    if not Path(args.checkpoint_dir).is_dir():
+        parser.error(f"--checkpoint-dir must be a directory: {args.checkpoint_dir}")
+    if not Path(args.tokenizer_dir).is_dir():
+        parser.error(f"--tokenizer-dir must be a directory: {args.tokenizer_dir}")
+    if args.port is not None and not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if not math.isfinite(args.registration_retry_seconds) or (
+        args.registration_retry_seconds <= 0
+    ):
+        parser.error("--registration-retry-seconds must be positive")
+    if any(not name.strip() for name in args.image_names):
+        parser.error("--image-names must contain non-empty names")
+    if len(set(args.image_names)) != len(args.image_names):
+        parser.error("--image-names must not contain duplicates")
+    if any(dimension <= 0 for dimension in args.image_shape):
+        parser.error("--image-shape dimensions must be positive")
+    if args.state_dim <= 0:
+        parser.error("--state-dim must be positive")
+    if args.action_dim <= 0:
+        parser.error("--action-dim must be positive")
+    if args.max_batch_size <= 0:
+        parser.error("--max-batch-size must be positive")
+    if not args.gateway_registry.strip():
+        parser.error("--gateway-registry must be non-empty")
+    if not args.model_name.strip():
+        parser.error("--model-name must be non-empty")
+    if args.listen is not None and args.advertised_endpoint is None:
+        parser.error(
+            "--advertised-endpoint is required when --listen is used"
+        )
+    if (
+        args.advertised_endpoint is not None
+        and not args.advertised_endpoint.strip()
+    ):
+        parser.error("--advertised-endpoint must be non-empty")
+
     serve(
         checkpoint_dir=args.checkpoint_dir,
+        tokenizer_dir=args.tokenizer_dir,
+        model_name=args.model_name,
+        gateway_registry=args.gateway_registry,
+        registration_retry_seconds=args.registration_retry_seconds,
+        image_names=tuple(args.image_names),
+        image_shape=tuple(args.image_shape),
+        state_dim=args.state_dim,
+        action_dim=args.action_dim,
+        max_batch_size=args.max_batch_size,
         port=args.port,
         listen=args.listen,
         advertised_endpoint=args.advertised_endpoint,
-        gateway_registry=args.gateway_registry,
     )
+
 
 if __name__ == "__main__":
     main()
