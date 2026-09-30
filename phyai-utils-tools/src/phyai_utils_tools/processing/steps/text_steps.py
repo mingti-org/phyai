@@ -41,7 +41,9 @@ class TokenizerStep(ProcessorStep):
     ``step_kwargs`` on load). The encode call uses right padding to
     ``max_length`` and truncation. Produces ``INPUT_IDS`` ``(B, max_length)``
     int64 and ``LANG_LENS`` ``(B,)`` int64 (real lengths from the attention
-    mask). Config schema matches lerobot's ``tokenizer_processor``.
+    mask). Config schema matches lerobot's ``tokenizer_processor``. An optional
+    ``suffix`` is encoded separately without special tokens and appended before
+    truncation; this preserves instruction-only policies' newline token boundary.
     """
 
     tokenizer: Any = field(repr=False, default=None)
@@ -51,6 +53,7 @@ class TokenizerStep(ProcessorStep):
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
+    suffix: str = ""
 
     def __call__(self, transition: Transition) -> Transition:
         if self.tokenizer is None:
@@ -62,6 +65,41 @@ class TokenizerStep(ProcessorStep):
             raise ValueError("TokenizerStep requires a PROMPT or TASK entry.")
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        if self.suffix:
+            if (
+                self.padding != "max_length"
+                or self.padding_side != "right"
+                or self.max_length <= 0
+            ):
+                raise ValueError(
+                    "Token suffixes require right padding to a positive max_length"
+                )
+            # Encode the suffix separately; concatenating strings can change BPE merges.
+            suffix_ids = self.tokenizer.encode(self.suffix, add_special_tokens=False)
+            encoded = self.tokenizer(
+                list(prompts), padding=False, truncation=False, verbose=False
+            )
+            sequences = [ids + suffix_ids for ids in encoded["input_ids"]]
+            if not self.truncation and any(
+                len(ids) > self.max_length for ids in sequences
+            ):
+                raise ValueError("Prompt exceeds max_length with truncation disabled")
+            ids = torch.full(
+                (len(sequences), self.max_length),
+                self.tokenizer.pad_token_id,
+                dtype=torch.int64,
+            )
+            lengths = []
+            for row, sequence in enumerate(sequences):
+                sequence = sequence[: self.max_length]
+                ids[row, : len(sequence)] = torch.tensor(sequence, dtype=torch.int64)
+                lengths.append(len(sequence))
+            return {
+                **transition,
+                INPUT_IDS: ids,
+                LANG_LENS: torch.tensor(lengths, dtype=torch.int64),
+            }
 
         encoded = self.tokenizer(
             list(prompts),
@@ -86,6 +124,7 @@ class TokenizerStep(ProcessorStep):
             "padding": self.padding,
             "truncation": self.truncation,
             "tokenizer_name": self.tokenizer_name,
+            **({"suffix": self.suffix} if self.suffix else {}),
         }
 
 

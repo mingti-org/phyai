@@ -1,0 +1,27 @@
+[project]
+name = "phyai-robot"
+dynamic = ["version"]
+description = "Robot interfaces, transport backends, and deployment loops"
+requires-python = ">=3.12"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+zmq = ["pyzmq>=26"]
+# ROS middleware and rclpy must be provided by a compatible ROS installation.
+ros2 = []
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "..", fallback_version = "0.1.0" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phyai_robot"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--import-mode=importlib"]
+testpaths = ["tests"]
+pythonpath = ["src"]

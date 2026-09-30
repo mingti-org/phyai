@@ -24,10 +24,13 @@ def resize_with_pad(
     *,
     mode: str = "bilinear",
     pad_value: float = 0.0,
+    backend: str = "torch",
 ) -> torch.Tensor:
     """Aspect-preserving resize of ``(B, C, H, W)`` images, padded to target.
 
-    Port of openpi / lerobot ``resize_with_pad_torch`` (channels-first only).
+    The default torch backend follows openpi / lerobot's tensor operation.
+    The optional PIL backend preserves PIL's uint8 bilinear rounding for RGB
+    checkpoints trained with that transform. Both use channels-first inputs.
     The image is downscaled by the larger of the two axis ratios so it fits
     inside ``target_h`` x ``target_w`` without distortion, then symmetrically
     padded with ``pad_value`` to exactly the target size. Inputs already at the
@@ -44,12 +47,38 @@ def resize_with_pad(
             f"{tuple(images.shape)}."
         )
     _, _, cur_h, cur_w = images.shape
+    if backend not in {"torch", "pil"}:
+        raise ValueError(f"Unknown resize backend: {backend!r}")
+    if min(cur_h, cur_w, target_h, target_w) <= 0:
+        raise ValueError("Image dimensions must be positive")
+    if backend == "pil" and (images.dtype != torch.uint8 or images.shape[1] != 3):
+        raise ValueError("PIL resize requires RGB uint8 images")
     if cur_h == target_h and cur_w == target_w:
         return images
 
     ratio = max(cur_w / target_w, cur_h / target_h)
     resized_h = int(cur_h / ratio)
     resized_w = int(cur_w / ratio)
+    if min(resized_h, resized_w) < 1:
+        raise ValueError("Image aspect ratio is too extreme for the target size")
+
+    if backend == "pil":
+        import numpy as np
+        from PIL import Image
+
+        if mode != "bilinear":
+            raise ValueError("PIL resize currently supports bilinear interpolation")
+        processed = []
+        for image in images.detach().cpu().permute(0, 2, 3, 1).numpy():
+            resized = Image.fromarray(image).resize(
+                (resized_w, resized_h), Image.Resampling.BILINEAR
+            )
+            canvas = Image.new("RGB", (target_w, target_h), (int(pad_value),) * 3)
+            canvas.paste(
+                resized, ((target_w - resized_w) // 2, (target_h - resized_h) // 2)
+            )
+            processed.append(torch.from_numpy(np.array(canvas)).permute(2, 0, 1))
+        return torch.stack(processed).to(images.device)
 
     resized = F.interpolate(
         images,
@@ -74,12 +103,14 @@ def resize_with_pad(
 
 
 def normalize_pixels(images: torch.Tensor) -> torch.Tensor:
-    """Map ``[0, 1]`` pixels to ``[-1, 1]`` (SigLIP's expected range).
+    """Map float ``[0, 1]`` or uint8 ``[0, 255]`` pixels to ``[-1, 1]``.
 
     ``images * 2 - 1``. Mirrors lerobot's ``img * 2.0 - 1.0`` step. Apply only
-    to images that are actually in ``[0, 1]``; images already in ``[-1, 1]``
+    to raw uint8 or float ``[0, 1]`` images; images already in ``[-1, 1]``
     should skip this (the processor exposes it as an optional step).
     """
+    if images.dtype == torch.uint8:
+        images = images.to(torch.float32) / 255.0
     return images * 2.0 - 1.0
 
 

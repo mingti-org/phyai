@@ -1,0 +1,63 @@
+# Edit this file, or pass --config with a partial/full YAML override.
+# Paths below are relative to the checkout root, not this YAML's directory.
+# Precedence: typed schema < this file < --config file < dotted CLI overrides.
+# Example overrides: task="Plug in the Ethernet cable" deployment.execution_horizon=20
+# Use --print-config to inspect the merged settings without ROS/GPU allocation.
+# This configuration starts a live deployment; it is not a dry-run configuration.
+task: Plug in the Ethernet cable
+max_steps: null  # Actual Robot.send_action calls; null means continuous until Ctrl-C.
+
+# Device-specific ROS setup, owned by robots/tianji.py. Startup requests ready,
+# this joint mode, optional velocity ratio, then User/Custom input 3. The standard
+# stop/close path requests input 0; it does not restore previous mode/ratio values.
+robot:
+  mode: 3  # 1: joint position; 3: joint impedance. Mode 2 does not accept joint targets.
+  velocity_ratio: null  # Optional controller percentage [0, 100]; null leaves it unchanged.
+  node_name: phyai_tianji_robot
+  service_timeout_s: 3.0  # Per-service availability and response timeout.
+  io_timeout_s: 0.1  # CompositeRobot backend read/write/stop timeout.
+
+# Model/robot mapping, owned by adapters/tianji_pi05.py. State layout is
+# [left joints x7, left gripper, right joints x7, right gripper]; joint units are
+# radians and model gripper values are normalized. Only gripper feedback position
+# enters the model. EEF, wrench, and the rest of the raw feedback stay in Observation.
+# Relative metadata_file paths are the exception to the root-path rule above:
+# they resolve inside the checkpoint directory, not inside this YAML's directory.
+adapter:
+  metadata_file: null  # Relative to checkpoint; null discovers deployment metadata.
+  gripper_limits_rad: [0.0, 1.6]  # Closed/open motor positions; set to actual hardware calibration.
+
+# Engine settings, owned by policies.py. Construction loads the local model;
+# one complete warmup prediction is decoded and discarded before enabling input.
+# Changing execution_horizon below does not shorten the model's 50-step prediction.
+policy:
+  checkpoint: ???  # Required: local converted pi0.5 weights, tokenizer, stats and metadata.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42  # CPU diffusion-noise stream; a fresh sample is drawn for each prediction.
+  # Positive Euler-step count; null preserves config.json. Applied before CUDA
+  # graph capture, so changing this requires restarting the deployment. This
+  # affects predicted trajectories, not horizon length or action/control rates.
+  num_inference_steps: null
+  use_cuda_graph: true
+  num_threads: 16  # PhyAI runtime CPU thread count, not ROS callback threads.
+
+# Shared RobotDeployment settings, owned by options.py and phyai-robot.
+# With defaults, retain 20 of 50 model-rate targets. Adjacent targets are 40 ms
+# apart; the loop interpolates absolute arm/gripper positions every 5 ms. It holds
+# the final target for one source interval: 0.8 s and nominally 160 complete sends.
+# All four action fields are sent at control_hz; there is no separate gripper loop.
+# Queue capacity is in source targets, not expanded 200 Hz commands. Once empty,
+# the queue triggers a fresh observation/prediction and no commands are sent until
+# the new prefix is ready. This is not prediction/execution overlap across chunks.
+# Ensure max_prediction_age_s covers inference plus the intended execution window.
+deployment:
+  action_hz: 25.0  # Source-model targets: 40 ms between adjacent actions.
+  control_hz: 200.0  # Interpolated complete robot commands: nominal 5 ms intervals.
+  execution_horizon: 20  # Execute this prefix of the model's 50 predicted targets.
+  max_queued_actions: 20  # Source-target capacity; must cover execution_horizon.
+  max_sample_age_s: 0.5  # Oldest allowed locally received sample at snapshot time.
+  startup_timeout_s: 10.0  # Wait for first executable prediction after enabling control.
+  observation_timeout_s: 10.0  # Wait for a complete/fresh snapshot before each prediction.
+  max_prediction_age_s: 2.0  # Snapshot-to-send age, including inference and execution.
+  shutdown_timeout_s: 2.0  # Wait for in-flight inference after robot stop/close.
+  max_control_lateness_s: 0.01  # Allow at most 10 ms past a scheduled control tick.

@@ -25,6 +25,7 @@ dependencies = [
 phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
+deployment = ["phyai-robot"]
 ext = ["phyai-ext"]
 fastokenizer = ["fastokens>=0.2.0"]
 
@@ -40,5 +41,6 @@ raw-options = { root = "..", fallback_version = "0.1.0" }
 packages = ["src/phyai"]
 
 [tool.uv.sources]
+phyai-robot = { workspace = true }
 phyai-kernel = { workspace = true }
 phyai-ext = { workspace = true }

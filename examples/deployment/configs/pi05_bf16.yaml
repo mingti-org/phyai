@@ -1,0 +1,32 @@
+# Static BF16 deployment with exact GELU semantics for the pi0.5 MLPs.
+# These overrides preserve checkpoint inference behavior rather than silently
+# substituting a tanh-approximate GELU implementation.
+# This file selects operator implementations; policies.py selects BF16 weights.
+# It does not configure action timing, ROS transport, or the execution horizon.
+schema: phyai.kernel/v1
+profile: static
+defaults:
+  # Do not silently accept an unavailable requested implementation. A kernel
+  # selection failure should surface during model setup/warmup, before control.
+  fallback: error
+overrides:
+  # Gated GELU fuses activation and multiplication; use the exact GELU path.
+  - id: pi05-exact-geglu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: true
+    use: flashinfer.activation.gelu_and_mul
+  # Non-gated GELU uses the corresponding torch implementation.
+  - id: pi05-exact-gelu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: false
+    use: torch.activation.gelu

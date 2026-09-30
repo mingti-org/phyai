@@ -1,0 +1,48 @@
+# Live deployment, like tianji.yaml. --print-config does not start ROS or CUDA.
+# Cameras/Piper drivers must already be running; stop other control clients first.
+task: ""  # Set the instruction used for this checkpoint and scene.
+max_steps: null  # Actual send calls; use a finite value for the first trial.
+
+policy:
+  checkpoint: ???
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42
+  num_inference_steps: null  # Preserve the checkpoint's 10 denoising steps.
+  use_cuda_graph: true
+  num_threads: 4
+
+robot:
+  ros_python: /usr/bin/python3
+  ros_setup: /opt/ros/humble/setup.bash
+  node_name: phyai_agilex
+  domain_id: 0
+  localhost_only: false
+  camera_height: 480
+  camera_width: 640
+  image_topics:
+    front: /camera_f/color/image_raw
+    left: /camera_l/color/image_raw
+    right: /camera_r/color/image_raw
+  state_topics:
+    left: /puppet/joint_left
+    right: /puppet/joint_right
+  command_topics:
+    left: /joint_left_states
+    right: /joint_right_states
+  startup_timeout_s: 15.0
+  observation_timeout_s: 2.0
+  io_timeout_s: 0.25
+
+# Same shared loop/options as Tianji; no robot-specific limits or watchdog.
+# Model predicts 50 targets; retain 25 at 30 Hz, interpolate sends at 200 Hz.
+deployment:
+  action_hz: 30.0
+  control_hz: 200.0
+  execution_horizon: 25
+  max_queued_actions: 25
+  max_sample_age_s: 0.5
+  startup_timeout_s: 10.0
+  observation_timeout_s: 10.0
+  max_prediction_age_s: 2.0
+  shutdown_timeout_s: 2.0
+  max_control_lateness_s: 0.01
