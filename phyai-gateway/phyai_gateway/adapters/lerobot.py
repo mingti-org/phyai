@@ -68,8 +68,6 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
             self._latency_enabled = False
 
     def Ready(self, request, context):
-        print(type(context))
-        print(context)
         session_id = self._session_id(context)
         with self._sessions_lock:
             self._sessions[session_id] = _SessionState()
