@@ -5,9 +5,20 @@ package robot.inference.v1;
 // Model-defined inference requests forwarded by the gateway.
 service ModelInference {
   rpc Infer(InferenceRequest) returns (InferenceResponse);
+  rpc CheckHealth(HealthRequest) returns (HealthResponse);
 }
 
-// Model servers register an endpoint and renew it with heartbeats.
+message HealthRequest {
+  // Registry route to check; a backend may serve multiple model names.
+  string model_name = 1;
+}
+
+message HealthResponse {
+  // True when the backend is ready to accept inference requests.
+  bool healthy = 1;
+}
+
+// Optional backend-initiated registration with renewable leases.
 service ModelRegistry {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);

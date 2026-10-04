@@ -32,7 +32,9 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
             request_id = f"gateway-{next(self._request_ids)}"
             request = self._build_request(sensor_data, request_id, context)
             try:
-                response = self._model_client.infer(request, self._model_name)
+                response = self._model_client.infer(
+                    request, self._model_name, context=context
+                )
             except Exception as error:
                 abort_for_backend_error(context, error)
             yield self._build_action(response, request_id, context)
@@ -132,6 +134,11 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
             context.abort(
                 grpc.StatusCode.DATA_LOSS,
                 "Model Server gripper opening must be in [0, 1]",
+            )
+        if response.inference_time_us >= 2**63:
+            context.abort(
+                grpc.StatusCode.DATA_LOSS,
+                "Model Server inference time must fit signed 64-bit microseconds",
             )
         return robot_pb2.ActionCmd(
             target_joint_angles=values[:-1],

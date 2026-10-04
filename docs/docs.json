@@ -68,6 +68,7 @@
           {
             "group": "Deployment",
             "pages": [
+              "deployment/server-gateway",
               "deployment/parallel-serving"
             ]
           },
@@ -142,6 +143,7 @@
           {
             "group": "部署",
             "pages": [
+              "zh/deployment/server-gateway",
               "zh/deployment/parallel-serving"
             ]
           },

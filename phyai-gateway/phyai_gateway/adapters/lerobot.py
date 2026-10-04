@@ -32,6 +32,7 @@ class _SessionState:
     condition: threading.Condition = field(default_factory=threading.Condition)
     pending_observation: object = None
     setup: _PolicySetup | None = None
+    closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,13 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
     def Ready(self, request, context):
         session_id = self._session_id(context)
         with self._sessions_lock:
+            previous = self._sessions.get(session_id)
+            if previous is not None:
+                with previous.condition:
+                    previous.closed = True
+                    previous.pending_observation = None
+                    previous.setup = None
+                    previous.condition.notify_all()
             self._sessions[session_id] = _SessionState()
         return services_pb2.Empty()
 
@@ -155,11 +163,24 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         with session.condition:
+            if session.closed:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "LeRobot session was reset while decoding PolicySetup",
+                )
             session.setup = setup
             session.pending_observation = None
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):
+        session = self._lookup_session(context)
+        with session.condition:
+            setup = session.setup
+        if setup is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "SendPolicyInstructions must precede observations",
+            )
         payload = bytearray()
         started = False
         completed = False
@@ -210,14 +231,6 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
                 "Observation payload is empty",
             )
 
-        session = self._lookup_session(context)
-        with session.condition:
-            setup = session.setup
-        if setup is None:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "SendPolicyInstructions must precede observations",
-            )
         try:
             observation = self._decode_observation(bytes(payload), setup)
         except Exception as error:
@@ -227,10 +240,10 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         with session.condition:
-            if session.setup is not setup:
+            if session.closed or session.setup is not setup:
                 context.abort(
                     grpc.StatusCode.FAILED_PRECONDITION,
-                    "PolicySetup changed while decoding the observation",
+                    "PolicySetup changed while receiving the observation",
                 )
             session.pending_observation = (observation, setup)
             session.condition.notify()
@@ -238,11 +251,26 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
 
     def GetActions(self, request, context):
         session = self._lookup_session(context)
+
+        def wake_on_cancel():
+            with session.condition:
+                session.condition.notify_all()
+
+        if not context.add_callback(wake_on_cancel):
+            context.abort(grpc.StatusCode.CANCELLED, "Action request was cancelled")
         with session.condition:
             ready = session.condition.wait_for(
-                lambda: session.pending_observation is not None,
+                lambda: session.pending_observation is not None
+                or session.closed
+                or not context.is_active(),
                 timeout=2.0,
             )
+            if not context.is_active():
+                context.abort(grpc.StatusCode.CANCELLED, "Action request was cancelled")
+            if session.closed:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION, "LeRobot session was reset"
+                )
             if not ready:
                 return services_pb2.Actions()
             observation, setup = session.pending_observation
@@ -252,7 +280,9 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
         request_id = f"lerobot-gateway-{next(self._request_ids)}"
         inference_request = self._build_request(observation, request_id, setup)
         try:
-            response = self._model_client.infer(inference_request, setup.model_name)
+            response = self._model_client.infer(
+                inference_request, setup.model_name, context=context
+            )
         except Exception as error:
             abort_for_backend_error(context, error)
 
@@ -270,7 +300,13 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
             )
             for index, action in enumerate(action_tensor)
         ]
-        return services_pb2.Actions(data=pickle.dumps(action_chunk))
+        with session.condition:
+            if session.closed or session.setup is not setup:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "PolicySetup changed while producing actions",
+                )
+            return services_pb2.Actions(data=pickle.dumps(action_chunk))
 
     @staticmethod
     def _decode_observation(payload, setup):

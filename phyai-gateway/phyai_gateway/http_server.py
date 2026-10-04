@@ -1,9 +1,13 @@
+import asyncio
+from contextlib import suppress
 import logging
+import threading
 
 import grpc
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 from phyai_gateway.adapters.rlinf import (
     RLinfAdapter,
@@ -15,6 +19,12 @@ from phyai_gateway.clients.model_inference import NoHealthyModelServerError
 
 MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 logger = logging.getLogger(__name__)
+
+
+class BackendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_name: StrictStr
+    endpoint: StrictStr
 
 
 def _error_response(status_code, code, message):
@@ -39,13 +49,56 @@ def _backend_error_response(error):
     return _error_response(502, "backend_error", error.details())
 
 
-def create_http_app(model_client, *, default_model=None):
+async def _infer_until_disconnect(request, adapter, body):
+    cancelled = threading.Event()
+
+    async def watch_disconnect():
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                cancelled.set()
+                return
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        return await run_in_threadpool(
+            adapter.infer_msgpack, body, cancel_event=cancelled
+        )
+    finally:
+        cancelled.set()
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+
+
+def create_http_app(model_client, *, default_model=None, registry=None):
     app = FastAPI(title="PhyAI Gateway HTTP API")
     rlinf_adapter = RLinfAdapter(model_client, default_model=default_model)
 
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    if registry is not None:
+
+        @app.post("/v1/backends", status_code=202)
+        async def add_backend(request: BackendRequest):
+            try:
+                return registry.add_backend(request.model_name, request.endpoint)
+            except ValueError as error:
+                return _error_response(422, "invalid_backend", str(error))
+
+        @app.get("/v1/backends")
+        async def list_backends():
+            return {"backends": registry.list_backends()}
+
+        @app.delete("/v1/backends/{server_id}", status_code=204)
+        async def remove_backend(server_id: str):
+            if not registry.remove_backend(server_id):
+                return _error_response(
+                    404, "backend_not_found", "backend is not registered"
+                )
+            return Response(status_code=204)
 
     @app.post("/v1/actions/generations")
     async def receive_rlinf_observation(request: Request):
@@ -79,8 +132,8 @@ def create_http_app(model_client, *, default_model=None):
         if not body:
             return _error_response(400, "invalid_msgpack", "request body is empty")
         try:
-            response_body = await run_in_threadpool(
-                rlinf_adapter.infer_msgpack, bytes(body)
+            response_body = await _infer_until_disconnect(
+                request, rlinf_adapter, bytes(body)
             )
         except RLinfWireError as error:
             return _error_response(400, "invalid_msgpack", str(error))

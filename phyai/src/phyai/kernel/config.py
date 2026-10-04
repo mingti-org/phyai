@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Mapping
+from typing import Any, Callable
 from dataclasses import dataclass
 
 
@@ -17,6 +18,7 @@ class KernelConfig:
     # ``profile: autotune`` gets the engine's default select-time hook
     # (phyai.kernel.benchmark); set a callable to override it.
     benchmark: Callable[..., float] | None = None
+    policy_config: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.profile is not None and self.profile.lower() not in {
@@ -28,6 +30,13 @@ class KernelConfig:
             object.__setattr__(self, "profile", self.profile.lower())
         if self.benchmark is not None and not callable(self.benchmark):
             raise TypeError("KernelConfig.benchmark must be callable or None")
+        if self.policy_config is not None:
+            if not isinstance(self.policy_config, Mapping):
+                raise TypeError("KernelConfig.policy_config must be a mapping or None")
+            if self.config_path is not None:
+                raise ValueError(
+                    "KernelConfig.config_path and policy_config are mutually exclusive"
+                )
 
     def policy(self):
         """Build the policy selected by this configuration."""

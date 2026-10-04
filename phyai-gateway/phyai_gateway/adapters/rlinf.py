@@ -44,18 +44,26 @@ def unpack_numpy(value):
     is_scalar = _get_field(value, "__npgeneric__")
     if not is_array and not is_scalar:
         return value
+    dtype_name = _get_field(value, "dtype")
+    if dtype_name is None:
+        raise RLinfWireError("NumPy dtype is required")
     try:
-        dtype = np.dtype(_get_field(value, "dtype"))
+        dtype = np.dtype(dtype_name)
     except (TypeError, ValueError) as error:
         raise RLinfWireError("invalid NumPy dtype") from error
     if dtype.kind in {"O", "V", "c"}:
         raise RLinfWireError(f"unsupported NumPy dtype: {dtype}")
     data = _get_field(value, "data")
     if is_scalar:
+        if data is None:
+            raise RLinfWireError("NumPy scalar data is required")
         try:
-            return dtype.type(data)
+            scalar = dtype.type(data)
         except (TypeError, ValueError, OverflowError) as error:
             raise RLinfWireError("invalid NumPy scalar") from error
+        if not np.isscalar(scalar):
+            raise RLinfWireError("NumPy scalar data must be a scalar")
+        return scalar
     shape = _get_field(value, "shape")
     if not isinstance(data, bytes) or not isinstance(shape, (list, tuple)):
         raise RLinfWireError("invalid NumPy array payload")
@@ -97,7 +105,7 @@ class RLinfAdapter:
         self._model_client = model_client
         self._default_model = default_model
 
-    def infer_msgpack(self, body: bytes) -> bytes:
+    def infer_msgpack(self, body: bytes, *, cancel_event=None) -> bytes:
         try:
             payload = msgpack.unpackb(body, raw=False, object_hook=unpack_numpy)
         except RLinfWireError:
@@ -106,10 +114,13 @@ class RLinfAdapter:
             raise RLinfWireError("invalid MessagePack request") from error
 
         if isinstance(payload, Mapping) and "input" in payload:
-            return self._infer_envelope(payload)
+            return self._infer_envelope(payload, cancel_event=cancel_event)
         data = self._validate_payload(payload, self._default_model)
         request = self._build_request(data, time.time_ns())
-        response = self._model_client.infer(request, data["model_name"])
+        call_options = (
+            {"cancel_event": cancel_event} if cancel_event is not None else {}
+        )
+        response = self._model_client.infer(request, data["model_name"], **call_options)
         batch = self._decode_actions(
             response,
             request.request_id,
@@ -290,7 +301,7 @@ class RLinfAdapter:
             )
         return request
 
-    def _infer_envelope(self, payload):
+    def _infer_envelope(self, payload, *, cancel_event=None):
         model_name = self._model_name(payload, self._default_model)
         if not isinstance(payload["input"], Mapping):
             raise RLinfPayloadError("input must be an object")
@@ -327,10 +338,6 @@ class RLinfAdapter:
                         f"unsupported tensor dtype for {name}: {value.dtype}"
                     )
                 array = np.ascontiguousarray(value, dtype=dtype)
-                if dtype.kind == "f" and not np.isfinite(array).all():
-                    raise RLinfPayloadError(
-                        f"tensor input {name} contains non-finite values"
-                    )
                 request.inputs[name].CopyFrom(
                     model_inference_pb2.Tensor(
                         data=array.tobytes(order="C"),
@@ -349,7 +356,10 @@ class RLinfAdapter:
             raise RLinfPayloadError(
                 "envelope metadata must contain JSON values"
             ) from error
-        response = self._model_client.infer(request, model_name)
+        call_options = (
+            {"cancel_event": cancel_event} if cancel_event is not None else {}
+        )
+        response = self._model_client.infer(request, model_name, **call_options)
         actions = self._decode_actions(response, request.request_id)
         envelope = {
             "data": [

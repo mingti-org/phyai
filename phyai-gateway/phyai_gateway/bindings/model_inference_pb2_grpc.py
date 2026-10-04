@@ -46,12 +46,24 @@ class ModelInferenceStub(object):
             response_deserializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.InferenceResponse.FromString,
             _registered_method=True,
         )
+        self.CheckHealth = channel.unary_unary(
+            "/robot.inference.v1.ModelInference/CheckHealth",
+            request_serializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthRequest.SerializeToString,
+            response_deserializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class ModelInferenceServicer(object):
     """Model-defined inference requests forwarded by the gateway."""
 
     def Infer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def CheckHealth(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
@@ -64,6 +76,11 @@ def add_ModelInferenceServicer_to_server(servicer, server):
             servicer.Infer,
             request_deserializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.InferenceRequest.FromString,
             response_serializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.InferenceResponse.SerializeToString,
+        ),
+        "CheckHealth": grpc.unary_unary_rpc_method_handler(
+            servicer.CheckHealth,
+            request_deserializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthRequest.FromString,
+            response_serializer=phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthResponse.SerializeToString,
         ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -109,9 +126,39 @@ class ModelInference(object):
             _registered_method=True,
         )
 
+    @staticmethod
+    def CheckHealth(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/robot.inference.v1.ModelInference/CheckHealth",
+            phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthRequest.SerializeToString,
+            phyai__gateway_dot_bindings_dot_model__inference__pb2.HealthResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
 
 class ModelRegistryStub(object):
-    """Model servers register an endpoint and renew it with heartbeats."""
+    """Optional backend-initiated registration with renewable leases."""
 
     def __init__(self, channel):
         """Constructor.
@@ -134,7 +181,7 @@ class ModelRegistryStub(object):
 
 
 class ModelRegistryServicer(object):
-    """Model servers register an endpoint and renew it with heartbeats."""
+    """Optional backend-initiated registration with renewable leases."""
 
     def Register(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -173,7 +220,7 @@ def add_ModelRegistryServicer_to_server(servicer, server):
 
 # This class is part of an EXPERIMENTAL API.
 class ModelRegistry(object):
-    """Model servers register an endpoint and renew it with heartbeats."""
+    """Optional backend-initiated registration with renewable leases."""
 
     @staticmethod
     def Register(

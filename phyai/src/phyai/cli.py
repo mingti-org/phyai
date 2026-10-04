@@ -32,6 +32,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     env.add_argument("--json", action="store_true", help="Emit JSON output.")
     env.set_defaults(handler=_run_env)
+
+    server = commands.add_parser(
+        "server", help="Serve a model from a YAML configuration."
+    )
+    server.add_argument("config", help="Path to the server YAML file.")
+    server.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate configuration without starting the model.",
+    )
+    server.set_defaults(handler=_run_server)
     return parser
 
 
@@ -70,11 +81,26 @@ def _run_env(args: argparse.Namespace) -> None:
         print(f"{name}={value if value is not None else ''}")
 
 
+def _run_server(args: argparse.Namespace) -> None:
+    from phyai.server.config import load_server_config
+
+    config = load_server_config(args.config)
+    if args.check:
+        print(f"Configuration valid: {args.config}")
+        return
+    from phyai.server.serving import serve
+
+    serve(config)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run a PhyAI command."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.handler(args)
+    try:
+        args.handler(args)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
 
 __all__ = ["build_parser", "main"]

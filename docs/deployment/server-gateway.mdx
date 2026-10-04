@@ -1,0 +1,225 @@
+---
+title: "Serve models through the gateway"
+description: "Start model servers from YAML, register multiple backends, and connect your LeRobot client."
+---
+
+Prepare the model checkpoint, tokenizer files, and the CUDA environment required by your model. For a source installation, run the setup commands below from the repository root. Activate the environment in each terminal before using `phyai` or `phyai-gateway`.
+
+## Prepare a server configuration
+
+Install phyai and copy the PI0.5 example:
+
+```bash
+uv sync
+source .venv/bin/activate
+cp examples/pi05/server.yaml pi05.yaml
+```
+
+Edit `pi05.yaml` before starting it:
+
+- Set `plugin_args.checkpoint_dir` and `adapter.args.tokenizer_dir` to your local files.
+- Set `adapter.args.image_names` in checkpoint camera order, and set the corresponding `plugin_args.inputs_image_shape` entries to the incoming image sizes.
+- Match `adapter.args.state_dim` and `adapter.args.action_dim` to the checkpoint and client. The example's two cameras, eight state values, and seven action values are example settings.
+- Choose `server.model_name`, `server.port`, and `config.device.target`. The example uses `pi05`, port `50063`, and `cuda`.
+
+For another model, use its `plugin`, `plugin_args`, and `adapter` settings in the same YAML layout.
+
+### Load a separate kernel policy
+
+Add this top-level field to `pi05.yaml`:
+
+```yaml
+kernel_policy: ./kernel-policy.yaml
+```
+
+Create `kernel-policy.yaml` beside it. A minimal policy is:
+
+```yaml
+schema: phyai.kernel/v1
+profile: static
+rules: []
+```
+
+You can also use an absolute path, such as `kernel_policy: /path/to/kernel-policy.yaml`. Relative policy paths resolve from the directory containing `pi05.yaml`, regardless of where you run the command. For local checkpoint and tokenizer paths, use an absolute path or an explicit `./` or `../` prefix.
+
+## Start a model server
+
+```bash
+phyai server pi05.yaml --check
+phyai server pi05.yaml
+```
+
+`--check` checks configuration fields and types without loading the model. It does not verify checkpoint contents or adapter startup.
+
+### Start two servers
+
+Make one YAML file per server:
+
+```bash
+cp pi05.yaml server-a.yaml
+cp pi05.yaml server-b.yaml
+```
+
+For two replicas on one machine, edit these fields:
+
+| File | `server.model_name` | `server.port` | `config.device.target` |
+| --- | --- | --- | --- |
+| `server-a.yaml` | `pi05` | `50063` | `cuda:0` |
+| `server-b.yaml` | `pi05` | `50064` | `cuda:1` |
+
+Run each command in a separate terminal:
+
+```bash
+phyai server server-a.yaml
+phyai server server-b.yaml
+```
+
+On two hosts, both servers can use port `50063` and their local GPU. Register each host's address in the gateway.
+
+## Start the gateway
+
+Repeat `--backend MODEL HOST:PORT` for each server:
+
+```bash
+phyai-gateway \
+  --backend pi05 127.0.0.1:50063 \
+  --backend pi05 127.0.0.1:50064
+```
+
+The gateway listens on gRPC port `50111` and HTTP port `30000`. Each backend's `MODEL` must match its YAML `server.model_name`. Use a reachable host address when the gateway runs on another machine.
+
+To serve different models, give their server YAML files different `model_name` values and register both:
+
+```bash
+phyai-gateway \
+  --backend policy-a 10.0.0.11:50063 \
+  --backend policy-b 10.0.0.12:50063
+```
+
+You can start servers and the gateway in either order. Wait for a backend's `healthy` field to become `true` before sending requests. Reapply registrations after restarting the gateway.
+
+Use multiple replicas for stateless inference. Successive requests from one client can reach different servers; a model that keeps session state needs a single backend for that route.
+
+## Add or remove a backend while running
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/backends \
+  -H 'Content-Type: application/json' \
+  -d '{"model_name":"pi05","endpoint":"127.0.0.1:50065"}'
+
+curl http://127.0.0.1:30000/v1/backends
+
+curl -X DELETE http://127.0.0.1:30000/v1/backends/SERVER_ID
+```
+
+Replace `SERVER_ID` with the `server_id` returned by POST or GET. POST returns `202`; inspect GET to check readiness. DELETE stops new requests from using that registration and lets active requests finish.
+
+## Connect a LeRobot client
+
+Install LeRobot support in the gateway's environment. From the PhyAI repository root:
+
+```bash
+uv pip install -e './phyai-gateway[lerobot]'
+```
+
+Keep the client's existing `pretrained_name_or_path`. Set the server YAML's `server.model_name` and the gateway's registration name to that exact value. For example, if your client uses `your-org/your-policy`, set `server.model_name: your-org/your-policy` before starting the model server, then start the gateway:
+
+```bash
+phyai-gateway --lerobot \
+  --backend your-org/your-policy 10.0.0.11:50063
+```
+
+Replace `10.0.0.11` with the model server's address. For the PI05 adapter, match `adapter.args.image_names` to the client's camera names after any `rename_map`. Set `plugin_args.inputs_image_shape` to the incoming image sizes, and match the state/action dimensions and ordering to your robot and checkpoint. The client's `actions_per_chunk` must not exceed the checkpoint's chunk size.
+
+On the robot machine, use your existing LeRobot environment and client configuration. If that configuration is saved as `robot-client.yaml`, run:
+
+```bash
+python -m lerobot.async_inference.robot_client \
+  --config_path=robot-client.yaml \
+  --server_address=10.0.0.10:50111
+```
+
+Replace `10.0.0.10` with the gateway's address. `robot-client.yaml` is your LeRobot `RobotClientConfig`, including `robot`, `policy_type`, `pretrained_name_or_path`, and `actions_per_chunk`. This command starts the original client's robot control loop. If you already pass those settings as command-line arguments, keep them and change only `--server_address`. No client source changes or extra request headers are needed.
+
+Match the gateway's `--lerobot-fps` to the client's `fps`; both default to `30`. For a client configured at 20 Hz, add `--lerobot-fps 20` to the gateway command. All LeRobot clients on one gateway must use the same rate to receive correctly spaced action timestamps. Use the LeRobot adapter with trusted clients.
+
+### Send one test observation
+
+You can test a request without connecting a robot. This example uses the original PI05 YAML settings: model name `pi05`, eight state values, and the `main_images` and `wrist_images` cameras at 360 × 360 pixels. Start that model server, then start the gateway for this test with:
+
+```bash
+phyai-gateway --lerobot --backend pi05 127.0.0.1:50063
+```
+
+Run the following Python code in your LeRobot environment. Replace the gateway address if it runs on another machine. Replace the zero-valued test observations with real camera images and state values when using your robot.
+
+```python
+import pickle
+import time
+
+import grpc
+import numpy as np
+from lerobot.async_inference.helpers import RemotePolicyConfig, TimedObservation
+from lerobot.transport import services_pb2, services_pb2_grpc
+from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+
+state_names = [f"joint{i}.pos" for i in range(8)]
+camera_names = ["main_images", "wrist_images"]
+image_shape = (360, 360, 3)
+
+features = {
+    "observation.state": {
+        "dtype": "float32",
+        "shape": (8,),
+        "names": state_names,
+    },
+}
+for name in camera_names:
+    features[f"observation.images.{name}"] = {
+        "dtype": "image",
+        "shape": image_shape,
+        "names": ["height", "width", "channels"],
+    }
+
+policy = RemotePolicyConfig(
+    policy_type="pi05",
+    pretrained_name_or_path="pi05",
+    lerobot_features=features,
+    actions_per_chunk=1,
+)
+
+with grpc.insecure_channel(
+    "127.0.0.1:50111", options=grpc_channel_options()
+) as channel:
+    stub = services_pb2_grpc.AsyncInferenceStub(channel)
+    stub.Ready(services_pb2.Empty(), timeout=5)
+    stub.SendPolicyInstructions(
+        services_pb2.PolicySetup(data=pickle.dumps(policy)), timeout=5
+    )
+
+    observation = TimedObservation(
+        timestamp=time.time(),
+        timestep=0,
+        observation={
+            **{name: 0.0 for name in state_names},
+            **{
+                name: np.zeros(image_shape, dtype=np.uint8)
+                for name in camera_names
+            },
+            "task": "pick up the object",
+        },
+    )
+    stub.SendObservations(
+        send_bytes_in_chunks(
+            pickle.dumps(observation), services_pb2.Observation
+        ),
+        timeout=5,
+    )
+    response = stub.GetActions(services_pb2.Empty(), timeout=60)
+    if not response.data:
+        raise RuntimeError("No actions returned")
+    actions = pickle.loads(response.data)
+    print(actions[0].get_action())
+```
+
+The response contains one LeRobot `TimedAction` because this example requests `actions_per_chunk=1`. Its action is a Torch tensor with seven values for the sample server's `action_dim: 7`. Keep the same channel open for setup, observation uploads, and action requests.
