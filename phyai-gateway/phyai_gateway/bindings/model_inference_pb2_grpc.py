@@ -32,7 +32,7 @@ if _version_not_supported:
 
 
 class ModelInferenceStub(object):
-    """Inference requests forwarded by the gateway."""
+    """Model-defined inference requests forwarded by the gateway."""
 
     def __init__(self, channel):
         """Constructor.
@@ -49,7 +49,7 @@ class ModelInferenceStub(object):
 
 
 class ModelInferenceServicer(object):
-    """Inference requests forwarded by the gateway."""
+    """Model-defined inference requests forwarded by the gateway."""
 
     def Infer(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -77,7 +77,7 @@ def add_ModelInferenceServicer_to_server(servicer, server):
 
 # This class is part of an EXPERIMENTAL API.
 class ModelInference(object):
-    """Inference requests forwarded by the gateway."""
+    """Model-defined inference requests forwarded by the gateway."""
 
     @staticmethod
     def Infer(

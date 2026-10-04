@@ -39,9 +39,9 @@ def _backend_error_response(error):
     return _error_response(502, "backend_error", error.details())
 
 
-def create_http_app(model_client):
-    app = FastAPI(title="Robot Gateway HTTP API")
-    rlinf_adapter = RLinfAdapter(model_client)
+def create_http_app(model_client, *, default_model=None):
+    app = FastAPI(title="PhyAI Gateway HTTP API")
+    rlinf_adapter = RLinfAdapter(model_client, default_model=default_model)
 
     @app.get("/health")
     async def health():

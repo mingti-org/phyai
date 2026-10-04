@@ -604,7 +604,8 @@ def main():
     parser.add_argument(
         "--image-names",
         nargs="+",
-        default=("agentview", "robot0_eye_in_hand"),
+        default=("main_images", "wrist_images"),
+        help="Camera names in the incoming request, in checkpoint camera order",
     )
     parser.add_argument(
         "--image-shape",

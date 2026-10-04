@@ -10,6 +10,7 @@ from phyai_gateway.adapters.robot import RobotAdapter
 from phyai_gateway.bindings import model_inference_pb2_grpc, robot_pb2_grpc
 from phyai_gateway.clients.model_inference import ModelInferenceClient
 from phyai_gateway.http_server import MAX_MESSAGE_BYTES, create_http_app
+from phyai_gateway.services.inference import ModelInferenceService
 from phyai_gateway.services.model_registry import ModelRegistryService
 
 SHUTDOWN_GRACE_SECONDS = 5
@@ -18,15 +19,18 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Serve robot gRPC and RLinf HTTP requests."
+        description="Route inference requests to registered model servers."
     )
     parser.add_argument("--gateway", default="0.0.0.0:50111")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--http-host", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=30000)
     parser.add_argument(
+        "--http-model", help="default model for HTTP clients that omit a model name"
+    )
+    parser.add_argument(
         "--robot-model",
-        help="enable RobotInference for a backend returning six joint angles and a gripper opening",
+        help="enable RobotInference for a backend returning joint targets and a gripper opening",
     )
     parser.add_argument(
         "--lerobot",
@@ -52,6 +56,9 @@ def main():
         ],
     )
     model_inference_pb2_grpc.add_ModelRegistryServicer_to_server(registry, server)
+    model_inference_pb2_grpc.add_ModelInferenceServicer_to_server(
+        ModelInferenceService(model_client), server
+    )
     if args.robot_model:
         robot_pb2_grpc.add_RobotInferenceServicer_to_server(
             RobotAdapter(model_client, model_name=args.robot_model), server
@@ -73,7 +80,7 @@ def main():
         server.start()
         logger.info("Gateway gRPC listening on %s", args.gateway)
         uvicorn.run(
-            create_http_app(model_client),
+            create_http_app(model_client, default_model=args.http_model),
             host=args.http_host,
             port=args.http_port,
             timeout_graceful_shutdown=SHUTDOWN_GRACE_SECONDS,

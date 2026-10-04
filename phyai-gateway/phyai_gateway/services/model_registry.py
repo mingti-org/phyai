@@ -55,7 +55,7 @@ class ModelRegistryService(model_inference_pb2_grpc.ModelRegistryServicer):
                 (
                     server
                     for server in self._servers.values()
-                    if server.endpoint == endpoint
+                    if server.endpoint == endpoint and server.model_name == model_name
                 ),
                 None,
             )
@@ -65,7 +65,6 @@ class ModelRegistryService(model_inference_pb2_grpc.ModelRegistryServicer):
                 self._servers[server_id] = server
             else:
                 server_id = server.server_id
-                server.model_name = model_name
                 server.last_heartbeat = now
 
         logger.info(

@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n,phyai_gateway/bindings/model_inference.proto\x12\x12robot.inference.v1"R\n\x06Tensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x04\x12+\n\x05\x64type\x18\x03 \x01(\x0e\x32\x1c.robot.inference.v1.DataType"\xc5\x01\n\x05Image\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\r\n\x05shape\x18\x03 \x03(\x04\x12+\n\x05\x64type\x18\x04 \x01(\x0e\x32\x1c.robot.inference.v1.DataType\x12\x33\n\x08\x65ncoding\x18\x05 \x01(\x0e\x32!.robot.inference.v1.ImageEncoding\x12/\n\x06layout\x18\x06 \x01(\x0e\x32\x1f.robot.inference.v1.ImageLayout"\xe8\x01\n\x10InferenceRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\x02 \x01(\x03\x12)\n\x06images\x18\x03 \x03(\x0b\x32\x19.robot.inference.v1.Image\x12/\n\x0brobot_state\x18\x04 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor\x12\x13\n\x0binstruction\x18\x05 \x01(\t\x12 \n\x18requested_action_horizon\x18\x06 \x01(\r\x12\x17\n\x0f\x65xtensions_json\x18\x07 \x01(\t"\x88\x01\n\x11InferenceResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12+\n\x07\x61\x63tions\x18\x02 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor\x12\x19\n\x11inference_time_us\x18\x03 \x01(\x04\x12\x17\n\x0f\x65xtensions_json\x18\x04 \x01(\t"7\n\x0fRegisterRequest\x12\x10\n\x08\x65ndpoint\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t"l\n\x10RegisterResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x11\n\tserver_id\x18\x02 \x01(\t\x12"\n\x1aheartbeat_interval_seconds\x18\x03 \x01(\r\x12\x0f\n\x07message\x18\x04 \x01(\t"%\n\x10HeartbeatRequest\x12\x11\n\tserver_id\x18\x01 \x01(\t"8\n\x11HeartbeatResponse\x12\x12\n\nregistered\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t*\xd5\x01\n\x08\x44\x61taType\x12\x19\n\x15\x44\x41TA_TYPE_UNSPECIFIED\x10\x00\x12\x13\n\x0f\x44\x41TA_TYPE_UINT8\x10\x01\x12\x13\n\x0f\x44\x41TA_TYPE_INT32\x10\x02\x12\x13\n\x0f\x44\x41TA_TYPE_INT64\x10\x03\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT16\x10\x04\x12\x16\n\x12\x44\x41TA_TYPE_BFLOAT16\x10\x05\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT32\x10\x06\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT64\x10\x07\x12\x12\n\x0e\x44\x41TA_TYPE_BOOL\x10\x08*x\n\rImageEncoding\x12\x1e\n\x1aIMAGE_ENCODING_UNSPECIFIED\x10\x00\x12\x16\n\x12IMAGE_ENCODING_RAW\x10\x01\x12\x17\n\x13IMAGE_ENCODING_JPEG\x10\x02\x12\x16\n\x12IMAGE_ENCODING_PNG\x10\x03*W\n\x0bImageLayout\x12\x1c\n\x18IMAGE_LAYOUT_UNSPECIFIED\x10\x00\x12\x14\n\x10IMAGE_LAYOUT_HWC\x10\x01\x12\x14\n\x10IMAGE_LAYOUT_CHW\x10\x02\x32\x66\n\x0eModelInference\x12T\n\x05Infer\x12$.robot.inference.v1.InferenceRequest\x1a%.robot.inference.v1.InferenceResponse2\xc0\x01\n\rModelRegistry\x12U\n\x08Register\x12#.robot.inference.v1.RegisterRequest\x1a$.robot.inference.v1.RegisterResponse\x12X\n\tHeartbeat\x12$.robot.inference.v1.HeartbeatRequest\x1a%.robot.inference.v1.HeartbeatResponseb\x06proto3'
+    b'\n,phyai_gateway/bindings/model_inference.proto\x12\x12robot.inference.v1"R\n\x06Tensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x04\x12+\n\x05\x64type\x18\x03 \x01(\x0e\x32\x1c.robot.inference.v1.DataType"\xc5\x01\n\x05Image\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\r\n\x05shape\x18\x03 \x03(\x04\x12+\n\x05\x64type\x18\x04 \x01(\x0e\x32\x1c.robot.inference.v1.DataType\x12\x33\n\x08\x65ncoding\x18\x05 \x01(\x0e\x32!.robot.inference.v1.ImageEncoding\x12/\n\x06layout\x18\x06 \x01(\x0e\x32\x1f.robot.inference.v1.ImageLayout"\x89\x03\n\x10InferenceRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\x02 \x01(\x03\x12)\n\x06images\x18\x03 \x03(\x0b\x32\x19.robot.inference.v1.Image\x12/\n\x0brobot_state\x18\x04 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor\x12\x13\n\x0binstruction\x18\x05 \x01(\t\x12 \n\x18requested_action_horizon\x18\x06 \x01(\r\x12\x17\n\x0f\x65xtensions_json\x18\x07 \x01(\t\x12\x12\n\nmodel_name\x18\x08 \x01(\t\x12@\n\x06inputs\x18\t \x03(\x0b\x32\x30.robot.inference.v1.InferenceRequest.InputsEntry\x1aI\n\x0bInputsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12)\n\x05value\x18\x02 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor:\x02\x38\x01"\x99\x02\n\x11InferenceResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12+\n\x07\x61\x63tions\x18\x02 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor\x12\x19\n\x11inference_time_us\x18\x03 \x01(\x04\x12\x17\n\x0f\x65xtensions_json\x18\x04 \x01(\t\x12\x43\n\x07outputs\x18\x05 \x03(\x0b\x32\x32.robot.inference.v1.InferenceResponse.OutputsEntry\x1aJ\n\x0cOutputsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12)\n\x05value\x18\x02 \x01(\x0b\x32\x1a.robot.inference.v1.Tensor:\x02\x38\x01"7\n\x0fRegisterRequest\x12\x10\n\x08\x65ndpoint\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t"l\n\x10RegisterResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x11\n\tserver_id\x18\x02 \x01(\t\x12"\n\x1aheartbeat_interval_seconds\x18\x03 \x01(\r\x12\x0f\n\x07message\x18\x04 \x01(\t"%\n\x10HeartbeatRequest\x12\x11\n\tserver_id\x18\x01 \x01(\t"8\n\x11HeartbeatResponse\x12\x12\n\nregistered\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t*\xd5\x01\n\x08\x44\x61taType\x12\x19\n\x15\x44\x41TA_TYPE_UNSPECIFIED\x10\x00\x12\x13\n\x0f\x44\x41TA_TYPE_UINT8\x10\x01\x12\x13\n\x0f\x44\x41TA_TYPE_INT32\x10\x02\x12\x13\n\x0f\x44\x41TA_TYPE_INT64\x10\x03\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT16\x10\x04\x12\x16\n\x12\x44\x41TA_TYPE_BFLOAT16\x10\x05\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT32\x10\x06\x12\x15\n\x11\x44\x41TA_TYPE_FLOAT64\x10\x07\x12\x12\n\x0e\x44\x41TA_TYPE_BOOL\x10\x08*x\n\rImageEncoding\x12\x1e\n\x1aIMAGE_ENCODING_UNSPECIFIED\x10\x00\x12\x16\n\x12IMAGE_ENCODING_RAW\x10\x01\x12\x17\n\x13IMAGE_ENCODING_JPEG\x10\x02\x12\x16\n\x12IMAGE_ENCODING_PNG\x10\x03*W\n\x0bImageLayout\x12\x1c\n\x18IMAGE_LAYOUT_UNSPECIFIED\x10\x00\x12\x14\n\x10IMAGE_LAYOUT_HWC\x10\x01\x12\x14\n\x10IMAGE_LAYOUT_CHW\x10\x02\x32\x66\n\x0eModelInference\x12T\n\x05Infer\x12$.robot.inference.v1.InferenceRequest\x1a%.robot.inference.v1.InferenceResponse2\xc0\x01\n\rModelRegistry\x12U\n\x08Register\x12#.robot.inference.v1.RegisterRequest\x1a$.robot.inference.v1.RegisterResponse\x12X\n\tHeartbeat\x12$.robot.inference.v1.HeartbeatRequest\x1a%.robot.inference.v1.HeartbeatResponseb\x06proto3'
 )
 
 _globals = globals()
@@ -35,30 +35,38 @@ _builder.BuildTopDescriptorsAndMessages(
 )
 if not _descriptor._USE_C_DESCRIPTORS:
     DESCRIPTOR._loaded_options = None
-    _globals["_DATATYPE"]._serialized_start = 991
-    _globals["_DATATYPE"]._serialized_end = 1204
-    _globals["_IMAGEENCODING"]._serialized_start = 1206
-    _globals["_IMAGEENCODING"]._serialized_end = 1326
-    _globals["_IMAGELAYOUT"]._serialized_start = 1328
-    _globals["_IMAGELAYOUT"]._serialized_end = 1415
+    _globals["_INFERENCEREQUEST_INPUTSENTRY"]._loaded_options = None
+    _globals["_INFERENCEREQUEST_INPUTSENTRY"]._serialized_options = b"8\001"
+    _globals["_INFERENCERESPONSE_OUTPUTSENTRY"]._loaded_options = None
+    _globals["_INFERENCERESPONSE_OUTPUTSENTRY"]._serialized_options = b"8\001"
+    _globals["_DATATYPE"]._serialized_start = 1297
+    _globals["_DATATYPE"]._serialized_end = 1510
+    _globals["_IMAGEENCODING"]._serialized_start = 1512
+    _globals["_IMAGEENCODING"]._serialized_end = 1632
+    _globals["_IMAGELAYOUT"]._serialized_start = 1634
+    _globals["_IMAGELAYOUT"]._serialized_end = 1721
     _globals["_TENSOR"]._serialized_start = 68
     _globals["_TENSOR"]._serialized_end = 150
     _globals["_IMAGE"]._serialized_start = 153
     _globals["_IMAGE"]._serialized_end = 350
     _globals["_INFERENCEREQUEST"]._serialized_start = 353
-    _globals["_INFERENCEREQUEST"]._serialized_end = 585
-    _globals["_INFERENCERESPONSE"]._serialized_start = 588
-    _globals["_INFERENCERESPONSE"]._serialized_end = 724
-    _globals["_REGISTERREQUEST"]._serialized_start = 726
-    _globals["_REGISTERREQUEST"]._serialized_end = 781
-    _globals["_REGISTERRESPONSE"]._serialized_start = 783
-    _globals["_REGISTERRESPONSE"]._serialized_end = 891
-    _globals["_HEARTBEATREQUEST"]._serialized_start = 893
-    _globals["_HEARTBEATREQUEST"]._serialized_end = 930
-    _globals["_HEARTBEATRESPONSE"]._serialized_start = 932
-    _globals["_HEARTBEATRESPONSE"]._serialized_end = 988
-    _globals["_MODELINFERENCE"]._serialized_start = 1417
-    _globals["_MODELINFERENCE"]._serialized_end = 1519
-    _globals["_MODELREGISTRY"]._serialized_start = 1522
-    _globals["_MODELREGISTRY"]._serialized_end = 1714
+    _globals["_INFERENCEREQUEST"]._serialized_end = 746
+    _globals["_INFERENCEREQUEST_INPUTSENTRY"]._serialized_start = 673
+    _globals["_INFERENCEREQUEST_INPUTSENTRY"]._serialized_end = 746
+    _globals["_INFERENCERESPONSE"]._serialized_start = 749
+    _globals["_INFERENCERESPONSE"]._serialized_end = 1030
+    _globals["_INFERENCERESPONSE_OUTPUTSENTRY"]._serialized_start = 956
+    _globals["_INFERENCERESPONSE_OUTPUTSENTRY"]._serialized_end = 1030
+    _globals["_REGISTERREQUEST"]._serialized_start = 1032
+    _globals["_REGISTERREQUEST"]._serialized_end = 1087
+    _globals["_REGISTERRESPONSE"]._serialized_start = 1089
+    _globals["_REGISTERRESPONSE"]._serialized_end = 1197
+    _globals["_HEARTBEATREQUEST"]._serialized_start = 1199
+    _globals["_HEARTBEATREQUEST"]._serialized_end = 1236
+    _globals["_HEARTBEATRESPONSE"]._serialized_start = 1238
+    _globals["_HEARTBEATRESPONSE"]._serialized_end = 1294
+    _globals["_MODELINFERENCE"]._serialized_start = 1723
+    _globals["_MODELINFERENCE"]._serialized_end = 1825
+    _globals["_MODELREGISTRY"]._serialized_start = 1828
+    _globals["_MODELREGISTRY"]._serialized_end = 2020
 # @@protoc_insertion_point(module_scope)

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package robot.inference.v1;
 
-// Inference requests forwarded by the gateway.
+// Model-defined inference requests forwarded by the gateway.
 service ModelInference {
   rpc Infer(InferenceRequest) returns (InferenceResponse);
 }
@@ -48,7 +48,7 @@ message Tensor {
 }
 
 message Image {
-  // Camera name understood by the model, e.g. "agentview".
+  // Camera name understood by the model, e.g. "front".
   string name = 1;
   // RAW pixels or a complete JPEG/PNG file.
   bytes data = 2;
@@ -65,22 +65,28 @@ message InferenceRequest {
   // Observation capture time, as Unix nanoseconds.
   int64 timestamp_ns = 2;
   repeated Image images = 3;
-  // State [D] or [B, D]; the model defines dimension order and units.
+  // Optional robot-policy fields; the model defines shapes, order, and units.
   Tensor robot_state = 4;
   string instruction = 5;
   // Zero selects the model's default horizon.
   uint32 requested_action_horizon = 6;
-  // Adapter-specific JSON. RLinf includes per-sample "instructions" here.
+  // Model-defined JSON metadata.
   string extensions_json = 7;
+  // Registry route, required when calling the gateway's Infer RPC.
+  string model_name = 8;
+  // Named model inputs; shapes and dtypes are defined by the backend.
+  map<string, Tensor> inputs = 9;
 }
 
 message InferenceResponse {
   string request_id = 1;
-  // Actions [T, D] or [B, T, D], with model-specific dimension semantics.
+  // Optional robot-policy output, with model-defined shape and semantics.
   Tensor actions = 2;
   // Model execution time, excluding gRPC transport.
   uint64 inference_time_us = 3;
   string extensions_json = 4;
+  // Named model outputs, including predictions other than robot actions.
+  map<string, Tensor> outputs = 5;
 }
 
 message RegisterRequest {

@@ -1,4 +1,5 @@
 import itertools
+import json
 import math
 import struct
 import time
@@ -19,7 +20,7 @@ IMAGE_BYTES = IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS
 
 
 class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
-    """Serve a backend that returns six joint targets and one gripper opening."""
+    """Translate the fixed RobotInference wire format into backend requests."""
 
     def __init__(self, model_client, model_name):
         self._model_client = model_client
@@ -86,6 +87,14 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
             ),
             instruction=sensor_data.language_instruction,
             requested_action_horizon=1,
+            extensions_json=json.dumps(
+                {
+                    "robot": {
+                        "joint_angle_count": len(state.joint_angles),
+                        "joint_velocity_count": len(state.joint_velocities),
+                    }
+                }
+            ),
         )
 
     @staticmethod
@@ -101,10 +110,10 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
                 grpc.StatusCode.DATA_LOSS,
                 "Model Server actions dtype must be FLOAT32",
             )
-        if list(actions.shape) != [1, 7]:
+        if len(actions.shape) != 2 or actions.shape[0] != 1 or actions.shape[1] < 2:
             context.abort(
                 grpc.StatusCode.DATA_LOSS,
-                "Model Server actions must have shape [1, 7]: six joint targets and a gripper opening",
+                "Model Server actions must have shape [1, joint_count + 1]: joint targets then gripper opening",
             )
         value_count = actions.shape[1]
         if len(actions.data) != value_count * 4:
@@ -119,14 +128,14 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
                 grpc.StatusCode.DATA_LOSS,
                 "Model Server actions contain non-finite values",
             )
-        if not 0.0 <= values[6] <= 1.0:
+        if not 0.0 <= values[-1] <= 1.0:
             context.abort(
                 grpc.StatusCode.DATA_LOSS,
                 "Model Server gripper opening must be in [0, 1]",
             )
         return robot_pb2.ActionCmd(
-            target_joint_angles=values[:6],
-            gripper_opening=values[6],
+            target_joint_angles=values[:-1],
+            gripper_opening=values[-1],
             timestamp_ns=time.time_ns(),
             inference_time=response.inference_time_us,
         )

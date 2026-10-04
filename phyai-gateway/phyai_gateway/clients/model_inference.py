@@ -22,8 +22,20 @@ class ModelInferenceClient:
         self._closed = False
 
     def infer(
-        self, request: model_inference_pb2.InferenceRequest, model_name: str
+        self,
+        request: model_inference_pb2.InferenceRequest,
+        model_name: str,
+        *,
+        timeout: float | None = None,
     ) -> model_inference_pb2.InferenceResponse:
+        model_name = model_name.strip()
+        if request.model_name and request.model_name.strip() != model_name:
+            raise ValueError("request model_name does not match the selected route")
+        if request.model_name != model_name:
+            forwarded = model_inference_pb2.InferenceRequest()
+            forwarded.CopyFrom(request)
+            forwarded.model_name = model_name
+            request = forwarded
         selected = self._registry.acquire_server(model_name)
         if selected is None:
             raise NoHealthyModelServerError(
@@ -50,7 +62,14 @@ class ModelInferenceClient:
                     self._channels[selected.endpoint] = channel
                     self._stubs[selected.endpoint] = stub
 
-            return stub.Infer(request, timeout=INFERENCE_TIMEOUT_SECONDS)
+            return stub.Infer(
+                request,
+                timeout=(
+                    INFERENCE_TIMEOUT_SECONDS
+                    if timeout is None
+                    else min(INFERENCE_TIMEOUT_SECONDS, timeout)
+                ),
+            )
         finally:
             self._registry.release_server(selected.server_id)
 
