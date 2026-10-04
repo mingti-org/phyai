@@ -9,6 +9,7 @@ dependencies = [
     "phyai-ext",
     "phyai-model-optimizer",
     "phyai-utils-tools",
+    "phyai-gateway",
 ]
 
 [tool.ruff.format]
@@ -21,7 +22,7 @@ length-sort = true
 package = false
 
 [tool.uv.workspace]
-members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools"]
+members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools", "phyai-gateway"]
 
 [tool.uv.sources]
 phyai = { workspace = true }
@@ -29,6 +30,7 @@ phyai-kernel = { workspace = true }
 phyai-ext = { workspace = true }
 phyai-model-optimizer = { workspace = true }
 phyai-utils-tools = { workspace = true }
+phyai-gateway = { workspace = true }
 
 [dependency-groups]
 dev = [

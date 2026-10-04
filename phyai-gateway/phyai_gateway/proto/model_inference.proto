@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package robot.inference.v1;
+
+// Inference requests forwarded by the gateway.
+service ModelInference {
+  rpc Infer(InferenceRequest) returns (InferenceResponse);
+}
+
+// Model servers register an endpoint and renew it with heartbeats.
+service ModelRegistry {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
+  DATA_TYPE_UINT8 = 1;
+  DATA_TYPE_INT32 = 2;
+  DATA_TYPE_INT64 = 3;
+  DATA_TYPE_FLOAT16 = 4;
+  DATA_TYPE_BFLOAT16 = 5;
+  DATA_TYPE_FLOAT32 = 6;
+  DATA_TYPE_FLOAT64 = 7;
+  DATA_TYPE_BOOL = 8;
+}
+
+enum ImageEncoding {
+  IMAGE_ENCODING_UNSPECIFIED = 0;
+  IMAGE_ENCODING_RAW = 1;
+  IMAGE_ENCODING_JPEG = 2;
+  IMAGE_ENCODING_PNG = 3;
+}
+
+// A batch adds a leading dimension to either layout.
+enum ImageLayout {
+  IMAGE_LAYOUT_UNSPECIFIED = 0;
+  IMAGE_LAYOUT_HWC = 1;
+  IMAGE_LAYOUT_CHW = 2;
+}
+
+// Contiguous C-order data. Multi-byte values are little-endian;
+// data length must equal the product of shape and dtype size.
+message Tensor {
+  bytes data = 1;
+  repeated uint64 shape = 2;
+  DataType dtype = 3;
+}
+
+message Image {
+  // Camera name understood by the model, e.g. "agentview".
+  string name = 1;
+  // RAW pixels or a complete JPEG/PNG file.
+  bytes data = 2;
+  // Required for RAW data: [H, W, C], [C, H, W], or a batch of either.
+  repeated uint64 shape = 3;
+  DataType dtype = 4;
+  ImageEncoding encoding = 5;
+  ImageLayout layout = 6;
+}
+
+message InferenceRequest {
+  // The model server returns this identifier unchanged.
+  string request_id = 1;
+  // Observation capture time, as Unix nanoseconds.
+  int64 timestamp_ns = 2;
+  repeated Image images = 3;
+  // State [D] or [B, D]; the model defines dimension order and units.
+  Tensor robot_state = 4;
+  string instruction = 5;
+  // Zero selects the model's default horizon.
+  uint32 requested_action_horizon = 6;
+  // Adapter-specific JSON. RLinf includes per-sample "instructions" here.
+  string extensions_json = 7;
+}
+
+message InferenceResponse {
+  string request_id = 1;
+  // Actions [T, D] or [B, T, D], with model-specific dimension semantics.
+  Tensor actions = 2;
+  // Model execution time, excluding gRPC transport.
+  uint64 inference_time_us = 3;
+  string extensions_json = 4;
+}
+
+message RegisterRequest {
+  // Address reachable by the gateway, e.g. "127.0.0.1:50061".
+  string endpoint = 1;
+  string model_name = 2;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string server_id = 2;
+  uint32 heartbeat_interval_seconds = 3;
+  // Empty on success.
+  string message = 4;
+}
+
+message HeartbeatRequest {
+  string server_id = 1;
+}
+
+message HeartbeatResponse {
+  // Re-register if false.
+  bool registered = 1;
+  string message = 2;
+}

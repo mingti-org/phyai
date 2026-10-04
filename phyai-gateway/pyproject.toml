@@ -1,0 +1,32 @@
+[project]
+name = "phyai-gateway"
+version = "0.1.0"
+description = "HTTP and gRPC gateway for PhyAI model inference."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "grpcio>=1.73.1",
+    "msgpack",
+    "numpy",
+    "protobuf>=6.31.1",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+lerobot = ["lerobot", "torch"]
+benchmark = ["httpx"]
+codegen = ["grpcio-tools==1.73.1"]
+
+[project.scripts]
+phyai-gateway = "phyai_gateway.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["phyai_gateway"]
+
+[tool.hatch.build.targets.sdist]
+include = ["phyai_gateway", "examples", "pyproject.toml", "README.md"]
