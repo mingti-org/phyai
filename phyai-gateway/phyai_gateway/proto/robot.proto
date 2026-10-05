@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package robot;
+
+message RobotState {
+  repeated double joint_angles = 1;  // Radians.
+  repeated double joint_velocities = 2;
+  double x = 3;
+  double y = 4;
+  double z = 5;
+  double roll = 6;
+  double pitch = 7;
+  double yaw = 8;
+}
+
+message SensorData {
+  bytes image_rgb = 1;  // Raw uint8 RGB pixels, [480, 640, 3].
+  bytes image_depth = 2;  // Unused by the current adapter.
+  int64 timestamp_ns = 3;  // Unix nanoseconds.
+  RobotState state = 4;
+  string language_instruction = 5;
+}
+
+message ActionCmd {
+  repeated double target_joint_angles = 1;
+  repeated double target_joint_velocities = 2;
+  double gripper_opening = 3;  // [0, 1].
+  int64 timestamp_ns = 4;  // Unix nanoseconds.
+  int64 inference_time = 5;  // Model execution time in microseconds.
+}
+
+service RobotInference {
+  // One action command for each observation in the stream.
+  rpc Communicate(stream SensorData) returns (stream ActionCmd);
+}

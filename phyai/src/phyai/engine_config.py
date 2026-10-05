@@ -252,6 +252,7 @@ class EngineConfig:
         kernel_kw: dict[str, object] = {}
         if (v := envs.PHYAI_KERNEL_CONFIG.get()) is not None:
             kernel_kw["config_path"] = v
+            kernel_kw["policy_config"] = None
         if (v := envs.PHYAI_KERNEL_PROFILE.get()) is not None:
             kernel_kw["profile"] = v
         if (v := envs.PHYAI_KERNEL_AUTOTUNE_CACHE.get()) is not None:

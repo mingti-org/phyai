@@ -1,0 +1,225 @@
+---
+title: "通过 Gateway 部署模型服务"
+description: "用 YAML 启动模型服务，注册多个后端，并连接 LeRobot 客户端。"
+---
+
+先准备模型权重、tokenizer 文件，以及模型所需的 CUDA 环境。从源码安装时，在仓库根目录执行下面的安装命令。每打开一个终端，都要先激活环境，再使用 `phyai` 或 `phyai-gateway`。
+
+## 准备服务配置
+
+安装 phyai，复制 PI0.5 示例：
+
+```bash
+uv sync
+source .venv/bin/activate
+cp examples/pi05/server.yaml pi05.yaml
+```
+
+启动前修改 `pi05.yaml`：
+
+- 将 `plugin_args.checkpoint_dir` 和 `adapter.args.tokenizer_dir` 改为本地文件路径。
+- 按 checkpoint 的相机顺序设置 `adapter.args.image_names`，并将对应的 `plugin_args.inputs_image_shape` 改为客户端输入图像的尺寸。
+- 根据 checkpoint 和客户端设置 `adapter.args.state_dim`、`adapter.args.action_dim`。示例中的两个相机、8 维状态和 7 维动作只是示例配置。
+- 设置 `server.model_name`、`server.port` 和 `config.device.target`。示例分别使用 `pi05`、`50063` 和 `cuda`。
+
+部署其他模型时，在同一 YAML 格式中使用该模型的 `plugin`、`plugin_args` 和 `adapter` 配置。
+
+### 使用独立的 kernel policy 文件
+
+在 `pi05.yaml` 顶层加入：
+
+```yaml
+kernel_policy: ./kernel-policy.yaml
+```
+
+在同一目录创建 `kernel-policy.yaml`。最小配置如下：
+
+```yaml
+schema: phyai.kernel/v1
+profile: static
+rules: []
+```
+
+也可以使用绝对路径，例如 `kernel_policy: /path/to/kernel-policy.yaml`。相对 policy 路径以 `pi05.yaml` 所在目录为基准，与执行命令时的目录无关。本地权重和 tokenizer 路径请使用绝对路径，或明确以 `./`、`../` 开头。
+
+## 启动模型服务
+
+```bash
+phyai server pi05.yaml --check
+phyai server pi05.yaml
+```
+
+`--check` 检查配置字段和类型，不加载模型，也不验证权重内容或 adapter 能否启动。
+
+### 启动两个服务
+
+为每个服务准备一份 YAML：
+
+```bash
+cp pi05.yaml server-a.yaml
+cp pi05.yaml server-b.yaml
+```
+
+在同一台机器上启动两个副本时，修改以下字段：
+
+| 文件 | `server.model_name` | `server.port` | `config.device.target` |
+| --- | --- | --- | --- |
+| `server-a.yaml` | `pi05` | `50063` | `cuda:0` |
+| `server-b.yaml` | `pi05` | `50064` | `cuda:1` |
+
+在两个终端中分别运行：
+
+```bash
+phyai server server-a.yaml
+phyai server server-b.yaml
+```
+
+如果使用两台机器，两份配置都可以使用端口 `50063` 和各自的本地 GPU。在 gateway 中注册对应机器的地址。
+
+## 启动 gateway
+
+每个服务对应一组 `--backend MODEL HOST:PORT`，可以重复传入：
+
+```bash
+phyai-gateway \
+  --backend pi05 127.0.0.1:50063 \
+  --backend pi05 127.0.0.1:50064
+```
+
+Gateway 的 gRPC 端口默认为 `50111`，HTTP 端口默认为 `30000`。每组后端的 `MODEL` 必须与其 YAML 中的 `server.model_name` 一致。Gateway 在其他机器上运行时，请填写可访问的服务地址。
+
+部署不同模型时，在各自的服务 YAML 中设置不同的 `model_name`，再分别注册：
+
+```bash
+phyai-gateway \
+  --backend policy-a 10.0.0.11:50063 \
+  --backend policy-b 10.0.0.12:50063
+```
+
+模型服务与 gateway 可以按任意顺序启动。等待后端的 `healthy` 字段变为 `true` 后再发送请求。Gateway 重启后需要重新注册后端。
+
+多副本适用于无状态推理。同一个客户端的连续请求可能发往不同服务；如果模型需要保留会话状态，请为该模型只注册一个后端。
+
+## 运行中添加或移除后端
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/backends \
+  -H 'Content-Type: application/json' \
+  -d '{"model_name":"pi05","endpoint":"127.0.0.1:50065"}'
+
+curl http://127.0.0.1:30000/v1/backends
+
+curl -X DELETE http://127.0.0.1:30000/v1/backends/SERVER_ID
+```
+
+将 `SERVER_ID` 替换为 POST 或 GET 返回的 `server_id`。POST 返回 `202` 后，通过 GET 查看是否就绪。DELETE 会停止向该注册项发送新请求，正在执行的请求可以完成。
+
+## 连接 LeRobot 客户端
+
+在 gateway 的环境中安装 LeRobot 支持。在 PhyAI 仓库根目录执行：
+
+```bash
+uv pip install -e './phyai-gateway[lerobot]'
+```
+
+保留客户端原有的 `pretrained_name_or_path`，将服务 YAML 的 `server.model_name` 和 gateway 注册名都设为这个值。例如，客户端使用 `your-org/your-policy`，就先将 `server.model_name` 改为 `your-org/your-policy`，启动模型服务，再启动 gateway：
+
+```bash
+phyai-gateway --lerobot \
+  --backend your-org/your-policy 10.0.0.11:50063
+```
+
+将 `10.0.0.11` 替换为模型服务所在机器的地址。使用 PI05 adapter 时，`adapter.args.image_names` 要与客户端应用 `rename_map` 后的相机名称一致，`plugin_args.inputs_image_shape` 要填写传入图像的尺寸。状态和动作的维度、顺序应与机器人和 checkpoint 一致。客户端的 `actions_per_chunk` 不能超过 checkpoint 的 chunk size。
+
+在机器人所在机器上，使用已有的 LeRobot 环境和客户端配置。如果配置文件是 `robot-client.yaml`，运行：
+
+```bash
+python -m lerobot.async_inference.robot_client \
+  --config_path=robot-client.yaml \
+  --server_address=10.0.0.10:50111
+```
+
+将 `10.0.0.10` 替换为 gateway 所在机器的地址。`robot-client.yaml` 是 LeRobot 的 `RobotClientConfig`，包含 `robot`、`policy_type`、`pretrained_name_or_path` 和 `actions_per_chunk` 等配置。这个命令会启动原版客户端的机器人控制循环。如果你已经通过命令行传入这些配置，保留原有参数，只修改 `--server_address` 即可，无需修改客户端源码或添加请求头。
+
+Gateway 的 `--lerobot-fps` 要与客户端的 `fps` 相同，两者默认都是 `30`。客户端使用 20 Hz 时，在 gateway 命令中加上 `--lerobot-fps 20`。连接同一个 gateway 的 LeRobot 客户端必须使用相同频率，才能收到间隔正确的动作时间戳。LeRobot adapter 用于可信客户端。
+
+### 发送一条测试观测
+
+不连接机器人也可以测试请求。下面使用 PI05 示例的原始配置：模型名为 `pi05`，状态为 8 维，相机为 `main_images` 和 `wrist_images`，图像尺寸均为 360 × 360。启动这个模型服务后，用以下命令启动测试用 gateway：
+
+```bash
+phyai-gateway --lerobot --backend pi05 127.0.0.1:50063
+```
+
+在 LeRobot 环境中运行下面的 Python 代码。Gateway 在其他机器上时，替换代码中的地址。全零观测只用于测试；处理机器人观测时，换成实际的相机图像和状态值。
+
+```python
+import pickle
+import time
+
+import grpc
+import numpy as np
+from lerobot.async_inference.helpers import RemotePolicyConfig, TimedObservation
+from lerobot.transport import services_pb2, services_pb2_grpc
+from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+
+state_names = [f"joint{i}.pos" for i in range(8)]
+camera_names = ["main_images", "wrist_images"]
+image_shape = (360, 360, 3)
+
+features = {
+    "observation.state": {
+        "dtype": "float32",
+        "shape": (8,),
+        "names": state_names,
+    },
+}
+for name in camera_names:
+    features[f"observation.images.{name}"] = {
+        "dtype": "image",
+        "shape": image_shape,
+        "names": ["height", "width", "channels"],
+    }
+
+policy = RemotePolicyConfig(
+    policy_type="pi05",
+    pretrained_name_or_path="pi05",
+    lerobot_features=features,
+    actions_per_chunk=1,
+)
+
+with grpc.insecure_channel(
+    "127.0.0.1:50111", options=grpc_channel_options()
+) as channel:
+    stub = services_pb2_grpc.AsyncInferenceStub(channel)
+    stub.Ready(services_pb2.Empty(), timeout=5)
+    stub.SendPolicyInstructions(
+        services_pb2.PolicySetup(data=pickle.dumps(policy)), timeout=5
+    )
+
+    observation = TimedObservation(
+        timestamp=time.time(),
+        timestep=0,
+        observation={
+            **{name: 0.0 for name in state_names},
+            **{
+                name: np.zeros(image_shape, dtype=np.uint8)
+                for name in camera_names
+            },
+            "task": "pick up the object",
+        },
+    )
+    stub.SendObservations(
+        send_bytes_in_chunks(
+            pickle.dumps(observation), services_pb2.Observation
+        ),
+        timeout=5,
+    )
+    response = stub.GetActions(services_pb2.Empty(), timeout=60)
+    if not response.data:
+        raise RuntimeError("No actions returned")
+    actions = pickle.loads(response.data)
+    print(actions[0].get_action())
+```
+
+示例设置了 `actions_per_chunk=1`，因此响应中只有一个 LeRobot `TimedAction`。它的动作是一个包含 7 个值的 Torch tensor，对应示例服务的 `action_dim: 7`。设置策略、上传观测和请求动作时，请始终使用同一个 channel。

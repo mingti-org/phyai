@@ -27,6 +27,7 @@ models that run in interactive systems.
 
 ## News
 
+- [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
 - [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
 - [2026/09] 🤗 Support PI0.5 RL rollout for PPO. RLinf integration is in progress via [RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587).
 - [2026/07] 🚀 Day 0 support for MiniCPM-Robotic [blog](https://mingti-org.github.io/phyai-blog/blogs/260719-day-0-minicpm-robotic/).
@@ -100,6 +101,40 @@ uv pip install phyai phyai-ext \
   --extra-index-url https://mingti-org.github.io/phyai/simple/ \
   --prerelease=allow
 ```
+
+## Multi-host serving
+
+You can run model servers on separate machines and connect them through
+`phyai-gateway`. On each model host, prepare `pi05.yaml` with that host's
+checkpoint, tokenizer, and robot settings. You can start from the
+[PI0.5 example](examples/pi05/server.yaml), which serves `pi05` on port `50063`.
+Check the configuration, then start the server:
+
+```bash
+phyai server pi05.yaml
+```
+
+On the gateway host, register both servers at startup. Replace the IP addresses
+below with your server hosts; `pi05` must match `server.model_name` in their YAML
+files. Repeat `--backend MODEL HOST:PORT` to add more servers:
+
+```bash
+phyai-gateway \
+  --backend pi05 10.0.0.11:50063 \
+  --backend pi05 10.0.0.12:50063
+```
+
+In another terminal on the gateway host, check that the backends report
+`healthy: true`:
+
+```bash
+curl http://127.0.0.1:30000/v1/backends
+```
+
+Clients use the gateway host's HTTP port `30000` or gRPC port `50111`. The gateway
+distributes stateless requests across healthy replicas. See the
+[server and gateway setup guide](https://phyai.mintlify.app/deployment/server-gateway) for client
+configuration and adding or removing servers while the gateway is running.
 
 ## Contribution Guidelines
 

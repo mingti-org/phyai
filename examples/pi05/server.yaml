@@ -1,0 +1,33 @@
+plugin: pi05
+# Optional policy file, relative to this YAML file.
+# kernel_policy: ./kernel-policy.yaml
+plugin_args:
+  checkpoint_dir: /path/to/checkpoint
+  max_batch_size: 1
+  inputs_image_shape:
+    - [360, 360, 3]
+    - [360, 360, 3]
+
+config:
+  device:
+    target: cuda
+    params_dtype: bfloat16
+  runtime:
+    use_cuda_graph: true
+
+deployment:
+  mode: auto
+
+server:
+  host: 0.0.0.0
+  port: 50063
+  model_name: pi05
+  workers: 1
+
+adapter:
+  factory: phyai.server.backends.pi05:PI05Backend
+  args:
+    tokenizer_dir: /path/to/tokenizer
+    image_names: [main_images, wrist_images]
+    state_dim: 8
+    action_dim: 7
