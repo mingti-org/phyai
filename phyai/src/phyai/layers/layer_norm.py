@@ -84,6 +84,10 @@ class RMSNorm(nn.Module):
         tensor that will be normalized (typically ``torch.bfloat16``);
         do *not* leave it as the fp32 default. The ``"phyai-kernel"``
         Triton path accepts any floating dtype.
+    cast_before_affine:
+        Round normalized values to the activation dtype before multiplying
+        gamma. This matches checkpoints whose reference uses a separate
+        low-precision affine multiply; weight and activation dtypes must match.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -106,6 +110,7 @@ class RMSNorm(nn.Module):
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str = "norm",
+        cast_before_affine: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -113,6 +118,9 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.prefix = prefix
         self.kernel_role = kernel_role
+        self.cast_before_affine = cast_before_affine
+        if cast_before_affine and self.variant != "rms":
+            raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
             device = get_engine_config().device.target
         # Validates the hint against the catalog and records the kernel ids to
@@ -137,6 +145,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(
             self._initial_weight(hidden_size, dtype, device), requires_grad=False
         )
+        if cast_before_affine:
+            self.register_buffer(
+                "_unit_weight", torch.ones_like(self.weight), persistent=False
+            )
         if prefix:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
@@ -161,9 +173,14 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.cast_before_affine and self.weight.dtype != x.dtype:
+            raise ValueError(
+                "cast_before_affine requires matching activation and weight dtypes"
+            )
+        weight = self._unit_weight if self.cast_before_affine else self.weight
         dtypes: dict[str, object] = {
             "input": x.dtype,
-            "weight": self.weight.dtype,
+            "weight": weight.dtype,
             "output": x.dtype,
         }
 
@@ -179,9 +196,12 @@ class RMSNorm(nn.Module):
                 attrs={"variant": self.variant},
             )
             if x.dim() == 2:
-                return handle.execute(
-                    x, residual, self.weight.data, self.variance_epsilon
+                out, res = handle.execute(
+                    x, residual, weight.data, self.variance_epsilon
                 )
+                if self.cast_before_affine:
+                    out.mul_(self.weight)
+                return out, res
             # Fused kernels operate on (tokens, hidden). For contiguous inputs
             # the reshape is a view, so the kernels' in-place writes still land
             # in the caller's buffers.
@@ -189,9 +209,11 @@ class RMSNorm(nn.Module):
             out, res = handle.execute(
                 x.reshape(-1, orig_shape[-1]),
                 residual.reshape(-1, orig_shape[-1]),
-                self.weight.data,
+                weight.data,
                 self.variance_epsilon,
             )
+            if self.cast_before_affine:
+                out.mul_(self.weight)
             return out.reshape(orig_shape), res.reshape(orig_shape)
 
         handle = self._plain_call.select(
@@ -204,7 +226,9 @@ class RMSNorm(nn.Module):
         if needs_reshape:
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])
-        out = handle.execute(x, self.weight.data, self.variance_epsilon)
+        out = handle.execute(x, weight.data, self.variance_epsilon)
+        if self.cast_before_affine:
+            out = out * self.weight
         return out.reshape(orig_shape) if needs_reshape else out
 
     def extra_repr(self) -> str:
@@ -335,6 +359,9 @@ class LayerNorm(nn.Module):
         (the typical encoder configuration). flashinfer's kernel always
         reads ``beta``; when ``bias=False`` the wrapper feeds it a zero
         buffer so the kernel's add becomes a no-op.
+    elementwise_affine:
+        If False, use nonpersistent identity buffers instead of checkpoint
+        parameters. The same selected normalization kernel still runs.
     dtype:
         Optional weight / bias dtype. Defaults to the global default.
         flashinfer's CUDA kernel hard-checks ``gamma`` / ``beta`` in
@@ -361,6 +388,7 @@ class LayerNorm(nn.Module):
         backend: str | None = None,
         *,
         bias: bool = True,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -372,6 +400,8 @@ class LayerNorm(nn.Module):
         self.backend = backend
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        bias = bias and elementwise_affine
         self.has_bias = bias
         self.prefix = prefix
         self.kernel_role = kernel_role
@@ -417,10 +447,11 @@ class LayerNorm(nn.Module):
         param_dtype = torch_dtype(chosen["weight"])
         beta_dtype = torch_dtype(chosen.get("bias", chosen["weight"]))
 
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=param_dtype, device=device),
-            requires_grad=False,
-        )
+        weight = torch.ones(hidden_size, dtype=param_dtype, device=device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+        else:
+            self.register_buffer("weight", weight, persistent=False)
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(hidden_size, dtype=beta_dtype, device=device),
@@ -438,7 +469,7 @@ class LayerNorm(nn.Module):
                 persistent=False,
             )
 
-        if prefix:
+        if prefix and elementwise_affine:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
             if bias:
@@ -467,7 +498,8 @@ class LayerNorm(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"{self.hidden_size}, eps={self.variance_epsilon}, "
-            f"bias={self.has_bias}, backend={self.backend!r}"
+            f"bias={self.has_bias}, elementwise_affine={self.elementwise_affine}, "
+            f"backend={self.backend!r}"
         )
 
 

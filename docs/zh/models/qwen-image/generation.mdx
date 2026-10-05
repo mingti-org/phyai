@@ -1,0 +1,74 @@
+---
+title: "Qwen-Image 2.1"
+description: "使用 PhyAI 运行 Qwen-Image 2.1，生成和编辑图片。"
+---
+
+使用 Qwen-Image 2.1 从文字描述生成图片，或编辑已有图片。
+
+## 准备模型
+
+从 [Hugging Face 上的 Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) 下载模型权重。
+
+你需要 Python 3.12 或更高版本、`uv`，以及支持 CUDA 的 NVIDIA GPU。在 PhyAI 仓库根目录运行以下命令，将 checkpoint 路径替换为保存模型的文件夹：
+
+```bash
+uv sync
+export QWEN_IMAGE_CHECKPOINT=/path/to/Qwen-Image-2.1
+```
+
+## 生成图片
+
+下面的示例使用两张 GPU，生成一张 512 × 512 的 PNG 图片。先用 `nvidia-smi` 查看可用 GPU，再按需调整 `CUDA_VISIBLE_DEVICES`。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+  --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
+  --prompt "An orange cat sitting beside a window in warm sunlight" \
+  --tp 2 \
+  --height 512 \
+  --width 512 \
+  --steps 40 \
+  --seed 42 \
+  --out .cache/qwen_image_21.png
+```
+
+打开 `.cache/qwen_image_21.png` 查看结果。脚本会自动创建输出文件夹。
+
+## 编辑图片
+
+通过 `--image` 指定输入图片，在 `--prompt` 中描述想要的修改：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+  --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
+  --image /path/to/input.png \
+  --prompt "Change the background to a snowy forest while keeping the subject unchanged" \
+  --tp 2 \
+  --height 512 \
+  --width 512 \
+  --steps 40 \
+  --seed 42 \
+  --out .cache/qwen_image_21_edited.png
+```
+
+重复添加 `--image` 可以提供多张参考图片，最多 10 张。
+
+## 常用参数
+
+| 参数 | 用途 |
+| --- | --- |
+| `--prompt` | 描述要生成的图片或要做的修改。 |
+| `--image` | 编辑时使用的参考图片，可选。 |
+| `--height`、`--width` | 输出图片的尺寸，单位为像素。请使用 32 的倍数。 |
+| `--steps` | 生成步数，默认 `40`。 |
+| `--seed` | 随机种子，默认 `42`。 |
+| `--tp` | 使用的 GPU 数量，默认 `1`。 |
+| `--out` | 输出图片路径，默认 `.cache/qwen_image_21.png`。 |
+
+使用单张 GPU 时，设置 `CUDA_VISIBLE_DEVICES=0` 和 `--tp 1`。使用八张 GPU 时，设置 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` 和 `--tp 8`。
+
+查看全部参数：
+
+```bash
+uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py --help
+```

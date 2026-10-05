@@ -1,0 +1,57 @@
+schema: phyai.kernel/v1
+profile: static
+defaults:
+  fallback: reference
+
+rules:
+  - id: qwen-image-21-bf16-attention
+    priority: 10
+    match:
+      op: attention
+      model.family: qwen_image_21
+      device.vendor: nvidia
+      dtype.input: bf16
+      shape.head_dim: 128
+      shape.heads: ">1"
+    prefer:
+      - flashinfer.attention
+      - sdpa.attention
+
+  - id: qwen-image-21-bf16-rmsnorm
+    priority: 10
+    match:
+      op: rmsnorm
+      model.family: qwen_image_21
+      device.vendor: nvidia
+      dtype.input: bf16
+      dtype.weight: bf16
+    prefer:
+      - flashinfer.rmsnorm
+      - phyai_kernel.rmsnorm
+
+  - id: qwen-image-21-bf16-layernorm
+    priority: 10
+    match:
+      op: layernorm
+      model.family: qwen_image_21
+      device.vendor: nvidia
+      dtype.input: bf16
+      dtype.weight: fp32
+      when:
+        if: { attrs.bias: true }
+        then: { dtype.bias: fp32 }
+    prefer:
+      - flashinfer.layernorm
+      - phyai_kernel.layernorm
+
+  # This fused path preserves the separate normalization/scale/affine rounding.
+  - id: qwen-image-21-bf16-channel-l2-norm
+    priority: 10
+    match:
+      op: channel_l2_norm
+      model.family: qwen_image_21
+      device.vendor: nvidia
+      dtype.input: bf16
+      attrs.fused_compatible: true
+    prefer:
+      - phyai_kernel.channel_l2_norm

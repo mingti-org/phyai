@@ -7,6 +7,7 @@ from phyai_kernel.jit_utils import jit
 from phyai_kernel.triton import (
     adarmsnorm,
     causal_conv1d_silu_split_qkv,
+    channel_l2_norm,
     create_paged_kv_indices,
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
@@ -27,6 +28,7 @@ __all__ = [
     "__version__",
     "adarmsnorm",
     "causal_conv1d_silu_split_qkv",
+    "channel_l2_norm",
     "create_paged_kv_indices",
     "fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm",

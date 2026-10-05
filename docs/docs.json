@@ -54,6 +54,12 @@
                   "models/cosmos/policy",
                   "models/cosmos/processors"
                 ]
+              },
+              {
+                "group": "Qwen-Image",
+                "pages": [
+                  "models/qwen-image/generation"
+                ]
               }
             ]
           },
@@ -128,6 +134,12 @@
                   "zh/models/cosmos/generation",
                   "zh/models/cosmos/policy",
                   "zh/models/cosmos/processors"
+                ]
+              },
+              {
+                "group": "Qwen-Image",
+                "pages": [
+                  "zh/models/qwen-image/generation"
                 ]
               }
             ]

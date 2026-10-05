@@ -114,6 +114,17 @@ LAYERNORM = OpSpec(
     bench_args=_bench_layernorm,
 )
 
+CHANNEL_L2_NORM = OpSpec(
+    name="channel_l2_norm",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "weight", "compute"),
+    optional_dtypes=("bias",),
+    attributes=("channel_first", "bias", "fused_compatible"),
+    params=("weight", "bias"),
+    signature="(x, weight, bias, eps, *, channel_first, compute_dtype) -> Tensor",
+    doc="Channel L2 normalization with separately rounded scale and affine operations.",
+)
+
 ADARMSNORM = OpSpec(
     name="adarmsnorm",
     dims=("tokens", "hidden", "cond_dim"),
@@ -241,6 +252,25 @@ def _torch_layernorm(facts, params):
     return layernorm
 
 
+def _triton_channel_l2_norm(facts, params):
+    from phyai_kernel import channel_l2_norm
+
+    return channel_l2_norm
+
+
+def _torch_channel_l2_norm(facts, params):
+    import torch.nn.functional as F
+
+    def channel_l2_norm(x, weight, bias, eps, *, channel_first, compute_dtype):
+        value = x if compute_dtype is None else x.to(compute_dtype)
+        dim = 1 if channel_first else -1
+        normalized = F.normalize(value, dim=dim, eps=eps).to(x.dtype)
+        output = normalized * weight.numel() ** 0.5 * weight
+        return output if bias is None else output + bias
+
+    return channel_l2_norm
+
+
 def _triton_adarmsnorm(facts, params):
     from phyai_kernel import adarmsnorm
 
@@ -282,7 +312,14 @@ def _torch_rmsnorm_silu_mul(facts, params):
 
 
 def register(catalog: Catalog) -> None:
-    for spec in (RMSNORM, RMSNORM_ADD, LAYERNORM, ADARMSNORM, RMSNORM_SILU_MUL):
+    for spec in (
+        RMSNORM,
+        RMSNORM_ADD,
+        LAYERNORM,
+        CHANNEL_L2_NORM,
+        ADARMSNORM,
+        RMSNORM_SILU_MUL,
+    ):
         catalog.register_op(spec)
 
     catalog.register_many(
@@ -367,6 +404,24 @@ def register(catalog: Catalog) -> None:
                 # The reference path accepts any floating affine dtype.
                 params={"weight": any_float(), "bias": any_float()},
             ),
+            # Channel L2 normalization.
+            Impl(
+                kernel_id="phyai_kernel.channel_l2_norm",
+                op="channel_l2_norm",
+                priority=Priority.OPTIMIZED,
+                when=all_of(TRITON_NORM, attrs.fused_compatible),
+                prepare=_triton_channel_l2_norm,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.channel_l2_norm",
+                op="channel_l2_norm",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=dtype.input.is_set(),
+                prepare=_torch_channel_l2_norm,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
             # AdaRMSNorm.
             Impl(
                 kernel_id="phyai_kernel.adarmsnorm",
@@ -406,6 +461,7 @@ def register(catalog: Catalog) -> None:
 __all__ = [
     "ADARMSNORM",
     "LAYERNORM",
+    "CHANNEL_L2_NORM",
     "RMSNORM",
     "RMSNORM_ADD",
     "RMSNORM_SILU_MUL",
