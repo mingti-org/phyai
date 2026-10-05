@@ -1,10 +1,13 @@
+import asyncio
+from contextlib import suppress
+import logging
 import threading
 
 import grpc
-import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 from phyai_gateway.adapters.rlinf import (
     RLinfAdapter,
@@ -15,6 +18,13 @@ from phyai_gateway.adapters.rlinf import (
 from phyai_gateway.clients.model_inference import NoHealthyModelServerError
 
 MAX_MESSAGE_BYTES = 100 * 1024 * 1024
+logger = logging.getLogger(__name__)
+
+
+class BackendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_name: StrictStr
+    endpoint: StrictStr
 
 
 def _error_response(status_code, code, message):
@@ -39,35 +49,60 @@ def _backend_error_response(error):
     return _error_response(502, "backend_error", error.details())
 
 
-def create_http_app(model_client):
-    app = FastAPI(title="Robot Gateway HTTP API")
-    rlinf_adapter = RLinfAdapter(model_client)
+async def _infer_until_disconnect(request, adapter, body):
+    cancelled = threading.Event()
+
+    async def watch_disconnect():
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                cancelled.set()
+                return
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        return await run_in_threadpool(
+            adapter.infer_msgpack, body, cancel_event=cancelled
+        )
+    finally:
+        cancelled.set()
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+
+
+def create_http_app(model_client, *, default_model=None, registry=None):
+    app = FastAPI(title="PhyAI Gateway HTTP API")
+    rlinf_adapter = RLinfAdapter(model_client, default_model=default_model)
 
     @app.get("/health")
     async def health():
         return {"status": "ok"}
 
-    @app.post("/v1/inference/{client_type}")
-    async def receive_inference(client_type: str, request: Request):
-        body = await request.body()
-        print(
-            f"HTTP request received: client_type={client_type}, "
-            f"content_type={request.headers.get('content-type')}, "
-            f"body_bytes={len(body)}, ",
-            flush=True,
-        )
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "received",
-                "client_type": client_type,
-                "body_bytes": len(body),
-            },
-        )
+    if registry is not None:
+
+        @app.post("/v1/backends", status_code=202)
+        async def add_backend(request: BackendRequest):
+            try:
+                return registry.add_backend(request.model_name, request.endpoint)
+            except ValueError as error:
+                return _error_response(422, "invalid_backend", str(error))
+
+        @app.get("/v1/backends")
+        async def list_backends():
+            return {"backends": registry.list_backends()}
+
+        @app.delete("/v1/backends/{server_id}", status_code=204)
+        async def remove_backend(server_id: str):
+            if not registry.remove_backend(server_id):
+                return _error_response(
+                    404, "backend_not_found", "backend is not registered"
+                )
+            return Response(status_code=204)
 
     @app.post("/v1/actions/generations")
     async def receive_rlinf_observation(request: Request):
-        content_type = request.headers.get("content-type", "").split(";", 1)[0]
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
         if content_type.lower() != "application/msgpack":
             return _error_response(
                 415,
@@ -77,18 +112,29 @@ def create_http_app(model_client):
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
-                if int(content_length) > MAX_MESSAGE_BYTES:
-                    return _error_response(413, "payload_too_large", "request is too large")
+                length = int(content_length)
+                if length < 0:
+                    raise ValueError
+                if length > MAX_MESSAGE_BYTES:
+                    return _error_response(
+                        413, "payload_too_large", "request is too large"
+                    )
             except ValueError:
-                return _error_response(400, "invalid_content_length", "invalid Content-Length")
+                return _error_response(
+                    400, "invalid_content_length", "invalid Content-Length"
+                )
 
-        body = await request.body()
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_MESSAGE_BYTES:
+                return _error_response(413, "payload_too_large", "request is too large")
+            body.extend(chunk)
         if not body:
             return _error_response(400, "invalid_msgpack", "request body is empty")
-        if len(body) > MAX_MESSAGE_BYTES:
-            return _error_response(413, "payload_too_large", "request is too large")
         try:
-            response_body = await run_in_threadpool(rlinf_adapter.infer_msgpack, body)
+            response_body = await _infer_until_disconnect(
+                request, rlinf_adapter, bytes(body)
+            )
         except RLinfWireError as error:
             return _error_response(400, "invalid_msgpack", str(error))
         except RLinfPayloadError as error:
@@ -100,32 +146,9 @@ def create_http_app(model_client):
         except RLinfBackendResponseError as error:
             return _error_response(502, "invalid_backend_response", str(error))
         except Exception:
+            logger.exception("Gateway inference failed")
             return _error_response(500, "internal_error", "Gateway inference failed")
 
         return Response(content=response_body, media_type="application/msgpack")
 
     return app
-
-
-class HTTPServer:
-    def __init__(self, host: str, port: int, model_client):
-        self._server = uvicorn.Server(
-            uvicorn.Config(
-                create_http_app(model_client),
-                host=host,
-                port=port,
-                log_level="info",
-            )
-        )
-        self._thread = threading.Thread(
-            target=self._server.run,
-            name="gateway-http",
-            daemon=True,
-        )
-
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._server.should_exit = True
-        self._thread.join()

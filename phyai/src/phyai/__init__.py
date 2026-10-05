@@ -17,6 +17,7 @@ _LAZY: dict[str, str] = {
     # phyai.engine
     "Engine": "phyai.engine",
     "EngineArgs": "phyai.engine",
+    "build_engine": "phyai.engine_builder",
     "DeploymentConfig": "phyai.server.deployment",
     "EngineUnavailableError": "phyai.server.lifecycle",
     "Entry": "phyai.engine",
@@ -41,6 +42,7 @@ _LAZY: dict[str, str] = {
 # so ``from phyai import Engine`` resolves under mypy / pyright / autocomplete.
 if TYPE_CHECKING:
     from phyai.engine import Engine, EngineArgs, Entry, EntryArgs
+    from phyai.engine_builder import build_engine
     from phyai.server.deployment import DeploymentConfig
     from phyai.server.lifecycle import EngineUnavailableError
     from phyai.engine_config import (
@@ -79,6 +81,7 @@ __all__ = [
     # engine
     "Engine",
     "EngineArgs",
+    "build_engine",
     "DeploymentConfig",
     "EngineUnavailableError",
     "Entry",

@@ -2,38 +2,34 @@ syntax = "proto3";
 
 package robot;
 
-// ----- Robot state -----
 message RobotState {
-    repeated double joint_angles = 1;   // Joint angles (radians)
-    repeated double joint_velocities = 2; // Joint velocities
-    double x = 3;                        // End-effector pose x
-    double y = 4;                        // End-effector pose y
-    double z = 5;                        // End-effector pose z
-    double roll = 6;                     // End-effector orientation roll
-    double pitch = 7;                    // End-effector orientation pitch
-    double yaw = 8;                      // End-effector orientation yaw
+  repeated double joint_angles = 1;  // Radians.
+  repeated double joint_velocities = 2;
+  double x = 3;
+  double y = 4;
+  double z = 5;
+  double roll = 6;
+  double pitch = 7;
+  double yaw = 8;
 }
 
-// ----- Sensor data -----
 message SensorData {
-    bytes image_rgb = 1;                 // Raw binary RGB image data
-    bytes image_depth = 2;               // Raw binary depth image data
-    int64 timestamp_ns = 3;              // Unix timestamp in nanoseconds
-    RobotState state = 4;                // Current robot state (nested message)
-    string language_instruction = 5;     //Language instruction
+  bytes image_rgb = 1;  // Raw uint8 RGB pixels, [480, 640, 3].
+  bytes image_depth = 2;  // Unused by the current adapter.
+  int64 timestamp_ns = 3;  // Unix nanoseconds.
+  RobotState state = 4;
+  string language_instruction = 5;
 }
 
-// ----- Action command returned by the server -----
 message ActionCmd {
-    repeated double target_joint_angles = 1;  // Target joint angles
-    repeated double target_joint_velocities = 2; // Target joint velocities
-    double gripper_opening = 3;                // Gripper opening [0, 1]
-    int64 timestamp_ns = 4;                    // Action generation timestamp
-    int64 inference_time=5;
+  repeated double target_joint_angles = 1;
+  repeated double target_joint_velocities = 2;
+  double gripper_opening = 3;  // [0, 1].
+  int64 timestamp_ns = 4;  // Unix nanoseconds.
+  int64 inference_time = 5;  // Model execution time in microseconds.
 }
 
-// ----- RPC service definition -----
 service RobotInference {
-    // Unary RPC: send sensor data and return action commands
-    rpc Communicate (stream SensorData) returns (stream ActionCmd) {}
+  // One action command for each observation in the stream.
+  rpc Communicate(stream SensorData) returns (stream ActionCmd);
 }

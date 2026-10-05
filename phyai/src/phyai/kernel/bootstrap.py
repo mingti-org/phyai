@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Generator
 from contextlib import contextmanager
 
 from phyai.kernel.types import ModelContext
-from phyai.kernel.policy import Policy, load_policy
+from phyai.kernel.policy import Policy, load_policy, policy_from_mapping
 from phyai.kernel.registry import Catalog, build_catalog
 from phyai.kernel.selector import Selector
 
@@ -55,7 +55,13 @@ def reset_kernel_selector() -> None:
 def resolve_policy(config: "KernelConfig", catalog: Catalog) -> Policy:
     """Load the configured policy and apply an explicit profile override."""
 
-    policy = load_policy(config.config_path, catalog)
+    policy = (
+        policy_from_mapping(
+            config.policy_config, catalog, source="KernelConfig.policy_config"
+        )
+        if config.policy_config is not None
+        else load_policy(config.config_path, catalog)
+    )
     if config.profile is not None and config.profile.lower() != policy.profile:
         policy = Policy(
             profile=config.profile,

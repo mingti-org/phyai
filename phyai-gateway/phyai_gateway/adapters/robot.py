@@ -1,5 +1,6 @@
-import ctypes
 import itertools
+import json
+import math
 import struct
 import time
 
@@ -16,29 +17,27 @@ IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 IMAGE_CHANNELS = 3
 IMAGE_BYTES = IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS
-MODEL_NAME = "pi05"
 
 
 class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
-    def __init__(self, model_client):
+    """Translate the fixed RobotInference wire format into backend requests."""
+
+    def __init__(self, model_client, model_name):
         self._model_client = model_client
+        self._model_name = model_name
         self._request_ids = itertools.count(1)
 
     def Communicate(self, request_iterator, context):
-        print("[Robot Adapter] Client stream established", flush=True)
-        try:
-            for sensor_data in request_iterator:
-                request_id = f"gateway-{next(self._request_ids)}"
-                request = self._build_request(sensor_data, request_id, context)
-                try:
-                    response, _ = self._model_client.infer(request, MODEL_NAME)
-                except grpc.RpcError as error:
-                    abort_for_backend_error(context, error)
-                except Exception as error:
-                    abort_for_backend_error(context, error)
-                yield self._build_action(response, request_id, context)
-        finally:
-            print("[Robot Adapter] Client stream closed", flush=True)
+        for sensor_data in request_iterator:
+            request_id = f"gateway-{next(self._request_ids)}"
+            request = self._build_request(sensor_data, request_id, context)
+            try:
+                response = self._model_client.infer(
+                    request, self._model_name, context=context
+                )
+            except Exception as error:
+                abort_for_backend_error(context, error)
+            yield self._build_action(response, request_id, context)
 
     @staticmethod
     def _build_request(sensor_data, request_id, context):
@@ -59,8 +58,17 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
             state.pitch,
             state.yaw,
         ]
-        float32_values = [ctypes.c_float(value).value for value in values]
-        state_data = struct.pack(f"<{len(values)}f", *float32_values)
+        if not all(math.isfinite(value) for value in values):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "Robot state must contain finite values",
+            )
+        try:
+            state_data = struct.pack(f"<{len(values)}f", *values)
+        except OverflowError:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "Robot state values must fit float32"
+            )
         return model_inference_pb2.InferenceRequest(
             request_id=request_id,
             timestamp_ns=sensor_data.timestamp_ns,
@@ -81,6 +89,14 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
             ),
             instruction=sensor_data.language_instruction,
             requested_action_horizon=1,
+            extensions_json=json.dumps(
+                {
+                    "robot": {
+                        "joint_angle_count": len(state.joint_angles),
+                        "joint_velocity_count": len(state.joint_velocities),
+                    }
+                }
+            ),
         )
 
     @staticmethod
@@ -96,37 +112,37 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
                 grpc.StatusCode.DATA_LOSS,
                 "Model Server actions dtype must be FLOAT32",
             )
-        if len(actions.data) % 4 != 0:
+        if len(actions.shape) != 2 or actions.shape[0] != 1 or actions.shape[1] < 2:
             context.abort(
                 grpc.StatusCode.DATA_LOSS,
-                "Model Server actions byte length is invalid",
+                "Model Server actions must have shape [1, joint_count + 1]: joint targets then gripper opening",
             )
-
-        value_count = len(actions.data) // 4
-        if value_count < 6:
+        value_count = actions.shape[1]
+        if len(actions.data) != value_count * 4:
             context.abort(
                 grpc.StatusCode.DATA_LOSS,
-                "Model Server actions must contain at least six values",
+                "Model Server actions shape does not match data length",
             )
-        if actions.shape:
-            element_count = 1
-            for dimension in actions.shape:
-                if dimension == 0:
-                    context.abort(
-                        grpc.StatusCode.DATA_LOSS,
-                        "Model Server actions shape contains zero",
-                    )
-                element_count *= dimension
-            if element_count != value_count:
-                context.abort(
-                    grpc.StatusCode.DATA_LOSS,
-                    "Model Server actions shape does not match data length",
-                )
 
         values = struct.unpack(f"<{value_count}f", actions.data)
+        if not all(math.isfinite(value) for value in values):
+            context.abort(
+                grpc.StatusCode.DATA_LOSS,
+                "Model Server actions contain non-finite values",
+            )
+        if not 0.0 <= values[-1] <= 1.0:
+            context.abort(
+                grpc.StatusCode.DATA_LOSS,
+                "Model Server gripper opening must be in [0, 1]",
+            )
+        if response.inference_time_us >= 2**63:
+            context.abort(
+                grpc.StatusCode.DATA_LOSS,
+                "Model Server inference time must fit signed 64-bit microseconds",
+            )
         return robot_pb2.ActionCmd(
-            target_joint_angles=values[:6],
-            target_joint_velocities=[0.0] * 6,
-            gripper_opening=0.5,
+            target_joint_angles=values[:-1],
+            gripper_opening=values[-1],
             timestamp_ns=time.time_ns(),
+            inference_time=response.inference_time_us,
         )

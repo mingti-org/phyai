@@ -1,4 +1,4 @@
-# phyai nightly publish — builds all five workspace packages and publishes them as
+# phyai nightly publish — builds all six workspace packages and publishes them as
 # a PEP 503 "simple" wheel index on GitHub Pages, so users can:
 #
 #   uv pip install phyai \
@@ -9,11 +9,11 @@
 #   setup        compute the one nightly version (git tag + date), shared by all
 #   build-ext    compile phyai-ext inside a manylinux_2_28 container so its .so
 #                links glibc 2.28 (wide compatibility), then auditwheel-repair it
-#   build-index  build the 4 pure-Python packages on a plain runner, merge in the
+#   build-index  build the 5 pure-Python packages on a plain runner, merge in the
 #                manylinux phyai-ext wheel, and generate the PEP 503 index
 #   deploy       publish the index to GitHub Pages
 #
-# Why phyai-ext is split out: it is the only compiled package. The other four are
+# Why phyai-ext is split out: it is the only compiled package. The other five are
 # py3-none-any (glibc-irrelevant) and need no C/C++ toolchain, so they stay on the
 # fast plain runner. phyai-ext's libphyai_ext_core.so is a tvm-ffi plugin loaded at
 # runtime (dlopen), NOT a CPython extension and NOT link-time bound to libtvm_ffi.so
@@ -167,14 +167,14 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      # The four pure-Python packages: py3-none-any wheels, no compiler needed.
+      # The five pure-Python packages: py3-none-any wheels, no compiler needed.
       # `uv build --package` can't be repeated in one call, so loop. phyai-ext is
       # NOT built here — it comes from the build-ext artifact below.
       - name: Build pure-Python packages
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.setup.outputs.version }}
         run: |
-          for pkg in phyai phyai-kernel phyai-model-optimizer phyai-utils-tools; do
+          for pkg in phyai phyai-gateway phyai-kernel phyai-model-optimizer phyai-utils-tools; do
             uv build --package "$pkg" --out-dir dist
           done
 
