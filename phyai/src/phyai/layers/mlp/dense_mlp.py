@@ -25,6 +25,7 @@ from typing import Callable, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from phyai.kernel.call import CallSite, token_shape
 from phyai.engine_config import get_engine_config
@@ -133,6 +134,9 @@ class DenseMLP(nn.Module):
         ``None`` uses the engine's dense sequence-parallel setting.
     params_dtype:
         Dtype for parameter allocation. Defaults to torch default.
+    cast_before_multiply:
+        Round the gated activation to the input dtype before multiplying
+        the up projection. Default False keeps the fused activation kernel.
     spec_in / spec_out:
         Per-leg :class:`~phyai.layers.quant.WeightSpec`. Most configs
         use the same spec for both, but FP8 mixed-precision recipes
@@ -163,12 +167,17 @@ class DenseMLP(nn.Module):
         gated_hf_legs: tuple[str, str] = ("gate_proj", "up_proj"),
         mesh: str = "model",
         prefix: str = "",
+        device: torch.device | str | None = None,
+        cast_before_multiply: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = _canonicalise_activation(activation)
         self.gated = gated
+        self.cast_before_multiply = cast_before_multiply
+        if cast_before_multiply and not gated:
+            raise ValueError("cast_before_multiply requires a gated MLP")
         self.bias_enabled = bias
         self.prefix = prefix
         if sequence_parallel is None:
@@ -186,6 +195,7 @@ class DenseMLP(nn.Module):
                 spec=spec_in,
                 hf_legs=gated_hf_legs,
                 mesh=mesh,
+                device=device,
                 prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
             )
             self.down_proj = RowParallelLinear(
@@ -199,6 +209,7 @@ class DenseMLP(nn.Module):
                 params_dtype=params_dtype,
                 spec=spec_out,
                 mesh=mesh,
+                device=device,
                 prefix=f"{prefix}.down_proj" if prefix else "down_proj",
             )
             # TODO(fp8/fp4 fused act-quant): wire a spec hook that fuses
@@ -218,6 +229,7 @@ class DenseMLP(nn.Module):
                 params_dtype=params_dtype,
                 spec=spec_in,
                 mesh=mesh,
+                device=device,
                 prefix=f"{prefix}.fc1" if prefix else "fc1",
             )
             self.fc2 = RowParallelLinear(
@@ -231,6 +243,7 @@ class DenseMLP(nn.Module):
                 params_dtype=params_dtype,
                 spec=spec_out,
                 mesh=mesh,
+                device=device,
                 prefix=f"{prefix}.fc2" if prefix else "fc2",
             )
             self._act_and_mul = None
@@ -239,7 +252,20 @@ class DenseMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gated:
             fused, _ = self.gate_up_proj(x)
-            activated = self._act_and_mul(fused)
+            if self.cast_before_multiply:
+                gate, up = fused.chunk(2, dim=-1)
+                if self.activation == "silu":
+                    activated = F.silu(gate)
+                else:
+                    activated = F.gelu(
+                        gate,
+                        approximate="tanh"
+                        if self.activation == "gelu_tanh"
+                        else "none",
+                    )
+                activated = activated * up
+            else:
+                activated = self._act_and_mul(fused)
             out, _ = self.down_proj(activated)
             return out
         h, _ = self.fc1(x)

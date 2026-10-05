@@ -830,6 +830,7 @@ from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
 )
 from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
+from phyai.models.qwen_image_21 import main_qwen_image_21 as _main_qwen_image_21  # noqa: E402, F401
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
     main_minicpm_gr00t as _main_minicpm_gr00t,
 )

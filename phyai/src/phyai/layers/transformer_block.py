@@ -52,15 +52,28 @@ def _make_norm(
     bias: bool,
     backend: str,
     dtype: torch.dtype | None,
+    device: torch.device | str | None,
+    cast_before_affine: bool,
     prefix: str,
 ) -> nn.Module:
     if norm_type == "rmsnorm":
         return RMSNorm(
-            hidden_size, eps=eps, backend=backend, dtype=dtype, prefix=prefix
+            hidden_size,
+            eps=eps,
+            backend=backend,
+            dtype=dtype,
+            device=device,
+            cast_before_affine=cast_before_affine,
+            prefix=prefix,
         )
     if norm_type == "gemma_rmsnorm":
         return GemmaRMSNorm(
-            hidden_size, eps=eps, backend=backend, dtype=dtype, prefix=prefix
+            hidden_size,
+            eps=eps,
+            backend=backend,
+            dtype=dtype,
+            device=device,
+            prefix=prefix,
         )
     if norm_type == "layernorm":
         return LayerNorm(
@@ -69,6 +82,7 @@ def _make_norm(
             backend=backend,
             bias=bias,
             dtype=dtype,
+            device=device,
             prefix=prefix,
         )
     raise ValueError(
@@ -216,6 +230,9 @@ class TransformerBlock(nn.Module):
         mlp_gated_hf_names: tuple[str, str] = ("gate_proj", "up_proj"),
         # ---- Misc ------------------------------------------------------- #
         params_dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        norm_cast_before_affine: bool = False,
+        mlp_cast_before_multiply: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -228,6 +245,8 @@ class TransformerBlock(nn.Module):
                 f"Unknown norm_type {norm_type!r}; expected one of "
                 f"{_VALID_NORM_TYPES!r}."
             )
+        if norm_cast_before_affine and norm_type != "rmsnorm":
+            raise ValueError("norm_cast_before_affine requires norm_type='rmsnorm'.")
         if num_kv_heads is None:
             num_kv_heads = num_heads
         if head_dim is None:
@@ -274,6 +293,8 @@ class TransformerBlock(nn.Module):
             bias=norm_bias,
             backend=norm_backend,
             dtype=params_dtype,
+            device=device,
+            cast_before_affine=norm_cast_before_affine,
         )
         self.input_norm = _make_norm(
             norm_type,
@@ -326,6 +347,7 @@ class TransformerBlock(nn.Module):
             gather_output=False,
             bias=attn_bias,
             params_dtype=params_dtype,
+            device=device,
             spec=spec_qkv,
             hf_legs=self.attn_qkv_hf_names,
             mesh=mesh,
@@ -347,6 +369,8 @@ class TransformerBlock(nn.Module):
                 bias=norm_bias,
                 backend=norm_backend,
                 dtype=params_dtype,
+                device=device,
+                cast_before_affine=norm_cast_before_affine,
                 prefix=f"{attn_prefix}.q_norm",
             )
             self.k_norm = _make_norm(
@@ -356,6 +380,8 @@ class TransformerBlock(nn.Module):
                 bias=norm_bias,
                 backend=norm_backend,
                 dtype=params_dtype,
+                device=device,
+                cast_before_affine=norm_cast_before_affine,
                 prefix=f"{attn_prefix}.k_norm",
             )
         else:
@@ -444,6 +470,7 @@ class TransformerBlock(nn.Module):
             reduce_results=True,
             bias=attn_out_bias,
             params_dtype=params_dtype,
+            device=device,
             spec=spec_o,
             mesh=mesh,
             prefix=f"{attn_prefix}.{attn_out_hf_name}",
@@ -454,10 +481,12 @@ class TransformerBlock(nn.Module):
             intermediate_size=intermediate_size,
             activation=mlp_activation,
             gated=mlp_gated,
+            cast_before_multiply=mlp_cast_before_multiply,
             bias=mlp_bias,
             group=dense_group,
             sequence_parallel=sequence_parallel,
             params_dtype=params_dtype,
+            device=device,
             spec_in=spec_mlp_in,
             spec_out=spec_mlp_out,
             gated_hf_legs=self.mlp_gated_hf_names,

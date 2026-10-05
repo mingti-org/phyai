@@ -1,0 +1,79 @@
+---
+title: "Qwen-Image 2.1"
+description: "Generate and edit images with Qwen-Image 2.1 in PhyAI."
+---
+
+Use Qwen-Image 2.1 to create an image from a text prompt or edit an existing image.
+
+## Prepare the model
+
+Download the model weights from [Qwen/Qwen-Image-2.1 on Hugging Face](https://huggingface.co/Qwen/Qwen-Image-2.1).
+
+You need Python 3.12 or newer, `uv`, and NVIDIA GPUs with CUDA support. Run the
+following commands from the PhyAI repository root. Replace the checkpoint path
+with the folder where you saved the model:
+
+```bash
+uv sync
+export QWEN_IMAGE_CHECKPOINT=/path/to/Qwen-Image-2.1
+```
+
+## Generate an image
+
+This example uses two GPUs and saves a 512 x 512 PNG. Check available GPUs with
+`nvidia-smi`, then adjust `CUDA_VISIBLE_DEVICES` if needed.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+  --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
+  --prompt "An orange cat sitting beside a window in warm sunlight" \
+  --tp 2 \
+  --height 512 \
+  --width 512 \
+  --steps 40 \
+  --seed 42 \
+  --out .cache/qwen_image_21.png
+```
+
+Open `.cache/qwen_image_21.png` to view the result. The script creates the output
+folder automatically.
+
+## Edit an image
+
+Set `--image` to your input image and describe the change in `--prompt`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+  --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
+  --image /path/to/input.png \
+  --prompt "Change the background to a snowy forest while keeping the subject unchanged" \
+  --tp 2 \
+  --height 512 \
+  --width 512 \
+  --steps 40 \
+  --seed 42 \
+  --out .cache/qwen_image_21_edited.png
+```
+
+Repeat `--image` to provide multiple reference images, up to 10.
+
+## Common options
+
+| Option | What it controls |
+| --- | --- |
+| `--prompt` | The image to create or the edit to make. |
+| `--image` | An optional reference image for editing. |
+| `--height`, `--width` | Output dimensions in pixels. Use multiples of 32. |
+| `--steps` | Number of generation steps. Default: `40`. |
+| `--seed` | Random seed. Default: `42`. |
+| `--tp` | Number of GPUs to use. Default: `1`. |
+| `--out` | Output image path. Default: `.cache/qwen_image_21.png`. |
+
+For one GPU, use `CUDA_VISIBLE_DEVICES=0` and `--tp 1`. For eight GPUs, use
+`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` and `--tp 8`.
+
+To see all available options:
+
+```bash
+uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py --help
+```
