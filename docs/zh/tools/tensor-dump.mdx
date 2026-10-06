@@ -36,7 +36,7 @@ Tensor dump 默认关闭。可以通过 runtime 配置打开，也可以纯靠�
 
     ```bash
     PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
-        uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
+        python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
     ```
 
     用一个 JSON 数组的正则（对每个算子的完整点分名字匹配）来限定捕获范围：
@@ -44,7 +44,7 @@ Tensor dump 默认关闭。可以通过 runtime 配置打开，也可以纯靠�
     ```bash
     PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
     PHYAI_DEBUG_TENSOR_DUMP_FILTER='["expert_stack\\.layers\\.0\\.", "\\.heads\\."]' \
-        uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
+        python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base --raw
     ```
 
     | 变量 | 含义 |

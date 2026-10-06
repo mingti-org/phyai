@@ -180,8 +180,14 @@ def test_manifest_and_describe_render_every_row_stably(catalog):
 
 def test_libraries_and_id_patterns_are_derived_from_the_rows(catalog):
     """The selector must import only what eligibility actually depends on."""
-    assert catalog.libraries() == {"flashinfer", "phyai_kernel", "fla", "flash_qla"}
-    assert catalog.libraries("gemm") == {"flashinfer"}
+    assert catalog.libraries() == {
+        "flashinfer",
+        "phyai_kernel",
+        "fla",
+        "flash_qla",
+        "humming",
+    }
+    assert catalog.libraries("gemm") == {"flashinfer", "humming"}
     assert catalog.libraries("attention_gdn") == {"flashinfer", "fla", "flash_qla"}
     assert set(catalog.match_ids("flashinfer.gemm.*")) == {
         "flashinfer.gemm.bf16",

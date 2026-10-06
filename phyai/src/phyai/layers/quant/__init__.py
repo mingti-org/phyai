@@ -27,6 +27,9 @@ from phyai.layers.quant.fp8 import Fp8Spec
 from phyai.layers.quant.granularity import Granularity
 from phyai.layers.quant.linear import ActivationView, LinearActivationQuant
 from phyai.layers.quant.nvfp4 import Nvfp4Spec
+from phyai.layers.quant.humming import HummingSpec
+from phyai.layers.quant.scheme import QDType, QuantScheme, TensorQuant
+from phyai.layers.quant.plan import QuantPlan
 
 __all__ = [
     "AllocationRequest",
@@ -36,6 +39,11 @@ __all__ = [
     "Bf16Spec",
     "Fp8Spec",
     "Nvfp4Spec",
+    "HummingSpec",
+    "QDType",
+    "QuantScheme",
+    "TensorQuant",
+    "QuantPlan",
     "ActivationView",
     "LinearActivationQuant",
 ]

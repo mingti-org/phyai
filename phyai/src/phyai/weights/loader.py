@@ -323,7 +323,9 @@ class WeightLoadSession:
                 self.report.unexpected.append(hf_key)
                 continue
             parameter, shard_id, loader = hit
-            if tensor.dtype != parameter.dtype:
+            if tensor.dtype != parameter.dtype and not getattr(
+                parameter, "loader_preserves_dtype", False
+            ):
                 self.report.casts.append((hf_key, tensor.dtype, parameter.dtype))
             loader(parameter, tensor, shard_id)
             self.seen.add(hf_key)
@@ -468,7 +470,9 @@ def load_pretrained(
                     continue
                 param, shard_id, loader = hit
                 tensor = load_tensor()
-                if tensor.dtype != param.dtype:
+                if tensor.dtype != param.dtype and not getattr(
+                    param, "loader_preserves_dtype", False
+                ):
                     report.casts.append((hf, tensor.dtype, param.dtype))
                 loader(param, tensor, shard_id)
                 seen.add(hf)

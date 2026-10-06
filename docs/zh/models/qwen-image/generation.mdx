@@ -13,6 +13,7 @@ description: "使用 PhyAI 运行 Qwen-Image 2.1，生成和编辑图片。"
 
 ```bash
 uv sync
+source .venv/bin/activate
 export QWEN_IMAGE_CHECKPOINT=/path/to/Qwen-Image-2.1
 ```
 
@@ -21,7 +22,7 @@ export QWEN_IMAGE_CHECKPOINT=/path/to/Qwen-Image-2.1
 下面的示例使用两张 GPU，生成一张 512 × 512 的 PNG 图片。先用 `nvidia-smi` 查看可用 GPU，再按需调整 `CUDA_VISIBLE_DEVICES`。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/qwen_image_21/run_qwen_image_21.py \
   --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
   --prompt "An orange cat sitting beside a window in warm sunlight" \
   --tp 2 \
@@ -39,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen
 通过 `--image` 指定输入图片，在 `--prompt` 中描述想要的修改：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/qwen_image_21/run_qwen_image_21.py \
   --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
   --image /path/to/input.png \
   --prompt "Change the background to a snowy forest while keeping the subject unchanged" \
@@ -70,5 +71,5 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen
 查看全部参数：
 
 ```bash
-uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py --help
+python examples/qwen_image_21/run_qwen_image_21.py --help
 ```

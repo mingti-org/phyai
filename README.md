@@ -42,7 +42,7 @@ models that run in interactive systems.
 - 🚀 Runs on NVIDIA Jetson edge devices
 - 🚀 Scales to GPU clusters with DP, TP, and CFG parallelism
 - 🚀 Uses high-performance kernels from FlashInfer and Humming
-- 🤗 Supports W4A8 (NVFP4, MXFP4, INT4), W8A8, and W8A16 quantization (PR under review)
+- 🤗 Supports INT4, INT8, FP8, MXFP4, and NVFP4 quantization through [kernel policies](#quantization) (PR under review)
 
 ## Supported Models
 
@@ -101,6 +101,30 @@ uv pip install phyai phyai-ext \
   --extra-index-url https://mingti-org.github.io/phyai/simple/ \
   --prerelease=allow
 ```
+
+## Quantization
+
+PhyAI supports post-training quantization (PTQ) when loading an unquantized
+checkpoint. One **kernel policy YAML** controls which layers are quantized,
+their weight and activation precision, and the execution kernels. Humming is
+included in the standard installation.
+
+For example, run PI0.5 with INT4 weights and BF16 activations (**W4A16**, NVIDIA
+SM80+) from the repository root, with your PhyAI Python environment activated:
+
+```bash
+PHYAI_KERNEL_CONFIG=examples/pi05/kernel_policies/humming_w4a16.yaml \
+python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base
+```
+
+This preset quantizes the language model and action expert's attention/MLP
+linear projections with group size 128. Vision and input/output heads keep their
+original precision. Point `--checkpoint` to your original, unquantized weights.
+
+Choose another [PI0.5 preset](examples/pi05/kernel_policies), or copy one and edit
+its `quantization` and kernel `rules`. See the
+[quantization guide](https://phyai.mintlify.app/quantization/overview) for matching
+layers, changing precision, and selecting kernels.
 
 ## Multi-host serving
 

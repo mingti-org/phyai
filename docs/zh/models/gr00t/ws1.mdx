@@ -86,13 +86,13 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
     从 NVIDIA 的 [GR00T-N1.7 collection](https://huggingface.co/collections/nvidia/gr00t-n17) 中选择兼容的 checkpoint。GR00T-N1.7 使用受限访问的 `nvidia/Cosmos-Reason2-2B` backbone 元数据完成 tokenization 和图像预处理，因此首次运行前需要先申请访问权限并登录：
 
     ```bash
-    uv run hf auth login
+    hf auth login
     ```
 
     LIBERO checkpoint 的模型文件位于 `libero_10` 下。下载 PhyAI 所需的文件：
 
     ```bash
-    uv run hf download nvidia/GR00T-N1.7-LIBERO \
+    hf download nvidia/GR00T-N1.7-LIBERO \
       --include "libero_10/config.json" \
       --include "libero_10/embodiment_id.json" \
       --include "libero_10/model-*.safetensors" \
@@ -198,7 +198,7 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
 `examples/gr00t/run_gr00t.py` 会根据 checkpoint 定义构造一份合成 observation，依次经过 processor、engine 和动作解码。运行命令如下：
 
 ```bash
-uv run python examples/gr00t/run_gr00t.py \
+python examples/gr00t/run_gr00t.py \
   --checkpoint checkpoints/GR00T-N1.7-LIBERO/libero_10 \
   --embodiment-tag LIBERO_PANDA
 ```

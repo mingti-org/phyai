@@ -125,7 +125,7 @@ PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine.__init__ 按固定顺�
 `examples/pi05/run_pi05.py` 用确定性 dummy 输入跑了 `max_batch_size ∈ {1, 4}` 的全路径,并包含多 batch 等价性检查。运行命令:
 
 ```bash
-uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi0.5
+python examples/pi05/run_pi05.py --checkpoint /path/to/pi0.5
 ```
 
 脚本会打印每阶段的 latency 统计(3 次预热 + 30 次计时的 mean / median / std / min / max)以及等价性检查的 `PASS` 行。把 `--checkpoint` 后的路径改成你本地的 checkpoint 路径即可。

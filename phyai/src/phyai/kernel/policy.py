@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from typing import Any, Mapping, Iterable, Sequence
+from typing import Any, Mapping, Iterable, Sequence, TYPE_CHECKING
 from pathlib import Path
 from dataclasses import field, dataclass
 
@@ -33,6 +33,9 @@ from phyai.kernel.predicate import (
     none_of,
     predicate_from_literal,
 )
+
+if TYPE_CHECKING:
+    from phyai.layers.quant.plan import QuantPlan
 
 SCHEMA = "phyai.kernel/v1"
 
@@ -239,13 +242,14 @@ class Decision:
 
 @dataclass(frozen=True)
 class Policy:
-    """Store compiled kernel rules, overrides, and defaults."""
+    """Store compiled kernel rules and optional load-time quantization."""
 
     profile: str = "static"
     fallback: str = "reference"
     rules: tuple[Rule, ...] = ()
     overrides: tuple[Rule, ...] = ()
     source: str | None = None
+    quant_plan: QuantPlan | None = None
 
     #: Cached policy fingerprint.
     version: str = field(default="", compare=False, repr=False)
@@ -261,6 +265,11 @@ class Policy:
         object.__setattr__(self, "fallback", fallback)
         object.__setattr__(self, "rules", tuple(self.rules or ()))
         object.__setattr__(self, "overrides", tuple(self.overrides or ()))
+        if self.quant_plan is not None:
+            from phyai.layers.quant.plan import QuantPlan
+
+            if not isinstance(self.quant_plan, QuantPlan):
+                raise PolicyError("quant_plan must be a QuantPlan or None")
         object.__setattr__(self, "version", self.compute_version())
 
     def decide(self, facts, catalog: Catalog) -> Decision:
@@ -293,6 +302,10 @@ class Policy:
             "rules": [_rule_payload(item) for item in self.rules],
             "overrides": [_rule_payload(item) for item in self.overrides],
         }
+        if self.quant_plan is not None:
+            from phyai.layers.quant.policy import quant_plan_payload
+
+            payload["quantization"] = quant_plan_payload(self.quant_plan)
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), default=str
         ).encode()
@@ -345,7 +358,14 @@ def policy_from_mapping(
     if not isinstance(value, Mapping):
         raise PolicyError("a policy document must be a mapping")
 
-    unknown = set(value) - {"schema", "profile", "defaults", "rules", "overrides"}
+    unknown = set(value) - {
+        "schema",
+        "profile",
+        "defaults",
+        "rules",
+        "overrides",
+        "quantization",
+    }
     if unknown:
         raise PolicyError(f"unknown top-level field(s): {sorted(unknown)}")
 
@@ -370,6 +390,14 @@ def policy_from_mapping(
         _compile_rule(raw, index, catalog, strict=True)
         for index, raw in enumerate(value.get("overrides") or ())
     )
+    quant_plan = None
+    if value.get("quantization") is not None:
+        from phyai.layers.quant.policy import quant_plan_from_mapping
+
+        try:
+            quant_plan = quant_plan_from_mapping(value["quantization"])
+        except ValueError as error:
+            raise PolicyError(str(error)) from error
 
     return Policy(
         profile=str(value.get("profile", "static")),
@@ -377,6 +405,7 @@ def policy_from_mapping(
         rules=rules,
         overrides=overrides,
         source=source,
+        quant_plan=quant_plan,
     )
 
 

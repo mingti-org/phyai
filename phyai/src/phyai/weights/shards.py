@@ -20,6 +20,15 @@ from phyai.parallel.mesh import Mesh
 WeightLoader = Callable[[torch.nn.Parameter, torch.Tensor, "int | str | None"], None]
 
 
+def _copy_exact(destination: torch.Tensor, source: torch.Tensor) -> None:
+    if destination.shape != source.shape:
+        raise ValueError(
+            f"Loaded weight shape {tuple(source.shape)} does not match "
+            f"destination shape {tuple(destination.shape)}"
+        )
+    destination.copy_(source)
+
+
 def replicated() -> WeightLoader:
     """Full-tensor copy. Handles 0-D HF scalars expanding into 1-element params."""
 
@@ -27,7 +36,7 @@ def replicated() -> WeightLoader:
         if loaded.dim() == 0 and param.numel() == 1:
             param.data.fill_(loaded.item())
             return
-        param.data.copy_(loaded)
+        _copy_exact(param.data, loaded)
 
     return load
 
@@ -59,7 +68,7 @@ def sharded(
                 f"weight dimension {loaded.shape[dim]} is not divisible by {world} shards."
             )
         size = loaded.shape[dim] // world
-        param.data.copy_(loaded.narrow(dim, rank * size, size))
+        _copy_exact(param.data, loaded.narrow(dim, rank * size, size))
 
     return load
 
@@ -97,7 +106,7 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
         leg = legs[shard_id]
         rank = mesh.group_rank(leg.group) // leg.replication_factor
         src = loaded.narrow(leg.dim, rank * leg.size, leg.size)
-        param.data.narrow(fuse_dim, leg.offset, leg.size).copy_(src)
+        _copy_exact(param.data.narrow(fuse_dim, leg.offset, leg.size), src)
 
     return load
 
@@ -130,7 +139,7 @@ def weight_norm_fold(*, eps: float = 1e-12) -> WeightLoader:
             v = cache.pop("v")
             dims = tuple(range(1, v.dim()))  # all dims except 0 (weight_norm dim=0)
             norm = v.norm(dim=dims, keepdim=True).clamp_min(eps)
-            param.data.copy_((g * v / norm).to(param.dtype))
+            _copy_exact(param.data, (g * v / norm).to(param.dtype))
 
     return load
 
@@ -153,7 +162,7 @@ def vocab(*, group: str = "dense_tp", mesh: Mesh) -> WeightLoader:
             param.data.zero_()
             return
         n_real = min(start + per_rank, v_real) - start
-        param.data.narrow(0, 0, n_real).copy_(loaded.narrow(0, start, n_real))
+        _copy_exact(param.data.narrow(0, 0, n_real), loaded.narrow(0, start, n_real))
         if n_real < per_rank:
             param.data.narrow(0, n_real, per_rank - n_real).zero_()
 

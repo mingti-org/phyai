@@ -86,13 +86,13 @@ raw cameras + state + instruction
     Choose a compatible checkpoint from NVIDIA's [GR00T-N1.7 collection](https://huggingface.co/collections/nvidia/gr00t-n17). GR00T-N1.7 uses the gated `nvidia/Cosmos-Reason2-2B` backbone metadata for tokenization and image preprocessing, so request access and authenticate before the first run:
 
     ```bash
-    uv run hf auth login
+    hf auth login
     ```
 
     The LIBERO checkpoint stores model files under `libero_10`. Download the files consumed by PhyAI:
 
     ```bash
-    uv run hf download nvidia/GR00T-N1.7-LIBERO \
+    hf download nvidia/GR00T-N1.7-LIBERO \
       --include "libero_10/config.json" \
       --include "libero_10/embodiment_id.json" \
       --include "libero_10/model-*.safetensors" \
@@ -198,7 +198,7 @@ raw cameras + state + instruction
 `examples/gr00t/run_gr00t.py` builds a checkpoint-shaped synthetic observation, runs it through the processor and engine, and decodes the result. To run it:
 
 ```bash
-uv run python examples/gr00t/run_gr00t.py \
+python examples/gr00t/run_gr00t.py \
   --checkpoint checkpoints/GR00T-N1.7-LIBERO/libero_10 \
   --embodiment-tag LIBERO_PANDA
 ```

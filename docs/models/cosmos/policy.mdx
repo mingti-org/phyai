@@ -242,7 +242,7 @@ An integer `domain_id` carries no width, so pass `--raw-action-dim` alongside it
 Predict an action from a single image:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot picks up the cup" \
@@ -255,7 +255,7 @@ Two files land in `.cache/`: `cosmos3_policy_out_action.json` with the action ch
 Roll out a video from a known action:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot pushes the object forward" \
@@ -292,7 +292,7 @@ uv run python examples/cosmos3/run_cosmos3_policy.py \
 Recover the action from an observation video:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --video obs.mp4 \
     --prompt "robot moves the cup to the right" \
@@ -322,7 +322,7 @@ Without stats the action stays in the model's normalized scale. Switching embodi
 The policy plugin takes the same `ParallelConfig` fields as the generation plugin. `tp_size` shards the transformer and is the knob that matters here: the examples run with `guidance_scale=1.0`, so `cfg_size=2` would compute an unconditional branch only to discard it (the scheduler warns when it sees this). A run needs `cfg_size * tp_size` GPUs, picked with `CUDA_VISIBLE_DEVICES` on the launching process.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run python examples/cosmos3/run_cosmos3_policy.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot picks up the cup" \

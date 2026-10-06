@@ -63,10 +63,16 @@ First prepare the checkpoint and Cosmos-Reason2 tokenizer files as described in
 the [GR00T-N1.7 ws1 guide](./ws1). Clone NVIDIA Isaac-GR00T with Git LFS so the
 linked LIBERO demo contains its `meta`, `data`, and `videos` directories.
 
+Install the additional dependency in your PhyAI Python environment:
+
+```bash
+python -m pip install pyarrow
+```
+
 From the PhyAI repository root, run:
 
 ```bash
-uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
+python benchmark/gr00t/accuracy_parity.py \
   --checkpoint <gr00t-checkpoint-dir> \
   --dataset-path <isaac-gr00t-dir>/demo_data/libero_demo \
   --embodiment-tag LIBERO_PANDA \

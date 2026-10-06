@@ -32,6 +32,18 @@ def use_quant_plan(plan: "QuantPlan | None") -> Generator[None]:
         _active_plan.reset(token)
 
 
+def resolve_quant_plan(
+    checkpoint_dir: str | Path | None,
+    *,
+    revision: str | None = None,
+) -> "QuantPlan | None":
+    """Prefer an explicit construction plan over checkpoint quantization."""
+    active = get_active_plan()
+    if active is not None:
+        return active
+    return load_quant_plan(checkpoint_dir, revision=revision)
+
+
 def load_quant_plan(
     checkpoint_dir: str | Path | None,
     *,
@@ -89,4 +101,4 @@ def load_quant_plan(
     )
 
 
-__all__ = ["get_active_plan", "use_quant_plan", "load_quant_plan"]
+__all__ = ["get_active_plan", "use_quant_plan", "resolve_quant_plan", "load_quant_plan"]

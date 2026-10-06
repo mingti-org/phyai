@@ -1,0 +1,44 @@
+# PI0.5: INT4 weights, group size 128; dynamic per-token FP8 E4M3 activations.
+# Text and action-expert attention/MLP projections.
+# Vision, embeddings, action/time heads, norms and the value head keep their precision.
+# Load an unquantized checkpoint; selected Linear layers accept and return BF16/FP16.
+# With the examples' BF16 compute, this preset requires NVIDIA SM89+.
+# Select with PHYAI_KERNEL_CONFIG before running run_pi05.py.
+
+schema: phyai.kernel/v1
+profile: static
+
+quantization:
+  method: rtn
+  stage: load
+  default: null
+  rules:
+    - match:
+        regex: '^paligemma_with_expert\.(paligemma\.model\.language_model|gemma_expert\.model)\.layers\.[0-9]+\.(self_attn\.(qkv_proj|o_proj)|mlp\.(gate_up_proj|down_proj))$'
+      weight:
+        dtype: int4
+        granularity: block
+        block_shape: [1, 128]
+        symmetric: true
+      input:
+        dtype: fp8_e4m3
+        granularity: per_channel
+        dynamic: true
+        symmetric: true
+
+rules:
+  - id: humming-quantized-linear
+    match:
+      op: gemm
+      quant.layout: humming
+    restrict_to: humming.gemm.int4_a8
+
+  # Preserve the existing PI0.5 attention policy on SM90.
+  - id: pi05-expert-joint-fa2
+    priority: 10
+    match:
+      op: attention_paged
+      role: expert
+      model.family: pi05
+      device.arch: sm90
+    restrict_to: flashinfer.attention_paged.fa2

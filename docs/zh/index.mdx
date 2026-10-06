@@ -20,7 +20,8 @@ import { SetupCard } from "/snippets/setup-card.jsx"
       ["Package", "not upload to pypi yet"],
       ["Source", `git clone https://github.com/mingti-org/phyai
 cd phyai
-uv sync`],
+uv sync
+source .venv/bin/activate`],
       ["Docker", "not upload yet"]
     ],
     "Device": ["Cloud/Consumer"],
@@ -33,4 +34,3 @@ uv sync`],
 ```shell
 uv pip install phyai phyai_ext --extra-index-url https://mingti-org.github.io/phyai/simple/ --prerelease=allow
 ```
-

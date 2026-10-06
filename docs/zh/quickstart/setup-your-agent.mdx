@@ -95,13 +95,13 @@ Coding Agent 不应在没有 profiling 证据时预设瓶颈。该 skill 要求�
 Coding Agent 应优先使用 skill 内置脚本：
 
 ```bash
-uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
+python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
 ```
 
 如需保存报告，可指定输出路径：
 
 ```bash
-uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
+python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
 ```
 
 该 skill 适合排查安装失败、CUDA 不可见、依赖版本不一致、workspace package 导入异常，以及只在特定机器上复现的运行时问题。除非你明确要求，Coding Agent 不应为了生成环境报告而安装依赖、修改仓库或执行重量级构建。

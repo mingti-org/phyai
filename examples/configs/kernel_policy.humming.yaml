@@ -1,0 +1,24 @@
+# Install the workspace with: uv sync
+# Select this file through KernelConfig.config_path or PHYAI_KERNEL_CONFIG.
+schema: phyai.kernel/v1
+profile: static
+
+quantization:
+  method: rtn
+  stage: load
+  default: null
+  # Quantization rules use first-match order and checkpoint layer prefixes.
+  rules:
+    - match: { glob: "*.mlp.*" }
+      weight:
+        dtype: int4
+        block_shape: [1, 128]
+        symmetric: true
+      input: null
+
+rules:
+  - id: humming-quantized-linear
+    match:
+      op: gemm
+      quant.layout: humming
+    restrict_to: "humming.gemm.*"

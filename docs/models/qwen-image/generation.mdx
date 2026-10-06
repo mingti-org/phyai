@@ -15,6 +15,7 @@ with the folder where you saved the model:
 
 ```bash
 uv sync
+source .venv/bin/activate
 export QWEN_IMAGE_CHECKPOINT=/path/to/Qwen-Image-2.1
 ```
 
@@ -24,7 +25,7 @@ This example uses two GPUs and saves a 512 x 512 PNG. Check available GPUs with
 `nvidia-smi`, then adjust `CUDA_VISIBLE_DEVICES` if needed.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/qwen_image_21/run_qwen_image_21.py \
   --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
   --prompt "An orange cat sitting beside a window in warm sunlight" \
   --tp 2 \
@@ -43,7 +44,7 @@ folder automatically.
 Set `--image` to your input image and describe the change in `--prompt`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/qwen_image_21/run_qwen_image_21.py \
   --checkpoint "$QWEN_IMAGE_CHECKPOINT" \
   --image /path/to/input.png \
   --prompt "Change the background to a snowy forest while keeping the subject unchanged" \
@@ -75,5 +76,5 @@ For one GPU, use `CUDA_VISIBLE_DEVICES=0` and `--tp 1`. For eight GPUs, use
 To see all available options:
 
 ```bash
-uv run --no-sync python examples/qwen_image_21/run_qwen_image_21.py --help
+python examples/qwen_image_21/run_qwen_image_21.py --help
 ```

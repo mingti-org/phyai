@@ -61,10 +61,16 @@ action 比较。
 tokenizer 文件。克隆 NVIDIA Isaac-GR00T 时需要启用 Git LFS，确保上面链接的
 LIBERO demo 中包含 `meta`、`data` 和 `videos` 三个目录。
 
+在 PhyAI 的 Python 环境中安装额外依赖：
+
+```bash
+python -m pip install pyarrow
+```
+
 在 PhyAI 仓库根目录运行：
 
 ```bash
-uv run --with pyarrow python benchmark/gr00t/accuracy_parity.py \
+python benchmark/gr00t/accuracy_parity.py \
   --checkpoint <gr00t-checkpoint-dir> \
   --dataset-path <isaac-gr00t-dir>/demo_data/libero_demo \
   --embodiment-tag LIBERO_PANDA \
