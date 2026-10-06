@@ -1,0 +1,34 @@
+# Cosmos3 Nano / Cosmos3 policy: INT8 weights, group size 128; dynamic per-token INT8 activations.
+# Language and generation attention/MLP projections.
+# Embeddings, time/input/output heads, action/audio adapters and VAE keep their precision.
+# Load an unquantized checkpoint; selected Linear layers accept and return BF16/FP16.
+# With the examples' BF16 compute, this preset requires NVIDIA SM80+.
+# Select with PHYAI_KERNEL_CONFIG before running run_cosmos3.py or run_cosmos3_policy.py.
+
+schema: phyai.kernel/v1
+profile: static
+
+quantization:
+  method: rtn
+  stage: load
+  default: null
+  rules:
+    - match:
+        regex: '^((language_model\.layers\.[0-9]+\.self_attn|gen_layers\.[0-9]+\.cross_attention)\.(qkv_proj|to_out)|(language_model\.layers|gen_layers)\.[0-9]+\.mlp\.(gate_up_proj|down_proj))$'
+      weight:
+        dtype: int8
+        granularity: block
+        block_shape: [1, 128]
+        symmetric: true
+      input:
+        dtype: int8
+        granularity: per_channel
+        dynamic: true
+        symmetric: true
+
+rules:
+  - id: humming-quantized-linear
+    match:
+      op: gemm
+      quant.layout: humming
+    restrict_to: humming.gemm.int8_a8

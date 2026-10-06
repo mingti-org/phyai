@@ -1,84 +1,198 @@
 ---
-title: "Quantization overview"
-description: "The layered design of PhyAI's quantization subsystem: a four-stage pipeline from checkpoint config to physical weight format."
-icon: "layer-group"
+title: "Quantization and kernel policies"
+description: "Configure quantization during loading, layer matching, weight precision, and execution kernels with a kernel policy YAML file."
+icon: "sliders"
 ---
 
-# Quantization
+Configure quantization and kernel selection in one kernel policy YAML file. `quantization` chooses the precision for each layer, and the top-level `rules` section selects execution kernels. After loading an unquantized FP16, BF16, or FP32 checkpoint, the system applies PTQ to the weights according to your configuration.
 
-Quantization stores and computes weights and activations at lower precision than bf16 (fp8, nvfp4, and so on) to save memory and raise throughput. The hard part is not how any single format does its math. It is that one engine has to accept several quantized checkpoints that come from different tools with different conventions, while leaving model code almost untouched.
+## Load a kernel policy
 
-PhyAI splits the problem into two layers:
+Save the configuration in the next section as `kernel-policy.yaml`. In a Python environment with PhyAI and `humming-kernels` installed, specify the file through an environment variable:
 
-- **Semantic layer**: what a tensor is quantized to. It describes only the mathematical properties (dtype, granularity, symmetry) and says nothing about scale layout, kernel, or device.
-- **Physical layer**: what the tensor looks like in memory. Its dtype, the shape and layout of its scales, whether it needs post-load processing, and which kernel the forward pass runs.
+```bash
+PHYAI_KERNEL_CONFIG=./kernel-policy.yaml python run_model.py
+```
 
-One explicit lowering step sits between the two layers. The semantic description is translated into a physical format once the device is known, and the physical format then allocates parameters and picks a kernel. Adding a new framework's config parser and adding a new physical kernel touch different files, so neither disturbs the other.
+Replace `run_model.py` with your model's launch script and keep its existing arguments, including the checkpoint path. Run the model in BF16 or FP16.
 
-![The layered design of quantization: config, plan, and scheme are all device-independent semantics; only materialize lowers them to a physical format](/images/quantization/layered-design.svg)
-
-One line, left to right: an importer recognizes the config as a `QuantPlan`, the `QuantPlan` resolves a `QuantScheme` by layer name, and `materialize` lowers that semantics into a `WeightSpec`. The first three stages never touch hardware. Only `materialize` reads the SM version, so the boundary falls between scheme and spec.
-
-# The four-stage pipeline
-
-What each stage in the figure actually does:
-
-| Stage | Input | Output | Code |
-| --- | --- | --- | --- |
-| Recognize | the checkpoint's quant config | `QuantPlan` | `layers/quant/importers/` |
-| Match | layer name + layer class | `QuantScheme` (or skip) | `layers/quant/plan.py` |
-| Lower | `QuantScheme` + SM version | `WeightSpec` | `layers/quant/materialize.py` |
-| Realize | `WeightSpec` | parameter allocation + kernel choice | `layers/quant/{bf16,fp8,nvfp4}.py` |
-
-Each stage reads only the output of the one before it and never reaches back. An importer collects assorted configs into a single rule table. The rule table answers one question by layer name: which scheme this layer uses. `materialize` translates semantics into physical form and makes the hardware-dependent choices here (for example, NVFP4's scale layout depends on the SM version).
-
-# Example: how three keys land
-
-Zoom into the `QuantPlan → WeightSpec` span above. Take an fp8 checkpoint whose plan has two rules: skip `lm_head`, send everything else to fp8. Three weight prefixes run through the rule table and land on different physical formats.
-
-![How one QuantPlan resolves three checkpoint weight keys](/images/quantization/resolve-example.svg)
-
-`qkv_proj` and `gate_up_proj` are not named by any rule, so they fall through to `default` and get an `Fp8Spec`: the weight is stored as `fp8_e4m3` with a fp32 `weight_scale` (per-channel, one per output channel), and the activation is quantized dynamically per token at runtime. `lm_head` hits the first skip rule, its `scheme` is `None`, so it stays bf16 with just a `weight` and no scale. Rules match top to bottom and stop at the first hit; everything else takes `default`.
-
-# Running a quantized checkpoint
-
-Model entries already wire up quantized loading, so running a quantized checkpoint uses the same code as a normal one. Take pi0.5:
+In Python, pass the configuration containing `KernelConfig` to `EngineArgs(config=config)`:
 
 ```python
-from pathlib import Path
-from phyai.engine import Engine, EngineArgs
-from phyai.engine_config import DeviceConfig, EngineConfig
-from phyai.models.pi05.main_pi05 import PI05Args
-import torch
+from phyai.engine_config import EngineConfig, KernelConfig
 
-engine = Engine(
-    EngineArgs(
-        plugin="pi05",
-        plugin_args=PI05Args(checkpoint_dir=Path("/path/to/quantized_pi05")),
-        config=EngineConfig(
-            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
-        ),
-    )
+config = EngineConfig(
+    kernel=KernelConfig(config_path="kernel-policy.yaml")
 )
 ```
 
-While building the model, the entry reads the checkpoint's quant config, builds the matching `QuantPlan`, and sets it as the active plan:
+In a [server YAML file](/deployment/server-gateway), add this top-level field:
 
-```python
-with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
-    self.model = PI05Model(config, ...)
+```yaml
+kernel_policy: ./kernel-policy.yaml
 ```
 
-If the checkpoint has no quant config, `load_quant_plan` returns `None`, the model falls back to bf16, and behavior is identical to before. Wiring up quantization needs no branch on the model side. This loading is already connected in the pi0, pi0.5, and cosmos3 entries.
+Relative paths in a server YAML file resolve from that file's directory. Relative paths in environment variables and Python resolve from the process working directory. Choose one policy source for each entry point; do not set both `kernel_policy` and `config.kernel.config_path`.
 
-# What's supported today
+`PHYAI_KERNEL_CONFIG` overrides Python and server YAML settings when the Engine starts. Clear an old environment setting before switching to either of those entry points:
 
-On the config side, three frameworks are recognized:
+```bash
+unset PHYAI_KERNEL_CONFIG
+```
 
-| Framework | Source file | Detection |
+## Customize quantized layers and precision
+
+The following complete policy uses INT4 for MLP weights and INT8 for attention projection weights, while keeping layer 0 at its original precision. The example assumes layer prefixes start with `model.layers.<layer-number>`. Replace them with your model's prefixes.
+
+```yaml
+schema: phyai.kernel/v1
+profile: static
+
+quantization:
+  method: rtn
+  stage: load
+  default: null
+  rules:
+    - match:
+        glob: "model.layers.0.*"
+      scheme: null
+    - match:
+        glob: "model.layers.*.mlp.*"
+      weight:
+        dtype: int4
+        block_shape: [1, 128]
+      input: null
+    - match:
+        glob: "model.layers.*.self_attn.*"
+      weight:
+        dtype: int8
+        block_shape: [1, 128]
+      input: null
+
+rules:
+  - id: humming-linear
+    match:
+      op: gemm
+      quant.layout: humming
+    restrict_to: "humming.gemm.*"
+```
+
+`quantization.rules` are checked from top to bottom and stop at the first match. Put exclusions first. `scheme: null` skips a layer, and `default: null` keeps the configured precision for unmatched layers. PTQ during loading currently uses `method: rtn` and `stage: load`.
+
+Each quantization rule's `match` must use exactly one selector:
+
+| Selector | What it matches |
+| --- | --- |
+| `name` | The full layer prefix, or its last segment |
+| `glob` | A wildcard pattern for the layer prefix, such as `model.layers.*.mlp.*` |
+| `regex` | A regular expression for the layer prefix; add `^` and `$` to require a full match |
+| `module_cls` | A substring of the layer class name, such as `RowParallelLinear` |
+
+These names are the `prefix` values passed when creating PhyAI Linear layers. They differ from checkpoint tensor keys and may differ from `named_modules()` paths. Check where your model creates its Linear layers to confirm their prefixes. If the model fuses `q_proj/k_proj/v_proj`, match the fused `qkv_proj` layer. Likewise, match `gate_up_proj` for fused `gate_proj/up_proj` weights.
+
+Common precision fields:
+
+| Field | Usage |
+| --- | --- |
+| `weight.dtype` | `int4`, `int8`, `fp8_e4m3`, `fp8_e5m2`, `mxfp4`, or `nvfp4` |
+| `weight.block_shape: [1, 128]` | Group size 128; specifying this selects block granularity automatically |
+| `weight.granularity: per_channel` | One set of weight quantization parameters per output channel; omit `block_shape` |
+| `weight.granularity: per_tensor` | One set of quantization parameters for the whole weight tensor; omit `block_shape` |
+| `input: null` | Keep BF16/FP16 activations |
+| `input.dtype` | The activation type for dynamic A8; use a weight/activation pair from the table below |
+
+Common combinations are listed below. `null` means `input: null`, which keeps BF16/FP16 activations. For A8, also set `granularity: per_channel` and `dynamic: true`.
+
+| `weight.dtype` | Weight granularity | `input.dtype`, or `input: null` |
 | --- | --- | --- |
-| HF flat fp8 | `quantization_config` in `config.json` | `quant_method == "fp8"` |
-| compressed-tensors (llm-compressor) | `quantization_config` in `config.json` | `quant_method == "compressed-tensors"` |
-| NVIDIA ModelOpt | `hf_quant_config.json` or inline | `quant_algo` present |
+| `int4` | `block_shape: [1, 128]` | `null`, `int8`, `fp8_e4m3` |
+| `int8` | `block_shape: [1, 128]` | `null`, `int8` |
+| `fp8_e4m3` | `granularity: per_channel` | `null`, `fp8_e4m3` |
+| `fp8_e5m2` | `granularity: per_channel` | `null`, `fp8_e5m2` |
+| `fp8_e4m3` | `block_shape: [128, 128]` | `fp8_e4m3` |
+| `fp8_e5m2` | `block_shape: [128, 128]` | `fp8_e5m2` |
+| `mxfp4` | `block_shape: [1, 32]` | `null` |
+| `nvfp4` | `block_shape: [1, 16]` | `null` |
 
-For how to configure it or hand-write rules, see [Configuring quantization](/quantization/configuration). To change physical formats or add a framework, see [Internals and extension](/quantization/internals).
+For example, replace a rule's `weight` and `input` fields with these settings to use FP8 E4M3 block A8:
+
+```yaml
+weight:
+  dtype: fp8_e4m3
+  block_shape: [128, 128]
+input:
+  dtype: fp8_e4m3
+  granularity: per_channel
+  dynamic: true
+```
+
+A8 still accepts and returns BF16/FP16 tensors. Activations are quantized dynamically per token during each call. FP8 A8 requires NVIDIA SM89 or newer; the other combinations in the table require SM80 or newer when running in BF16. MXFP4 and FP8 E5M2 A8 currently require BF16 inputs and outputs. PTQ uses symmetric weight quantization, and A8 activations must use dynamic quantization.
+
+After changing `quantization`, create a new Engine and reload the weights. Editing the YAML does not change the precision of an existing instance. If you omit the entire `quantization` section, the system uses the checkpoint and model's existing configuration. Load an already quantized checkpoint through its existing loading path.
+
+## Customize execution kernels
+
+The top-level `rules` section configures execution kernels. You can limit candidates by operation, role, dtype, device, and call shape. For example, append this attention rule to the top-level `rules` list in the file above:
+
+```yaml
+- id: paged-attention-fa2
+  priority: 10
+  match:
+    op: attention_paged
+    device.arch: sm90
+  restrict_to: flashinfer.attention_paged.fa2
+```
+
+Quantization rules and kernel rules use different matching methods:
+
+| Configuration | Selection behavior |
+| --- | --- |
+| `quantization.rules` | Matches layer prefixes/classes; the first match applies |
+| Top-level `rules` | Matches call conditions and chooses the highest `priority`; simultaneous matches at the same priority raise an error |
+| Top-level `overrides` | Takes precedence over `rules`; `use: full-kernel-ID` forces a kernel and raises an error if it is incompatible |
+
+All fields in a kernel's `match` must match. Common examples include `dtype.input: bf16`, `quant.format: int4`, `device.arch: ">=sm80"`, and `shape.M: "<=64"`. Here, `role` is an operation role. Layer prefixes belong in quantization rules; kernel `match` does not accept their `glob` or `regex` selectors.
+
+Each ordinary kernel rule must choose one candidate setting:
+
+- `restrict_to`: A full kernel ID or an ID wildcard pattern, such as `"humming.gemm.*"`.
+- `prefer`: An ordered list of full kernel IDs, such as `[flashinfer.gemm.bf16, torch.gemm.bf16]`. Other ordinary implementations are excluded from the candidates; compatible reference fallbacks are allowed by default.
+
+To disable reference fallbacks, set `defaults: {fallback: error}` at the top level of the policy. Humming quantized weights require a compatible Humming kernel. Forcing an ordinary BF16 GEMM for them will fail.
+
+`params` passes parameters that the selected kernel supports. For example, add this to the Humming rule:
+
+```yaml
+params:
+  compute_config:
+    use_batch_invariant: true
+```
+
+Parameters from different rules are not merged. To change the weight format, edit `quantization`. Changing only `prefer`, `restrict_to`, or `params` does not requantize the weights.
+
+## Check the configuration
+
+List the GEMM kernel IDs in your installed version:
+
+```bash
+python -c 'from phyai.kernel import build_catalog; print("\n".join(row.kernel_id for row in build_catalog().impls("gemm")))'
+```
+
+Then parse the file and check that a specific layer matches the settings you intended:
+
+```python
+from phyai.kernel import build_catalog, load_policy
+
+policy = load_policy("kernel-policy.yaml", build_catalog())
+prefix = "model.layers.1.self_attn.o_proj"
+print(policy.quant_plan.resolve(prefix))
+```
+
+With the custom policy above, this layer should show `INT8`. Changing the layer number to `0` returns `None`. Parsing does not verify checkpoint contents, GPU capabilities, or model accuracy. Follow it with loading and inference through your normal model entry point.
+
+| Problem | What to check |
+| --- | --- |
+| Editing the YAML has no effect | Whether `PHYAI_KERNEL_CONFIG` is still set, and whether you created a new Engine |
+| A target layer is not quantized | Whether its prefix matches, or an earlier `scheme: null` rule excludes it |
+| A weight shape is unsupported | The local dimensions after TP partitioning and the group/block size; group size 128 requires local K to be divisible by 128 |
+| No kernel is available | GPU architecture, BF16/FP16 restrictions, and whether `rules/overrides` exclude compatible implementations |

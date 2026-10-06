@@ -81,13 +81,17 @@ docker run --rm --entrypoint conda \
   pyzmq msgpack-numpy==0.4.8
 ```
 
+在 PhyAI 的 Python 环境中安装 adapter 的传输依赖：
+
+```bash
+python -m pip install pyzmq msgpack msgpack-numpy
+```
+
 在第一个终端启动 PhyAI adapter：
 
 ```bash
 CUDA_VISIBLE_DEVICES="$MODEL_GPU" \
-UV_CACHE_DIR=/tmp/phyai-libero-adapter-uv \
-uv run --with pyzmq --with msgpack --with msgpack-numpy \
-  python benchmark/gr00t/libero_rollout_server.py \
+python benchmark/gr00t/libero_rollout_server.py \
   --checkpoint "$CHECKPOINT" \
   --host 0.0.0.0 \
   --port 5556 \
@@ -156,7 +160,7 @@ jq '{server_info,successes,trials,complete,success_rate,wilson_95}' \
 ```bash
 export ISAAC_GR00T_REPO=/path/to/Isaac-GR00T
 cd "$ISAAC_GR00T_REPO"
-uv run python gr00t/eval/run_gr00t_server.py \
+python gr00t/eval/run_gr00t_server.py \
   --model-path "$CHECKPOINT" \
   --embodiment-tag LIBERO_PANDA \
   --device cuda \

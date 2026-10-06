@@ -1,84 +1,198 @@
 ---
-title: "量化概述"
-description: "PhyAI 量化子系统的分层设计：从 checkpoint 配置到物理权重格式的四级流水线。"
-icon: "layer-group"
+title: "量化与 kernel policy"
+description: "用 kernel policy YAML 配置加载时量化、层匹配、权重精度和执行 kernel。"
+icon: "sliders"
 ---
 
-# 量化
+用一份 kernel policy YAML 配置量化和 kernel 选择：`quantization` 指定哪些层使用哪种精度，顶层 `rules` 指定执行 kernel。加载未量化的 FP16、BF16 或 FP32 checkpoint 后，系统按配置对权重做 PTQ。
 
-量化把权重和激活从 bf16 换成更低的精度（fp8、nvfp4 等）来存储和计算，省显存、提吞吐。难点不在于某一种格式怎么算，而在于同一个引擎要同时接住好几种来源不同、约定不同的量化 checkpoint，还要让模型代码基本不用改。
+## 加载 kernel policy
 
-PhyAI 把这件事拆成两层来管：
+将下一节的配置保存为 `kernel-policy.yaml`。在已安装 PhyAI 和 `humming-kernels` 的 Python 环境中，通过环境变量指定文件：
 
-- **语义层**：这个张量量化成什么。只描述 dtype、粒度、对称性这些数学属性，不碰 scale 布局、kernel、设备。
-- **物理层**：这个张量在显存里长什么样。dtype、scale 的形状和排布、加载后要不要做后处理，以及前向时走哪个 kernel。
+```bash
+PHYAI_KERNEL_CONFIG=./kernel-policy.yaml python run_model.py
+```
 
-两层中间隔着一次显式的下降（lowering）。语义描述先在设备信息就位后被翻译成物理格式，再由物理格式去分配参数、挑选 kernel。这样加一种新框架的 config 解析，和加一种新的物理 kernel，改的是不同的文件，互不牵连。
+将 `run_model.py` 替换为你的模型启动脚本，并保留原来的 checkpoint 等参数。模型应以 BF16 或 FP16 运行。
 
-![量化的分层设计：config → plan → scheme 都是设备无关的语义，materialize 之后才落到物理格式](/images/quantization/layered-design.svg)
-
-一条线从左到右：config 被 importer 认成 `QuantPlan`，`QuantPlan` 按层名 `resolve` 出 `QuantScheme`，`materialize` 再把语义降成 `WeightSpec`。前三级都不碰硬件，只有 `materialize` 这一步把 SM 版本读进来，分界在 scheme 和 spec 之间。
-
-# 四级流水线
-
-上图的每一级，具体在做什么：
-
-| 阶段 | 输入 | 输出 | 代码位置 |
-| --- | --- | --- | --- |
-| 识别 | checkpoint 的量化 config | `QuantPlan` | `layers/quant/importers/` |
-| 匹配 | 层名 + 层的类 | `QuantScheme`（或跳过） | `layers/quant/plan.py` |
-| 下降 | `QuantScheme` + SM 版本 | `WeightSpec` | `layers/quant/materialize.py` |
-| 落地 | `WeightSpec` | 参数分配 + kernel 选择 | `layers/quant/{bf16,fp8,nvfp4}.py` |
-
-每一级都只认上一级的输出，不越级往回看。importer 只负责把五花八门的 config 收敛成一张规则表；规则表只负责按层名回答"这一层用哪个 scheme"；`materialize` 只负责把语义翻成物理，并在这里做和硬件相关的选择（比如 NVFP4 的 scale 布局要看 SM 版本）。
-
-# 举个例子：三个 key 怎么落地
-
-把上面 `QuantPlan → WeightSpec` 那一段放大来看。拿一个 fp8 checkpoint，它的 plan 只有两条规则：`lm_head` 跳过，其余走 fp8。三个权重前缀过一遍这张规则表，落到不同的物理格式。
-
-![一个 QuantPlan 如何解析三个 checkpoint 权重 key](/images/quantization/resolve-example.svg)
-
-`qkv_proj` 和 `gate_up_proj` 没被单独点名，落到 `default`，拿到 `Fp8Spec`：权重按 `fp8_e4m3` 存，再配一列 fp32 的 `weight_scale`（per-channel，每个输出通道一个），激活在运行时按 token 动态量化。`lm_head` 命中第一条 skip 规则，`scheme` 是 `None`，于是保持 bf16——只有一个 `weight`，没有 scale。规则自上而下匹配，命中即停，剩下的一律走 `default`。
-
-# 一个量化 checkpoint 怎么跑起来
-
-模型入口已经接好了量化的加载，所以跑一个量化 checkpoint 和跑普通 checkpoint 用的是同一套代码。以 pi0.5 为例：
+使用 Python 时，把包含 `KernelConfig` 的配置传给 `EngineArgs(config=config)`：
 
 ```python
-from pathlib import Path
-from phyai.engine import Engine, EngineArgs
-from phyai.engine_config import DeviceConfig, EngineConfig
-from phyai.models.pi05.main_pi05 import PI05Args
-import torch
+from phyai.engine_config import EngineConfig, KernelConfig
 
-engine = Engine(
-    EngineArgs(
-        plugin="pi05",
-        plugin_args=PI05Args(checkpoint_dir=Path("/path/to/quantized_pi05")),
-        config=EngineConfig(
-            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
-        ),
-    )
+config = EngineConfig(
+    kernel=KernelConfig(config_path="kernel-policy.yaml")
 )
 ```
 
-入口在构造模型时会读 checkpoint 的量化 config，构建出对应的 `QuantPlan`，并把它设为当前生效的计划：
+使用[服务 YAML](/zh/deployment/server-gateway) 时，在顶层增加：
 
-```python
-with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
-    self.model = PI05Model(config, ...)
+```yaml
+kernel_policy: ./kernel-policy.yaml
 ```
 
-如果 checkpoint 没有量化 config，`load_quant_plan` 返回 `None`，模型退回默认的 bf16，行为和以前完全一致。换句话说，接量化不需要模型侧写任何分支。这套加载已经接进 pi0、pi0.5 和 cosmos3 的各个入口。
+服务 YAML 中的相对路径以该 YAML 所在目录为基准；环境变量和 Python 中的相对路径以进程工作目录为基准。一个入口选择一种 policy 来源，不要同时设置 `kernel_policy` 和 `config.kernel.config_path`。
 
-# 当前支持范围
+`PHYAI_KERNEL_CONFIG` 会在 Engine 启动时覆盖 Python 或服务 YAML 的设置。改用后两种入口前，清除旧环境变量：
 
-config 识别侧目前认三种框架：
+```bash
+unset PHYAI_KERNEL_CONFIG
+```
 
-| 框架 | 来源文件 | 识别标志 |
+## 定制量化范围和精度
+
+下面是一份完整配置：MLP 权重用 INT4，attention 投影权重用 INT8，第 0 层保持原精度。示例假设层 prefix 以 `model.layers.<层号>` 开头；使用时替换成自己模型的 prefix。
+
+```yaml
+schema: phyai.kernel/v1
+profile: static
+
+quantization:
+  method: rtn
+  stage: load
+  default: null
+  rules:
+    - match:
+        glob: "model.layers.0.*"
+      scheme: null
+    - match:
+        glob: "model.layers.*.mlp.*"
+      weight:
+        dtype: int4
+        block_shape: [1, 128]
+      input: null
+    - match:
+        glob: "model.layers.*.self_attn.*"
+      weight:
+        dtype: int8
+        block_shape: [1, 128]
+      input: null
+
+rules:
+  - id: humming-linear
+    match:
+      op: gemm
+      quant.layout: humming
+    restrict_to: "humming.gemm.*"
+```
+
+`quantization.rules` 从上往下匹配，第一条命中后停止。把排除规则放在前面；`scheme: null` 表示跳过，`default: null` 表示未匹配的层保留其配置精度。当前加载时 PTQ 使用 `method: rtn`、`stage: load`。
+
+每条量化规则的 `match` 只能使用一种选择器：
+
+| 选择器 | 匹配对象 |
+| --- | --- |
+| `name` | 完整的层 prefix，或 prefix 的最后一段 |
+| `glob` | 层 prefix 的通配符模式，例如 `model.layers.*.mlp.*` |
+| `regex` | 层 prefix 的正则表达式；需要完整匹配时加 `^` 和 `$` |
+| `module_cls` | 层类名的子串，例如 `RowParallelLinear` |
+
+这些名字是创建 PhyAI Linear 时传入的 `prefix`，不是 checkpoint 的 tensor key，也不一定等于 `named_modules()` 的路径。查看模型创建 Linear 的位置，确认其 `prefix`。如果模型融合了 `q_proj/k_proj/v_proj`，要匹配融合层 `qkv_proj`；融合的 `gate_proj/up_proj` 同理匹配 `gate_up_proj`。
+
+常用精度字段：
+
+| 字段 | 用法 |
+| --- | --- |
+| `weight.dtype` | `int4`、`int8`、`fp8_e4m3`、`fp8_e5m2`、`mxfp4` 或 `nvfp4` |
+| `weight.block_shape: [1, 128]` | group 128；指定后自动使用 block 粒度 |
+| `weight.granularity: per_channel` | 每个输出通道一组权重量化参数，不设置 `block_shape` |
+| `weight.granularity: per_tensor` | 整个权重一组量化参数，不设置 `block_shape` |
+| `input: null` | 保留 BF16/FP16 激活 |
+| `input.dtype` | 动态 A8 的激活类型；使用下表中的权重/激活组合 |
+
+常用组合如下。`input: null` 表示 BF16/FP16 激活；设置 A8 时，同时指定 `granularity: per_channel` 和 `dynamic: true`。
+
+| `weight.dtype` | 权重粒度 | `input.dtype`，或 `input: null` |
 | --- | --- | --- |
-| HF 扁平 fp8 | `config.json` 的 `quantization_config` | `quant_method == "fp8"` |
-| compressed-tensors（llm-compressor） | `config.json` 的 `quantization_config` | `quant_method == "compressed-tensors"` |
-| NVIDIA ModelOpt | `hf_quant_config.json` 或内联 | `quant_algo` 字段存在 |
+| `int4` | `block_shape: [1, 128]` | `null`、`int8`、`fp8_e4m3` |
+| `int8` | `block_shape: [1, 128]` | `null`、`int8` |
+| `fp8_e4m3` | `granularity: per_channel` | `null`、`fp8_e4m3` |
+| `fp8_e5m2` | `granularity: per_channel` | `null`、`fp8_e5m2` |
+| `fp8_e4m3` | `block_shape: [128, 128]` | `fp8_e4m3` |
+| `fp8_e5m2` | `block_shape: [128, 128]` | `fp8_e5m2` |
+| `mxfp4` | `block_shape: [1, 32]` | `null` |
+| `nvfp4` | `block_shape: [1, 16]` | `null` |
 
-想知道具体怎么配、怎么手写规则，看[配置与使用](/zh/quantization/configuration)。想改物理格式或加新框架，看[内部机制与扩展](/zh/quantization/internals)。
+例如，给某条规则替换以下 `weight` 和 `input`，即可改用 FP8 E4M3 block A8：
+
+```yaml
+weight:
+  dtype: fp8_e4m3
+  block_shape: [128, 128]
+input:
+  dtype: fp8_e4m3
+  granularity: per_channel
+  dynamic: true
+```
+
+A8 仍接收和返回 BF16/FP16 张量，激活在调用时按 token 动态量化。FP8 A8 需要 NVIDIA SM89+；上表其余组合在 BF16 下需要 SM80+。当前 MXFP4 和 FP8 E5M2 A8 要求 BF16 输入输出。PTQ 使用对称权重量化，A8 激活必须动态量化。
+
+修改 `quantization` 后，重新创建 Engine 并加载权重。已有实例不会随着 YAML 修改而切换精度。省略整个 `quantization` 段时，系统沿用 checkpoint 和模型的原有配置；已有量化 checkpoint 应使用其原有加载方式。
+
+## 定制执行 kernel
+
+顶层 `rules` 配置执行 kernel。可以按算子、角色、dtype、设备和调用形状限制候选。例如，在上面文件的顶层 `rules` 列表中追加 attention 规则：
+
+```yaml
+- id: paged-attention-fa2
+  priority: 10
+  match:
+    op: attention_paged
+    device.arch: sm90
+  restrict_to: flashinfer.attention_paged.fa2
+```
+
+量化规则和 kernel 规则使用不同的匹配方式：
+
+| 配置 | 选择方式 |
+| --- | --- |
+| `quantization.rules` | 按层 prefix/class 匹配，第一条命中生效 |
+| 顶层 `rules` | 按调用条件匹配，选择最高 `priority`；同优先级同时命中会报错 |
+| 顶层 `overrides` | 优先于 `rules`，用 `use: 完整kernel ID` 强制选择；不兼容时报错 |
+
+kernel 的 `match` 中，各字段必须同时满足。常用写法包括 `dtype.input: bf16`、`quant.format: int4`、`device.arch: ">=sm80"`、`shape.M: "<=64"`。这里的 `role` 是算子角色，不是层 prefix；kernel `match` 不接受量化规则的 `glob` 或 `regex`。
+
+普通 kernel 规则必须选择一种候选配置：
+
+- `restrict_to`：一个完整 kernel ID，或 ID 通配符，例如 `"humming.gemm.*"`。
+- `prefer`：完整 kernel ID 的有序列表，例如 `[flashinfer.gemm.bf16, torch.gemm.bf16]`。未列出的普通实现不会自动加入候选；默认允许兼容的 reference 回退。
+
+如果要禁止 reference 回退，在 policy 顶层设置 `defaults: {fallback: error}`。Humming 量化权重必须使用兼容的 Humming kernel，不能强制交给普通 BF16 GEMM。
+
+`params` 传递所选 kernel 支持的参数。例如，给 Humming 的规则加上：
+
+```yaml
+params:
+  compute_config:
+    use_batch_invariant: true
+```
+
+不同规则的 `params` 不会合并。改变权重格式请修改 `quantization`；仅修改 `prefer`、`restrict_to` 或 `params` 不会重新量化权重。
+
+## 检查配置
+
+先列出当前安装版本的 GEMM kernel ID：
+
+```bash
+python -c 'from phyai.kernel import build_catalog; print("\n".join(row.kernel_id for row in build_catalog().impls("gemm")))'
+```
+
+再用解析器检查文件，并确认一个具体层匹配到预期设置：
+
+```python
+from phyai.kernel import build_catalog, load_policy
+
+policy = load_policy("kernel-policy.yaml", build_catalog())
+prefix = "model.layers.1.self_attn.o_proj"
+print(policy.quant_plan.resolve(prefix))
+```
+
+对上面的自定义配置，这一层应显示 `INT8`，把层号改成 `0` 则返回 `None`。解析检查不验证 checkpoint 内容、GPU 能力或模型精度；随后用正常模型入口加载和推理。
+
+| 遇到的问题 | 检查项 |
+| --- | --- |
+| 修改 YAML 后行为不变 | 是否仍设置了 `PHYAI_KERNEL_CONFIG`；是否重新创建了 Engine |
+| 目标层没有量化 | prefix 是否匹配；是否被更早的 `scheme: null` 规则排除 |
+| 权重形状不支持 | 检查 TP 切分后的本地尺寸和 group/block；group 128 要求本地 K 能被 128 整除 |
+| 没有可用 kernel | 检查 GPU 架构、BF16/FP16 限制，以及 `rules/overrides` 是否排除了兼容实现 |

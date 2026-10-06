@@ -35,9 +35,9 @@ class TensorQuant:
     ``dynamic`` is meaningful only for activations (True = scale computed
     at runtime); it is always False for weights. ``micro_scaled`` marks
     block-microscaled formats (NVFP4/MXFP4: an in-block low-precision
-    scale plus an outer global scale). ``block_shape`` is set for
-    block-granularity weights. ``group_size`` is intentionally not
-    modelled yet (no group/int4 path in this slice).
+    scale, with an outer global scale for NVFP4). ``block_shape`` is set for
+    block-granularity weights; ``(1, G)`` describes groups of G weights
+    along each output channel.
     """
 
     dtype: QDType

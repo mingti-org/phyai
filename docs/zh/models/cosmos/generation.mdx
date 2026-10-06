@@ -209,7 +209,7 @@ Cosmos3 的生成路径把一句话变成一段视频。打开 sound stream，�
 `examples/cosmos3/run_cosmos3.py` 把这些步骤串成了一条命令。最普通的 T2V：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --prompt "A red sports car driving along a coastal road at sunset." \
     --out .cache/cosmos3_t2v
@@ -218,7 +218,7 @@ uv run python examples/cosmos3/run_cosmos3.py \
 加上 CFG 和 tensor parallel，同一个脚本就能铺到八张卡上。8 个 rank 要 8 张可见 GPU，在启动进程上先选好：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python examples/cosmos3/run_cosmos3.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --cfg 2 \
     --tp 4 \
@@ -228,7 +228,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python examples/cosmos3/run_cosmos3.
 加 `--sound` 就是 T2AV。声音流会加载 AVAE，并且每一步多推进一条 latent，显存和耗时都会上去：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --prompt "ocean waves crashing on rocks" \
     --sound \
@@ -238,7 +238,7 @@ uv run python examples/cosmos3/run_cosmos3.py \
 默认是 `720×1280`、`189` 帧、`35` 步，要跑一阵子。第一次冒烟测试先把尺寸缩小：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --num-frames 49 \
     --height 480 \

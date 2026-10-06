@@ -38,6 +38,10 @@ def materialize(
     resolver.
     """
     w = scheme.weight
+    if scheme.online and w.dtype is not QDType.BF16:
+        from phyai.layers.quant.humming import HummingSpec
+
+        return HummingSpec(scheme)
     if w.dtype is QDType.BF16:
         return Bf16Spec()
     if w.dtype is QDType.FP8_E4M3:

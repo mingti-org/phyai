@@ -95,13 +95,13 @@ When collaborating with other people on code, `.memory` can also be used as a fo
 The Coding Agent should prefer the script bundled with the skill:
 
 ```bash
-uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
+python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py
 ```
 
 To save the report, provide an output path:
 
 ```bash
-uv run python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
+python .claude/skills/phyai-local-env-report/scripts/collect_env_report.py --output reports/local-env.md
 ```
 
 This skill is useful for diagnosing installation failures, invisible CUDA devices, dependency mismatches, workspace package import errors, and runtime problems that reproduce only on a specific machine. Unless explicitly requested, the Coding Agent should not install dependencies, modify the repository, or run heavyweight builds just to generate the environment report.

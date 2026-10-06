@@ -134,7 +134,7 @@ action query -> prefix + state + action chunk
   需要在 Nsight Systems 中展开 trace 时，可以关闭 CUDA graph：
 
   ```bash
-  uv run python benchmark/bench_n_batch_ws1_pi0.py \
+  python benchmark/bench_n_batch_ws1_pi0.py \
       --batch-sizes 4 \
       --no-cuda-graph
   ```
@@ -232,7 +232,7 @@ action query -> prefix + state + action chunk
 `examples/pi0/run_pi0.py` 既能使用 processor 构造请求，也能直接走 raw smoke 路径。带 checkpoint 时这样运行：
 
 ```bash
-uv run python examples/pi0/run_pi0.py \
+python examples/pi0/run_pi0.py \
     --checkpoint /path/to/pi0_pytorch \
     --batch-size 1
 ```
@@ -240,13 +240,13 @@ uv run python examples/pi0/run_pi0.py \
 只检查执行链路时，可以省略 checkpoint 并使用随机权重：
 
 ```bash
-uv run python examples/pi0/run_pi0.py --raw --batch-size 1
+python examples/pi0/run_pi0.py --raw --batch-size 1
 ```
 
 Checkpoint 若留有一路 empty camera，应只传两路图像：
 
 ```bash
-uv run python examples/pi0/run_pi0.py \
+python examples/pi0/run_pi0.py \
     --checkpoint /path/to/pi0_pytorch \
     --num-images 2
 ```
@@ -256,7 +256,7 @@ uv run python examples/pi0/run_pi0.py \
 使用 `benchmark/bench_n_batch_ws1_pi0.py`，可以在同一套 scheduler 配置下比较不同 batch size：
 
 ```bash
-uv run python benchmark/bench_n_batch_ws1_pi0.py \
+python benchmark/bench_n_batch_ws1_pi0.py \
     --batch-sizes 1 2 4 \
     --n-warmup 5 \
     --n-timed 30 \
@@ -270,7 +270,7 @@ nsys profile \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     -o ./prof/pi0_ws1 \
-    uv run python benchmark/bench_n_batch_ws1_pi0.py \
+    python benchmark/bench_n_batch_ws1_pi0.py \
         --batch-sizes 4 \
         --profile-backend nsys \
         --profile-start-step 5 \

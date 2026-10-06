@@ -134,7 +134,7 @@ For each request, the runners refresh their static input buffers and replay the 
   Disable CUDA graphs when you need an expanded Nsight Systems trace:
 
   ```bash
-  uv run python benchmark/bench_n_batch_ws1_pi0.py \
+  python benchmark/bench_n_batch_ws1_pi0.py \
       --batch-sizes 4 \
       --no-cuda-graph
   ```
@@ -232,7 +232,7 @@ For each request, the runners refresh their static input buffers and replay the 
 `examples/pi0/run_pi0.py` can drive either a processed request or the raw smoke path. A checkpoint-backed run looks like this:
 
 ```bash
-uv run python examples/pi0/run_pi0.py \
+python examples/pi0/run_pi0.py \
     --checkpoint /path/to/pi0_pytorch \
     --batch-size 1
 ```
@@ -240,13 +240,13 @@ uv run python examples/pi0/run_pi0.py \
 To check only the execution path, omit the checkpoint and use random weights:
 
 ```bash
-uv run python examples/pi0/run_pi0.py --raw --batch-size 1
+python examples/pi0/run_pi0.py --raw --batch-size 1
 ```
 
 A checkpoint with one empty camera expects two image streams:
 
 ```bash
-uv run python examples/pi0/run_pi0.py \
+python examples/pi0/run_pi0.py \
     --checkpoint /path/to/pi0_pytorch \
     --num-images 2
 ```
@@ -256,7 +256,7 @@ uv run python examples/pi0/run_pi0.py \
 Use `benchmark/bench_n_batch_ws1_pi0.py` to compare batch sizes under the same scheduler configuration:
 
 ```bash
-uv run python benchmark/bench_n_batch_ws1_pi0.py \
+python benchmark/bench_n_batch_ws1_pi0.py \
     --batch-sizes 1 2 4 \
     --n-warmup 5 \
     --n-timed 30 \
@@ -270,7 +270,7 @@ nsys profile \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     -o ./prof/pi0_ws1 \
-    uv run python benchmark/bench_n_batch_ws1_pi0.py \
+    python benchmark/bench_n_batch_ws1_pi0.py \
         --batch-sizes 4 \
         --profile-backend nsys \
         --profile-start-step 5 \

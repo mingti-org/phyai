@@ -42,6 +42,8 @@ rules: []
 
 也可以使用绝对路径，例如 `kernel_policy: /path/to/kernel-policy.yaml`。相对 policy 路径以 `pi05.yaml` 所在目录为基准，与执行命令时的目录无关。本地权重和 tokenizer 路径请使用绝对路径，或明确以 `./`、`../` 开头。
 
+加载时 PTQ 的配置方法和各模型的 policy 示例，见[量化使用指南](/zh/quantization/overview)。
+
 ## 启动模型服务
 
 ```bash

@@ -10,7 +10,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import ParallelConfig, get_engine_config
-from phyai.layers.quant.active import load_quant_plan, use_quant_plan
+from phyai.layers.quant.active import resolve_quant_plan, use_quant_plan
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
     cosmos3_avae_weight_remap,
@@ -108,7 +108,7 @@ class Cosmos3Entry(Entry):
 
         # The engine already initialized the mesh and process kernel selector, so
         # the model constructors below need no standalone register_mesh shim.
-        with use_quant_plan(load_quant_plan(ckpt / "transformer")):
+        with use_quant_plan(resolve_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
             ).eval()

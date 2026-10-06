@@ -45,7 +45,7 @@ Action alignment holds the inputs, prompt tokens, and denoising noise fixed, lea
 cd /phyai_workspace
 mkdir -p pt outputs
 
-uv run python benchmark/pi0/compare_pi0_lerobot_live.py \
+python benchmark/pi0/compare_pi0_lerobot_live.py \
   --checkpoint /data/share/pi0_base \
   --lerobot-root /phyai_workspace/lerobot-main \
   --tokenizer-name /data/share/paligemma-3b-pt-224 \
@@ -83,7 +83,7 @@ If the action chunks disagree, keep the original inputs. `--save-output` writes 
 ```bash
 cd /phyai_workspace
 
-uv run python benchmark/pi0/dump_compare_pi0_lerobot.py \
+python benchmark/pi0/dump_compare_pi0_lerobot.py \
   --checkpoint /data/share/pi0_base \
   --pt pt/pi0_bf16_payload.pt \
   --lerobot-root /phyai_workspace/lerobot-main \
@@ -121,7 +121,7 @@ Once the numerical path agrees, measure the PhyAI scheduler on its own with CUDA
 ```bash
 cd /phyai_workspace
 
-uv run python benchmark/bench_n_batch_ws1_pi0.py \
+python benchmark/bench_n_batch_ws1_pi0.py \
   --checkpoint /data/share/pi0_base \
   --batch-sizes 1 2 4 \
   --dtype bf16 \
@@ -149,7 +149,7 @@ HF_DATASETS_OFFLINE=1 \
 MUJOCO_GL=egl \
 MUJOCO_EGL_DEVICE_ID=0 \
 LEROBOT_PALIGEMMA_TOKENIZER_PATH=/data/share/paligemma-3b-pt-224 \
-uv run lerobot-eval \
+lerobot-eval \
   --policy.path=/data/share/pi0_libero_finetuned_v044 \
   --env.type=libero \
   --env.task=libero_object \
@@ -170,7 +170,7 @@ TRANSFORMERS_OFFLINE=1 \
 HF_DATASETS_OFFLINE=1 \
 MUJOCO_GL=egl \
 MUJOCO_EGL_DEVICE_ID=0 \
-uv run python examples/pi0/run_libero_pi0.py \
+python examples/pi0/run_libero_pi0.py \
   --checkpoint /data/share/pi0_libero_finetuned_v044 \
   --lerobot-root /phyai_workspace/lerobot-main \
   --tokenizer-name /data/share/paligemma-3b-pt-224 \

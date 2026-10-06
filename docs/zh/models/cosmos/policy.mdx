@@ -242,7 +242,7 @@ action 有两个宽度。`action_dim` 是模型内部宽度，默认 `64`；`raw
 从单张图预测 action：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot picks up the cup" \
@@ -255,7 +255,7 @@ uv run python examples/cosmos3/run_cosmos3_policy.py \
 用已知 action 推演视频：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot pushes the object forward" \
@@ -292,7 +292,7 @@ uv run python examples/cosmos3/run_cosmos3_policy.py \
 从一段 observation 视频反推 action：
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3_policy.py \
+python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --video obs.mp4 \
     --prompt "robot moves the cup to the right" \
@@ -322,7 +322,7 @@ uv run python examples/cosmos3/run_cosmos3_policy.py \
 policy 插件用的 `ParallelConfig` 字段和生成插件一样。`tp_size` 切分 transformer，是这里真正有用的开关：示例用 `guidance_scale=1.0`，CFG 是关着的，`cfg_size=2` 只会多算一个随后被丢掉的分支（scheduler 见到会打 warning）。一次运行要 `cfg_size * tp_size` 张卡，在启动进程上用 `CUDA_VISIBLE_DEVICES` 选。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run python examples/cosmos3/run_cosmos3_policy.py \
+CUDA_VISIBLE_DEVICES=0,1 python examples/cosmos3/run_cosmos3_policy.py \
     --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
     --image observation.png \
     --prompt "robot picks up the cup" \

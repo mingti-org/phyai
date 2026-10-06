@@ -5,7 +5,7 @@ from __future__ import annotations
 from phyai.kernel.facts import lib, dtype, quant, shape, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
 from phyai.kernel.registry import Catalog
-from phyai.kernel.predicate import all_of
+from phyai.kernel.predicate import all_of, any_of
 
 
 def _bench_args(facts, device):
@@ -51,6 +51,7 @@ NVIDIA_FLASHINFER = lib.has("flashinfer") & (device.vendor == "nvidia")
 # Shared capability for torch FP8 scaled matrix multiplication.
 TORCH_SCALED_MM = all_of(
     quant.format == "fp8_e4m3",
+    quant.layout.is_none(),
     device.vendor == "nvidia",
     device.arch.at_least("sm89"),
     shape.K % 16 == 0,
@@ -60,6 +61,7 @@ TORCH_SCALED_MM = all_of(
 # Torch block-scaled FP8 uses the reference dequantize-and-matmul path.
 TORCH_FP8_BLOCK = all_of(
     quant.format == "fp8_e4m3",
+    quant.layout.is_none(),
     quant.granularity == "block",
     device.vendor == "nvidia",
     device.arch.at_least("sm89"),
@@ -119,6 +121,87 @@ def _torch_dense(facts, params):
     return dense
 
 
+def _humming(facts, params):
+    from phyai.layers.linear.backends.humming import prepare
+
+    return prepare(facts, params)
+
+
+def _register_humming(catalog: Catalog) -> None:
+    floating_io = any_of(
+        all_of(dtype.input == "fp16", device.arch.at_least("sm75")),
+        all_of(dtype.input == "bf16", device.arch.at_least("sm80")),
+    )
+    common = all_of(
+        lib.has("humming"),
+        device.vendor == "nvidia",
+        quant.layout == "humming",
+        dtype.input == dtype.output,
+        floating_io,
+        shape.N % 64 == 0,
+        shape.K % 32 == 0,
+    )
+    a16 = quant.field("activation") == "a16"
+    a8 = any_of(
+        quant.field("activation") == "int8",
+        all_of(
+            quant.field("activation").in_({"fp8_e4m3", "fp8_e5m2"}),
+            device.arch.at_least("sm89"),
+        ),
+    )
+    rows = (
+        ("w4a16", quant.format == "int4", a16),
+        ("w8a16", quant.format == "int8", a16),
+        ("fp8_a16", quant.format.in_({"fp8_e4m3", "fp8_e5m2"}), a16),
+        (
+            "mxfp4_a16",
+            quant.format == "mxfp4",
+            all_of(a16, dtype.output == "bf16"),
+        ),
+        ("nvfp4_a16", quant.format == "nvfp4", a16),
+        (
+            "fp8_a8",
+            any_of(
+                all_of(
+                    quant.format == "fp8_e4m3",
+                    quant.field("activation") == "fp8_e4m3",
+                ),
+                all_of(
+                    quant.format == "fp8_e5m2",
+                    quant.field("activation") == "fp8_e5m2",
+                    dtype.output == "bf16",
+                ),
+            ),
+            all_of(a8, shape.K % 64 == 0),
+        ),
+        (
+            "int8_a8",
+            quant.format == "int8",
+            all_of(quant.field("activation") == "int8", shape.K % 64 == 0),
+        ),
+        (
+            "int4_a8",
+            quant.format == "int4",
+            all_of(
+                a8,
+                quant.field("activation").in_({"int8", "fp8_e4m3"}),
+                shape.K % 64 == 0,
+            ),
+        ),
+    )
+    for name, weight, activation in rows:
+        catalog.register(
+            Impl(
+                kernel_id=f"humming.gemm.{name}",
+                op="gemm",
+                priority=Priority.SPECIALIZED,
+                when=all_of(common, weight, activation),
+                prepare=_humming,
+                metadata={"package": "humming-kernels"},
+            )
+        )
+
+
 def register(catalog: Catalog) -> None:
     catalog.register_op(GEMM)
 
@@ -144,6 +227,7 @@ def register(catalog: Catalog) -> None:
             when=all_of(
                 NVIDIA_FLASHINFER,
                 quant.format == "fp8_e4m3",
+                quant.layout.is_none(),
                 quant.granularity == "block",
                 device.arch.at_least("sm100"),
             ),
@@ -215,6 +299,7 @@ def register(catalog: Catalog) -> None:
         ),
     )
     catalog.register_many(rows)
+    _register_humming(catalog)
 
 
 __all__ = ["GEMM", "register"]

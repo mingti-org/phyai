@@ -66,9 +66,7 @@
           {
             "group": "Quantization",
             "pages": [
-              "quantization/overview",
-              "quantization/configuration",
-              "quantization/internals"
+              "quantization/overview"
             ]
           },
           {
@@ -147,9 +145,7 @@
           {
             "group": "量化",
             "pages": [
-              "zh/quantization/overview",
-              "zh/quantization/configuration",
-              "zh/quantization/internals"
+              "zh/quantization/overview"
             ]
           },
           {

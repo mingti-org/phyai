@@ -15,6 +15,7 @@ _DISTRIBUTIONS = {
     "phyai_kernel": "phyai-kernel",
     "fla": "flash-linear-attention",
     "flash_qla": "flash-qla",
+    "humming": "humming-kernels",
 }
 
 _probes: dict[str, bool] = {}

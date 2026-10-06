@@ -209,7 +209,7 @@ The path follows PhyAI's usual <Tooltip headline="Engine + plugin" tip="Engine r
 `examples/cosmos3/run_cosmos3.py` strings these steps together. A plain T2V run:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --prompt "A red sports car driving along a coastal road at sunset." \
     --out .cache/cosmos3_t2v
@@ -218,7 +218,7 @@ uv run python examples/cosmos3/run_cosmos3.py \
 The same script spreads the run over eight GPUs once you add CFG and tensor parallelism. Eight ranks need eight visible devices, so pick them on the launching process:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python examples/cosmos3/run_cosmos3.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --cfg 2 \
     --tp 4 \
@@ -228,7 +228,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python examples/cosmos3/run_cosmos3.
 Add `--sound` for T2AV. The sound stream loads the AVAE and advances a second latent every step, so expect more memory and a longer run:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --prompt "ocean waves crashing on rocks" \
     --sound \
@@ -238,7 +238,7 @@ uv run python examples/cosmos3/run_cosmos3.py \
 The defaults are `720x1280`, `189` frames, and `35` steps, which takes a while. Shrink the run for a first smoke test:
 
 ```bash
-uv run python examples/cosmos3/run_cosmos3.py \
+python examples/cosmos3/run_cosmos3.py \
     --checkpoint /path/to/Cosmos3-Nano \
     --num-frames 49 \
     --height 480 \
