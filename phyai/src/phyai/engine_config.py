@@ -98,6 +98,11 @@ class RuntimeConfig:
     ------
     use_cuda_graph:
         Whether to enable CUDA graph capture.
+    allow_tf32:
+        Whether to allow TF32 for fp32 CUDA matmul paths.
+    allow_cudnn_tf32:
+        Whether to allow TF32 in cuDNN. `None` leaves the global setting
+        unchanged.
     freeze_kernel_choices:
         Whether to freeze kernel selections after warmup.
     flashinfer_workspace_bytes:
@@ -117,6 +122,8 @@ class RuntimeConfig:
     """
 
     use_cuda_graph: bool = True
+    allow_tf32: bool = False
+    allow_cudnn_tf32: bool | None = None
     freeze_kernel_choices: bool = False
     flashinfer_workspace_bytes: int = 128 * 1024 * 1024
     debug_tensor_dump_dir: str | None = None

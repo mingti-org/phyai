@@ -1,0 +1,6 @@
+schema: phyai.kernel/v1
+profile: static
+overrides:
+  - id: dreamzero-official-layernorm
+    match: {op: layernorm}
+    use: torch.layernorm
