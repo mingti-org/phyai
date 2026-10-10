@@ -48,6 +48,12 @@
                 ]
               },
               {
+                "group": "MolmoAct2",
+                "pages": [
+                  "models/molmoact2/inference"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "models/cosmos/generation",
@@ -124,6 +130,12 @@
                   "zh/models/gr00t/ws1",
                   "zh/models/gr00t/n17-accuracy-parity",
                   "zh/models/gr00t/n17-libero-closed-loop"
+                ]
+              },
+              {
+                "group": "MolmoAct2",
+                "pages": [
+                  "zh/models/molmoact2/inference"
                 ]
               },
               {

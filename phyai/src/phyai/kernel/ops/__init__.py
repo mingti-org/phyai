@@ -14,6 +14,7 @@ OP_MODULES: tuple[str, ...] = (
     "gemm",
     "norm",
     "activation",
+    "modulation",
     "embedding",
     "rope",
     "attention",

@@ -6,7 +6,28 @@ import torch
 import torch.nn as nn
 
 from phyai.engine_config import get_engine_config
+from phyai.kernel.call import CallSite, token_shape
 from phyai.weights.shards import replicated
+
+
+class SiLU(nn.Module):
+    """Elementwise SiLU selected through the shared activation kernel catalog."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_site = CallSite(
+            "activation",
+            role="activation",
+            attrs={"activation": "silu", "gated": False},
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        selection = self.call_site.select(
+            device=x.device,
+            dtype={"input": x.dtype, "output": x.dtype},
+            dims=token_shape(x, hidden=x.shape[-1] if x.ndim else 1),
+        )
+        return selection.execute(x)
 
 
 class Snake1d(nn.Module):
@@ -64,4 +85,4 @@ class Snake1d(nn.Module):
         return x.reshape(shape)
 
 
-__all__ = ["Snake1d"]
+__all__ = ["SiLU", "Snake1d"]

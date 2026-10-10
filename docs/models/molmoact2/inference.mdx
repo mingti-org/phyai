@@ -1,0 +1,313 @@
+---
+title: "MolmoAct2"
+description: "Download MolmoAct2, run action inference, and prepare camera and robot-state inputs for your application."
+---
+
+[MolmoAct2](https://github.com/allenai/molmoact2) predicts a chunk of robot actions
+from camera images, a task instruction, and robot state. PhyAI runs its
+vision-language backbone and continuous action expert in BF16.
+
+This guide uses the `franka_droid` robot configuration. You will first run a
+synthetic observation, then use a recorded sample and the Python API. Each example
+returns 15 actions with 8 values per action.
+
+| Item | This guide uses |
+| --- | --- |
+| Checkpoint | [allenai/MolmoAct2](https://huggingface.co/allenai/MolmoAct2) |
+| PhyAI plugin | `molmoact2` |
+| Input | Three RGB camera slots, an 8-value state vector, and a task instruction |
+| Output | A CPU `float32` action tensor shaped `(1, 15, 8)` after postprocessing |
+| Inference | BF16, 10 flow-matching steps, CUDA Graph enabled |
+| Example script | [run_molmoact2.py](https://github.com/mingti-org/phyai/blob/main/examples/molmoact2/run_molmoact2.py) |
+
+<Note>
+  `allenai/MolmoAct2` is a multi-embodiment foundation checkpoint intended for
+  further robot fine-tuning. These examples check inference and input handling;
+  they do not establish task success on a robot. Ai2 publishes deployment-specific
+  checkpoints in its [fine-tuned model collection](https://huggingface.co/collections/allenai/molmoact2-finetuned-models).
+</Note>
+
+## Quickstart
+
+Use Linux, Python 3.12 or newer, `uv`, and an NVIDIA GPU with BF16 support and
+enough free memory to load the model. See [installation](/index#setup) for the
+CUDA environment. The commands below run from the PhyAI repository root.
+
+<Steps>
+<Step title="Install PhyAI">
+
+```bash
+git clone https://github.com/mingti-org/phyai
+cd phyai
+uv sync
+source .venv/bin/activate
+```
+
+If you already have a checkout and environment, activate that environment and
+continue from its repository root.
+
+</Step>
+<Step title="Download the checkpoint">
+
+```bash
+hf download allenai/MolmoAct2 --local-dir checkpoints/MolmoAct2
+export MOLMOACT2_CHECKPOINT=checkpoints/MolmoAct2
+```
+
+Download the whole repository. Alongside the weights, the processor needs the
+tokenizer, image processor, Python files, and `norm_stats.json`. PhyAI loads the
+processor from this local directory with `trust_remote_code=True`.
+
+For an existing download, set `MOLMOACT2_CHECKPOINT` to that directory instead.
+Keep this variable and the activated environment in the same shell for the rest
+of the guide.
+
+</Step>
+<Step title="Run one observation">
+
+Select an available GPU with `nvidia-smi`. This command uses GPU 0:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/molmoact2/run_molmoact2.py \
+  --checkpoint "$MOLMOACT2_CHECKPOINT" \
+  --norm-tag franka_droid \
+  --synthetic \
+  --seed 0 \
+  --save-actions .cache/molmoact2/actions.npy
+```
+
+`--synthetic` creates camera images and uses the selected robot configuration's
+mean state, so this first run needs no observation files. The script loads the
+model, predicts actions, and saves the postprocessed array. Its log includes:
+
+```text
+Action chunk shape=(1, 15, 8) dtype=torch.float32 finite=True
+```
+
+</Step>
+<Step title="Read the result">
+
+```bash
+python - <<'PY'
+import numpy as np
+
+actions = np.load(".cache/molmoact2/actions.npy", allow_pickle=False)
+print(actions.shape, actions.dtype, np.isfinite(actions).all())
+print("First action:", actions[0, 0])
+PY
+```
+
+The first line should be `(1, 15, 8) float32 True`: one observation, 15 future
+actions, and 8 action values. For `franka_droid`, the values are
+`joint_0` through `joint_6`, followed by `gripper`; the control mode in the
+checkpoint is `absolute joint pose`.
+
+</Step>
+</Steps>
+
+## Run a recorded observation
+
+The [official DROID sample](https://huggingface.co/allenai/MolmoAct2-DROID#sample-input)
+provides an exterior-camera image, a wrist-camera image, and the matching state.
+Download just those two images and save the sample's state:
+
+```bash
+hf download allenai/MolmoAct2-DROID \
+  assets/sample_exterior_1_left_rgb.png \
+  assets/sample_wrist_left_rgb.png \
+  --local-dir .cache/molmoact2/inputs
+
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+
+inputs = Path(".cache/molmoact2/inputs")
+inputs.mkdir(parents=True, exist_ok=True)
+state = np.array(
+    [-0.12726949, -0.30641943, 0.09134164, -2.4143615,
+     -0.26460838, 2.068765, 0.123698, 0.0],
+    dtype=np.float32,
+)
+np.save(inputs / "state.npy", state)
+PY
+```
+
+The sample supplies only one exterior view. Following the upstream example,
+pass it twice to fill the two exterior-camera slots, then pass the wrist view:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/molmoact2/run_molmoact2.py \
+  --checkpoint "$MOLMOACT2_CHECKPOINT" \
+  --norm-tag franka_droid \
+  --image .cache/molmoact2/inputs/assets/sample_exterior_1_left_rgb.png \
+  --image .cache/molmoact2/inputs/assets/sample_exterior_1_left_rgb.png \
+  --image .cache/molmoact2/inputs/assets/sample_wrist_left_rgb.png \
+  --state .cache/molmoact2/inputs/state.npy \
+  --task "Put the black objects into the drawer and close the drawer." \
+  --seed 0 \
+  --save-actions .cache/molmoact2/recorded_actions.npy
+```
+
+This still uses the foundation checkpoint downloaded above. It demonstrates
+file-based input with a real observation; downloading sample images does not
+switch the model to the DROID fine-tune.
+
+### Supply your own camera frames and state
+
+Replace the sample files with one synchronized observation. For `franka_droid`,
+the order of repeated `--image` arguments must match this table:
+
+| Position | Camera key | View |
+| --- | --- | --- |
+| 1 | `observation.images.exterior_1_left` | First exterior camera |
+| 2 | `observation.images.exterior_2_left` | Second exterior camera |
+| 3 | `observation.images.wrist_left` | Wrist camera |
+
+Provide RGB images; the CLI converts image files to RGB. In Python, use `uint8`
+arrays shaped `(height, width, 3)`. The processor handles resizing and crops.
+For your own recordings, use the corresponding second exterior view in slot 2.
+
+Save the measured state as a `float32` NumPy `.npy` array shaped `(8,)` or `(1, 8)`,
+ordered as `[joint_0, joint_1, ..., joint_6, gripper]`. Pass the original state
+values; the processor applies the checkpoint's normalization and discrete state
+encoding. State and action conventions must match the selected checkpoint and
+robot configuration.
+
+### Select a different robot configuration
+
+`--norm-tag` selects camera order, state/action statistics, control mode, and
+action horizon. It must match the observation. Inspect the available tags and
+their dimensions before preparing data for another embodiment:
+
+```bash
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["MOLMOACT2_CHECKPOINT"])
+config = json.loads((root / "config.json").read_text())
+stats = json.loads(
+    (root / config.get("norm_stats_filename", "norm_stats.json")).read_text()
+)
+print("State history:", config.get("n_obs_steps", 1))
+for tag, metadata in stats["metadata_by_tag"].items():
+    print(tag)
+    for field in ("camera_keys", "control_mode", "action_horizon", "n_action_steps"):
+        print(f"  {field}: {metadata.get(field)}")
+    for field in ("state_stats", "action_stats"):
+        print(f"  {field}: {metadata.get(field, {}).get('names')}")
+PY
+```
+
+## Use the Python API
+
+Save the following as `run_molmoact2_api.py` at the repository root. It uses the
+checkpoint variable and recorded-sample files prepared above. The camera
+dictionary makes the mapping explicit; an ordered image list is also accepted.
+
+```python run_molmoact2_api.py
+import os
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.molmoact2 import MolmoAct2Args, MolmoAct2Request
+from phyai_utils_tools.models.molmoact2 import MolmoAct2Processor
+
+checkpoint = Path(os.environ["MOLMOACT2_CHECKPOINT"])
+inputs = Path(".cache/molmoact2/inputs")
+processor = MolmoAct2Processor.from_pretrained(checkpoint, norm_tag="franka_droid")
+camera_files = {
+    "observation.images.exterior_1_left": "sample_exterior_1_left_rgb.png",
+    "observation.images.exterior_2_left": "sample_exterior_1_left_rgb.png",
+    "observation.images.wrist_left": "sample_wrist_left_rgb.png",
+}
+images = {}
+for key, filename in camera_files.items():
+    with Image.open(inputs / "assets" / filename) as image:
+        images[key] = np.asarray(image.convert("RGB"))
+processed = processor.preprocess(
+    {
+        "images": images,
+        "task": "Put the black objects into the drawer and close the drawer.",
+        "state": np.load(inputs / "state.npy", allow_pickle=False),
+    }
+)
+request = MolmoAct2Request(
+    inputs=processed.tensors,
+    action_horizon=processed.action_horizon,
+    seed=0,
+)
+engine = Engine(
+    EngineArgs(
+        plugin="molmoact2",
+        plugin_args=MolmoAct2Args(checkpoint_dir=checkpoint),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+try:
+    normalized_actions = engine.step(request)
+    actions = processor.postprocess(normalized_actions)
+    print(tuple(actions.shape), actions.dtype, actions.device)
+    print("First action:", actions[0, 0].tolist())
+finally:
+    engine.close()
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_molmoact2_api.py
+```
+
+The first print returns `(1, 15, 8) torch.float32 cpu`. `engine.step()` itself
+returns normalized, padded actions shaped `(1, 15, 32)` for this configuration.
+`processor.postprocess()` removes padding, selects the requested action steps,
+and converts to the tag's action scale. Keep the engine and processor alive
+across observations in an application; close the engine when the application
+finishes.
+
+## Inference options
+
+| CLI option | Default | Effect |
+| --- | --- | --- |
+| `--checkpoint` | Required | Local directory containing the complete checkpoint. |
+| `--norm-tag` | Required | Robot configuration from `metadata_by_tag` in `norm_stats.json`. |
+| `--num-steps` | Checkpoint value: `10` | Number of flow-matching steps. Reducing it reduces model evaluations and can change action quality. |
+| `--n-action-steps` | Tag value: `15` | Number of actions returned after postprocessing. This trims the output; it does not shorten the generated horizon. |
+| `--seed` | `0` | Seed for initial action noise. Use the same inputs, settings, and seed for repeatable runs. |
+| `--device` | `cuda` | Device for this process; `cuda:0` is the first visible GPU. |
+| `--no-cuda-graph` | Graph enabled | Run action velocity evaluation without CUDA Graph capture. |
+| `--save-actions` | Unset | Save the postprocessed array as `.npy`. |
+
+Use `python examples/molmoact2/run_molmoact2.py --help` for all input options.
+In the Python API, set `num_steps` on `MolmoAct2Request` and `n_action_steps` on
+`MolmoAct2Processor.from_pretrained()`.
+
+CUDA Graph captures action velocity evaluation. Image/text preprocessing and
+prefill run outside the graph, and the first request includes capture work.
+Reuse the engine to reuse compatible captures. To disable capture in the Python
+example, set `RuntimeConfig(use_cuda_graph=False)`.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Unknown normalization tag | Run the metadata command above and select a tag present in this checkpoint. |
+| State dimension or history error | For `franka_droid`, pass one 8-value state vector. For other tags, check the state fields and `n_obs_steps`. |
+| Missing camera key or incorrect view order | Supply cameras in `camera_keys` order, or use a dictionary with those exact keys. |
+| Missing processor or configuration files | Download the complete checkpoint repository into the directory passed to `--checkpoint`. |
+| CUDA out of memory | Check free memory on the selected GPU. Adding `--no-cuda-graph` removes graph capture memory, but the full model still needs to fit. |
+| Unsupported depth configuration | This implementation rejects depth reasoning and action-expert depth gates. Use a checkpoint with both disabled. |
+
+Continuous actions require an action expert and `action_mode="continuous"` or
+`"both"`. The low-level API also exposes `MolmoAct2GenerationRequest` for greedy
+token IDs; the action examples above use `MolmoAct2Request` and its processor.
+
+For deployment beyond a local process, see [parallel serving](/deployment/parallel-serving).

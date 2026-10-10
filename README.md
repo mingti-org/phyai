@@ -27,6 +27,7 @@ models that run in interactive systems.
 
 ## News
 
+- [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
 - [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
 - [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
 - [2026/09] 🤗 Support PI0.5 RL rollout for PPO. RLinf integration is in progress via [RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587).
@@ -52,9 +53,10 @@ models that run in interactive systems.
       <th align="center" width="22%">VLA</th>
       <td align="center">
         <a href="https://phyai.mintlify.app/models/pi0/ws1"><strong>&pi;0</strong></a>,
-        <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>(w/ DP),
+        <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>,
         <a href="https://phyai.mintlify.app/models/gr00t/ws1"><strong>GR00T N1.7</strong></a>,
-        <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>
+        <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>,
+        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>
       </td>
     </tr>
     <tr>
@@ -69,11 +71,15 @@ models that run in interactive systems.
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Nano</strong></a>(w/ TP, CFG Parallel),
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
-        <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>
+        <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
+        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>
       </td>
     </tr>
   </tbody>
 </table>
+
+All supported models can scale through data-parallel (DP) replicas using the
+shared scheduler. See [parallel serving](https://phyai.mintlify.app/deployment/parallel-serving#serving-replicas).
 
 ## Performance Comparison
 
