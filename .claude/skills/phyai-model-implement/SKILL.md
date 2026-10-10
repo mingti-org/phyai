@@ -15,6 +15,11 @@ description: >-
 First, carefully study the existing repositories and articles. If the user has not provided
 references, ask them for the relevant references before proceeding.
 
+Before adding model modules, inspect the current `phyai.layers` implementations and their use in
+existing models. Map the required MLP, attention, normalization, and RoPE behavior to `DenseMLP`,
+`Attention`, `RMSNorm`/`LayerNorm`, and `RotaryEmbedding`, including weight layout and dtype rounding.
+Identify any unsupported behavior before writing a model-local replacement or changing shared layers.
+
 ## Core Three-Layer Architecture
 
 PHYAI uses a strict three-layer separation for every model:
@@ -38,7 +43,7 @@ vae.py              - Extra models or processing files, such as VAE, and auxilia
 
 ```text
 Engine Plugin (main_xxx.py)
-  +-- Scheduler (scheduler_ws1_xxx.py)
+  +-- Scheduler (scheduler_xxx.py)
         +-- ModelRunner (model_runner_xxx.py)
               +-- Model (modeling_xxx.py)
 ```
@@ -54,7 +59,7 @@ phyai/src/phyai/models/<model_name>/
 +-- configuration_<model>.py         # Frozen dataclass configuration
 +-- modeling_<model>.py              # Pure network architecture
 +-- model_runner_<model>.py          # Runtime state wrapper
-+-- scheduler_ws1_<model>.py         # Single-GPU scheduler; ws = world_size
++-- scheduler_<model>.py             # Inference orchestration
 +-- main_<model>.py                  # Engine plugin entry point; Entry subclass
 +-- (optional) sampler_*.py          # Diffusion or ODE sampler
      NOTE: name it XxxSampler, not XxxScheduler,
@@ -63,6 +68,7 @@ phyai/src/phyai/models/<model_name>/
 
 **Naming rules:**
 - Use CamelCase for class names and snake_case for file names.
+- Name schedulers `scheduler_<model>.py`, without world-size suffixes.
 - Weight remap function: `<model>_weight_remap`.
 - Engine plugin name: a short lowercase name, such as `"pi05"` or `"cosmos3_policy"`.
 
@@ -85,11 +91,25 @@ Follow these steps in order.
 **Principles:**
 - Keep modeling stateless. Each forward pass depends only on its input arguments, not on internal
   mutable state.
-- Use shared layers from `phyai.layers`, such as `Linear`, `RMSNorm`, `Attention`, and
+- Use shared layers from `phyai.layers`, such as `DenseMLP`, `Linear`, `RMSNorm`, `Attention`, and
   `RotaryEmbedding`.
+- Reuse standalone activation layers such as `phyai.layers.activation.SiLU` instead of `nn.SiLU`
+  or `F.silu` when their contracts match. Check both the public layer and kernel catalog before
+  adding a wrapper. Preserve low-precision rounding when replacing separate activation and
+  multiplication operations with a fused gated activation.
+- Reuse `DenseMLP` for supported MLPs. It handles plain ViT/SigLIP GELU layers with `gated=False`,
+  `activation="gelu"` or `"gelu_tanh"`, and `bias=True`, as well as gated MLPs. For gated MLPs,
+  `cast_before_multiply=True` preserves reference implementations that round the activation before
+  multiplying the up projection. Check these options before adding custom MLP code.
+- Adapt checkpoint parameter names through weight remapping, `prefix`, and `gated_hf_legs` where
+  applicable. Different weight names alone do not justify duplicating an existing MLP.
 - Do not implement a custom attention kernel. Use `phyai.layers.attention`.
 - Do not implement RoPE yourself. Use `phyai.layers.rotary_embedding`.
 - Do not implement normalization yourself. Use `RMSNorm` or `LayerNorm` from `phyai.layers`.
+- For normalization without affine parameters, pass `elementwise_affine=False` to the shared
+  layer. Do not delete its parameters or re-register them as buffers from model code.
+- Use `AffineModulation` for `x * (1 + scale[:, None]) + shift[:, None]` when its shape and dtype
+  contracts match. Its fused kernel preserves the rounding after each operation.
 - The weight mapping function `xxx_weight_remap(name)` returns the checkpoint key to PHYAI key
   mapping.
 - If a new general-purpose layer is needed, add it to `phyai.layers` rather than to the model
@@ -127,7 +147,7 @@ class XxxModel(nn.Module):
 - The runner holds a reference to the model but does **not** own the weights. Weights are loaded at
   the plugin layer and then passed in.
 
-### 5. Scheduler (`scheduler_ws1_<model>.py`)
+### 5. Scheduler (`scheduler_<model>.py`)
 
 - Inherit from `phyai.runtime.schedule.Scheduler`, whose abstract methods are `setup()` and
   `step(request)`.
@@ -200,8 +220,10 @@ class XxxModel(nn.Module):
 12. **Naming:** public by default. Do not add leading underscores casually. Expose singletons through
     `get_*()` getters.
 13. **Do not add `type: ignore`**. Fix the type instead of suppressing the warning.
-14. **Import order:** stdlib, third-party, phyai, then local imports. Ruff will sort imports
-    automatically.
+14. **Imports:** stdlib, third-party, then project packages. Use absolute package paths for all
+    project imports, including imports within the same model package, such as
+    `from phyai.models.<model>.modeling_<model> import XxxModel`. Processor imports likewise use
+    `phyai_utils_tools.models.<model>...`; do not use relative imports.
 
 ## Validation Workflow
 

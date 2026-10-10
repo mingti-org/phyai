@@ -1,0 +1,298 @@
+---
+title: "MolmoAct2"
+description: "下载 MolmoAct2、运行动作推理，并为应用准备相机图像和机器人状态。"
+---
+
+[MolmoAct2](https://github.com/allenai/molmoact2) 根据相机图像、任务指令和机器人状态，
+预测一段机器人动作。PhyAI 以 BF16 运行它的视觉语言骨干网络和连续动作 expert。
+
+本页使用 `franka_droid` 机器人配置。你会先运行一次合成 observation，
+再使用已采集的样本和 Python API。每个示例返回 15 个动作，每个动作包含 8 个值。
+
+| 项目 | 本页使用的配置 |
+| --- | --- |
+| Checkpoint | [allenai/MolmoAct2](https://huggingface.co/allenai/MolmoAct2) |
+| PhyAI 插件 | `molmoact2` |
+| 输入 | 三路 RGB 相机输入、8 维状态向量和任务指令 |
+| 输出 | 后处理后得到 CPU 上的 `float32` 动作张量，形状为 `(1, 15, 8)` |
+| 推理 | BF16、10 步 flow matching，启用 CUDA Graph |
+| 示例脚本 | [run_molmoact2.py](https://github.com/mingti-org/phyai/blob/main/examples/molmoact2/run_molmoact2.py) |
+
+<Note>
+  `allenai/MolmoAct2` 是面向多种机器人形态的基础 checkpoint，用于后续机器人任务微调。
+  本页示例检查推理和输入处理流程，不代表机器人上的任务成功率。
+  Ai2 在[微调模型合集](https://huggingface.co/collections/allenai/molmoact2-finetuned-models)中发布了面向具体部署场景的 checkpoint。
+</Note>
+
+## 快速开始
+
+你需要 Linux、Python 3.12 或更新版本、`uv`，以及支持 BF16 且有足够空闲显存加载模型的
+NVIDIA GPU。CUDA 环境见[安装说明](/zh/index#setup)。以下命令在 PhyAI 仓库根目录运行。
+
+<Steps>
+<Step title="安装 PhyAI">
+
+```bash
+git clone https://github.com/mingti-org/phyai
+cd phyai
+uv sync
+source .venv/bin/activate
+```
+
+如果已有仓库和环境，激活该环境后，从仓库根目录继续。
+
+</Step>
+<Step title="下载 checkpoint">
+
+```bash
+hf download allenai/MolmoAct2 --local-dir checkpoints/MolmoAct2
+export MOLMOACT2_CHECKPOINT=checkpoints/MolmoAct2
+```
+
+下载完整模型仓库。除了权重，processor 还需要 tokenizer、图像处理配置、Python 文件和
+`norm_stats.json`。PhyAI 使用 `trust_remote_code=True` 从这个本地目录加载 processor。
+
+如果已经下载好模型，将 `MOLMOACT2_CHECKPOINT` 设为已有目录。后续命令继续在同一个
+shell 中运行，保留这个变量和已激活的环境。
+
+</Step>
+<Step title="运行一次推理">
+
+用 `nvidia-smi` 选择可用的 GPU。下面的命令使用 GPU 0：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/molmoact2/run_molmoact2.py \
+  --checkpoint "$MOLMOACT2_CHECKPOINT" \
+  --norm-tag franka_droid \
+  --synthetic \
+  --seed 0 \
+  --save-actions .cache/molmoact2/actions.npy
+```
+
+`--synthetic` 生成相机图像，并使用所选机器人配置的平均状态，因此首次运行无需准备
+observation 文件。脚本加载模型、预测动作，并保存后处理后的数组。日志中会出现：
+
+```text
+Action chunk shape=(1, 15, 8) dtype=torch.float32 finite=True
+```
+
+</Step>
+<Step title="读取结果">
+
+```bash
+python - <<'PY'
+import numpy as np
+
+actions = np.load(".cache/molmoact2/actions.npy", allow_pickle=False)
+print(actions.shape, actions.dtype, np.isfinite(actions).all())
+print("First action:", actions[0, 0])
+PY
+```
+
+第一行应为 `(1, 15, 8) float32 True`，表示一次 observation、15 个未来动作，
+每个动作包含 8 个值。对于 `franka_droid`，这些值依次是 `joint_0` 到 `joint_6`，
+最后是 `gripper`；checkpoint 中的控制模式为 `absolute joint pose`。
+
+</Step>
+</Steps>
+
+## 运行已采集的 observation
+
+[官方 DROID 样本](https://huggingface.co/allenai/MolmoAct2-DROID#sample-input)
+提供一张外部相机图像、一张腕部相机图像，以及对应的状态。
+只下载这两张图像，并保存样本中的状态：
+
+```bash
+hf download allenai/MolmoAct2-DROID \
+  assets/sample_exterior_1_left_rgb.png \
+  assets/sample_wrist_left_rgb.png \
+  --local-dir .cache/molmoact2/inputs
+
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+
+inputs = Path(".cache/molmoact2/inputs")
+inputs.mkdir(parents=True, exist_ok=True)
+state = np.array(
+    [-0.12726949, -0.30641943, 0.09134164, -2.4143615,
+     -0.26460838, 2.068765, 0.123698, 0.0],
+    dtype=np.float32,
+)
+np.save(inputs / "state.npy", state)
+PY
+```
+
+样本只提供一路外部相机视角。按照上游示例，将这张图像传入两次，分别填入两个外部相机
+输入位置，再传入腕部视角：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/molmoact2/run_molmoact2.py \
+  --checkpoint "$MOLMOACT2_CHECKPOINT" \
+  --norm-tag franka_droid \
+  --image .cache/molmoact2/inputs/assets/sample_exterior_1_left_rgb.png \
+  --image .cache/molmoact2/inputs/assets/sample_exterior_1_left_rgb.png \
+  --image .cache/molmoact2/inputs/assets/sample_wrist_left_rgb.png \
+  --state .cache/molmoact2/inputs/state.npy \
+  --task "Put the black objects into the drawer and close the drawer." \
+  --seed 0 \
+  --save-actions .cache/molmoact2/recorded_actions.npy
+```
+
+这里仍使用前面下载的基础 checkpoint，通过真实 observation 演示文件输入流程。
+下载样本图像不会将模型切换为 DROID 微调版本。
+
+### 使用自己的相机图像和状态
+
+将样本文件替换为同一时刻采集的 observation。对于 `franka_droid`，重复传入的
+`--image` 参数须按下表排列：
+
+| 顺序 | 相机键 | 视角 |
+| --- | --- | --- |
+| 1 | `observation.images.exterior_1_left` | 第一台外部相机 |
+| 2 | `observation.images.exterior_2_left` | 第二台外部相机 |
+| 3 | `observation.images.wrist_left` | 腕部相机 |
+
+提供 RGB 图像；CLI 会将图像文件转换为 RGB。Python 输入使用形状为
+`(height, width, 3)` 的 `uint8` 数组，缩放和裁剪由 processor 处理。
+使用自己采集的数据时，第 2 路应传入对应的第二台外部相机图像。
+
+将测得的状态保存为 `float32` NumPy `.npy` 数组，形状为 `(8,)` 或 `(1, 8)`，
+顺序为 `[joint_0, joint_1, ..., joint_6, gripper]`。传入原始状态值；processor
+负责按 checkpoint 归一化并编码为离散状态 token。
+状态和动作的约定必须与所选 checkpoint 及机器人配置一致。
+
+### 选择其他机器人配置
+
+`--norm-tag` 决定相机顺序、状态和动作的归一化统计、控制模式，以及动作序列长度，
+必须与 observation 匹配。为其他机器人准备数据前，先查看可用 tag 及对应维度：
+
+```bash
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["MOLMOACT2_CHECKPOINT"])
+config = json.loads((root / "config.json").read_text())
+stats = json.loads(
+    (root / config.get("norm_stats_filename", "norm_stats.json")).read_text()
+)
+print("State history:", config.get("n_obs_steps", 1))
+for tag, metadata in stats["metadata_by_tag"].items():
+    print(tag)
+    for field in ("camera_keys", "control_mode", "action_horizon", "n_action_steps"):
+        print(f"  {field}: {metadata.get(field)}")
+    for field in ("state_stats", "action_stats"):
+        print(f"  {field}: {metadata.get(field, {}).get('names')}")
+PY
+```
+
+## 使用 Python API
+
+将下面的代码保存为仓库根目录下的 `run_molmoact2_api.py`。它使用前面设置的
+checkpoint 变量和准备好的样本文件。相机字典明确指定每一路对应的图像；你也可以传入
+有序图像列表。
+
+```python run_molmoact2_api.py
+import os
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.molmoact2 import MolmoAct2Args, MolmoAct2Request
+from phyai_utils_tools.models.molmoact2 import MolmoAct2Processor
+
+checkpoint = Path(os.environ["MOLMOACT2_CHECKPOINT"])
+inputs = Path(".cache/molmoact2/inputs")
+processor = MolmoAct2Processor.from_pretrained(checkpoint, norm_tag="franka_droid")
+camera_files = {
+    "observation.images.exterior_1_left": "sample_exterior_1_left_rgb.png",
+    "observation.images.exterior_2_left": "sample_exterior_1_left_rgb.png",
+    "observation.images.wrist_left": "sample_wrist_left_rgb.png",
+}
+images = {}
+for key, filename in camera_files.items():
+    with Image.open(inputs / "assets" / filename) as image:
+        images[key] = np.asarray(image.convert("RGB"))
+processed = processor.preprocess(
+    {
+        "images": images,
+        "task": "Put the black objects into the drawer and close the drawer.",
+        "state": np.load(inputs / "state.npy", allow_pickle=False),
+    }
+)
+request = MolmoAct2Request(
+    inputs=processed.tensors,
+    action_horizon=processed.action_horizon,
+    seed=0,
+)
+engine = Engine(
+    EngineArgs(
+        plugin="molmoact2",
+        plugin_args=MolmoAct2Args(checkpoint_dir=checkpoint),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+try:
+    normalized_actions = engine.step(request)
+    actions = processor.postprocess(normalized_actions)
+    print(tuple(actions.shape), actions.dtype, actions.device)
+    print("First action:", actions[0, 0].tolist())
+finally:
+    engine.close()
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_molmoact2_api.py
+```
+
+第一行输出为 `(1, 15, 8) torch.float32 cpu`。在这组配置下，`engine.step()`
+返回的是经过维度补齐的归一化动作，形状为 `(1, 15, 32)`。`processor.postprocess()`
+移除补齐维度、截取所需动作步数，并按 tag 的统计数据反归一化。
+在应用中，让 engine 和 processor 持续处理多次 observation，应用结束时再关闭 engine。
+
+## 推理参数
+
+| CLI 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `--checkpoint` | 必填 | 包含完整 checkpoint 的本地目录。 |
+| `--norm-tag` | 必填 | `norm_stats.json` 中 `metadata_by_tag` 下的机器人配置。 |
+| `--num-steps` | Checkpoint 配置：`10` | Flow matching 步数。减小它会减少模型计算次数，也可能改变动作质量。 |
+| `--n-action-steps` | Tag 配置：`15` | 后处理返回的动作数量。它只裁剪输出，不缩短模型生成的动作序列。 |
+| `--seed` | `0` | 初始动作噪声的随机种子。使用相同输入、配置和种子可复现结果。 |
+| `--device` | `cuda` | 当前进程使用的设备；`cuda:0` 表示第一张可见 GPU。 |
+| `--no-cuda-graph` | 默认启用 Graph | 不使用 CUDA Graph 捕获，直接执行动作速度计算。 |
+| `--save-actions` | 未设置 | 将后处理后的数组保存为 `.npy`。 |
+
+运行 `python examples/molmoact2/run_molmoact2.py --help` 查看全部输入参数。
+使用 Python API 时，在 `MolmoAct2Request` 中设置 `num_steps`，在
+`MolmoAct2Processor.from_pretrained()` 中设置 `n_action_steps`。
+
+CUDA Graph 捕获动作速度计算。图像和文本前处理、prefill 在图外执行，首次请求还包含
+捕获过程。复用 engine 可以复用兼容的已捕获图。要关闭 Python 示例中的捕获，设置
+`RuntimeConfig(use_cuda_graph=False)`。
+
+## 排查问题
+
+| 现象 | 检查方法 |
+| --- | --- |
+| 未知的归一化 tag | 运行上面的元数据查看命令，选择当前 checkpoint 中存在的 tag。 |
+| 状态维度或历史步数错误 | `franka_droid` 需要一个 8 维状态向量。其他 tag 请检查状态字段和 `n_obs_steps`。 |
+| 缺少相机键或视角顺序错误 | 按 `camera_keys` 顺序提供相机图像，或使用包含这些完整键名的字典。 |
+| 缺少 processor 或配置文件 | 将完整模型仓库下载到 `--checkpoint` 指定的目录。 |
+| CUDA 显存不足 | 检查所选 GPU 的空闲显存。添加 `--no-cuda-graph` 可省去图捕获所用的显存，但仍需容纳完整模型。 |
+| 不支持的深度配置 | 当前实现拒绝 depth reasoning 和 action-expert depth gate，请使用两者均关闭的 checkpoint。 |
+
+连续动作推理要求 checkpoint 包含 action expert，且 `action_mode` 为
+`"continuous"` 或 `"both"`。底层 API 还提供 `MolmoAct2GenerationRequest`，用于贪心生成
+token ID；本页动作示例使用 `MolmoAct2Request` 及对应的 processor。
+
+如需在本地进程之外部署，见[并行服务](/zh/deployment/parallel-serving)。

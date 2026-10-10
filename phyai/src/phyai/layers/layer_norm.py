@@ -73,6 +73,9 @@ class RMSNorm(nn.Module):
     backend:
         ``"flashinfer"`` (default) or ``"phyai-kernel"``. Underscore,
         hyphen, and case are normalized.
+    elementwise_affine:
+        Whether to register a weight parameter. If False, use a fixed identity
+        weight buffer that is excluded from checkpoints.
     dtype:
         Optional weight dtype. Defaults to the global default dtype.
         **flashinfer caveat**: the CUDA RMSNorm / GemmaRMSNorm /
@@ -88,6 +91,7 @@ class RMSNorm(nn.Module):
         Round normalized values to the activation dtype before multiplying
         gamma. This matches checkpoints whose reference uses a separate
         low-precision affine multiply; weight and activation dtypes must match.
+        Has no effect when ``elementwise_affine=False``.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -106,6 +110,7 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         backend: str | None = None,
         *,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -118,8 +123,9 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.prefix = prefix
         self.kernel_role = kernel_role
-        self.cast_before_affine = cast_before_affine
-        if cast_before_affine and self.variant != "rms":
+        self.elementwise_affine = elementwise_affine
+        self.cast_before_affine = cast_before_affine and elementwise_affine
+        if self.cast_before_affine and self.variant != "rms":
             raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
             device = get_engine_config().device.target
@@ -142,14 +148,16 @@ class RMSNorm(nn.Module):
             prefer=self._prefer_fused,
             dims={"hidden": hidden_size},
         )
-        self.weight = nn.Parameter(
-            self._initial_weight(hidden_size, dtype, device), requires_grad=False
-        )
-        if cast_before_affine:
+        weight = self._initial_weight(hidden_size, dtype, device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+        else:
+            self.register_buffer("weight", weight, persistent=False)
+        if self.cast_before_affine:
             self.register_buffer(
                 "_unit_weight", torch.ones_like(self.weight), persistent=False
             )
-        if prefix:
+        if prefix and elementwise_affine:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
 
@@ -233,7 +241,8 @@ class RMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}"
+            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}, "
+            f"elementwise_affine={self.elementwise_affine}"
         )
 
 
