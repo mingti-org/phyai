@@ -21,6 +21,8 @@
 It is designed first for latency critical workloads, such as policy and action
 models that run in interactive systems.
 
+https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
+
 <p align="center">
   <img src="assets/phyai-demo.gif" alt="PhyAI and OpenPI deployment comparison" width="100%">
 </p>
