@@ -336,7 +336,9 @@ class EngineCore:
         # 4. Initialize CUDA and cuBLAS.
         with self._stage("cuda"):
             init_cuda(self.config.device.target, self.config.device.params_dtype)
-            init_cublas()
+            init_cublas(allow_tf32=self.config.runtime.allow_tf32)
+            if self.config.runtime.allow_cudnn_tf32 is not None:
+                torch.backends.cudnn.allow_tf32 = self.config.runtime.allow_cudnn_tf32
 
         # 5. Initialize the distributed process group.
         with self._stage("dist"):
@@ -839,3 +841,4 @@ from phyai.models.qwen_image_21 import main_qwen_image_21 as _main_qwen_image_21
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
     main_minicpm_gr00t as _main_minicpm_gr00t,
 )
+from phyai.models.dreamzero import main_dreamzero as _main_dreamzero  # noqa: E402, F401
