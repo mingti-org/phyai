@@ -839,3 +839,6 @@ from phyai.models.qwen_image_21 import main_qwen_image_21 as _main_qwen_image_21
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
     main_minicpm_gr00t as _main_minicpm_gr00t,
 )
+from phyai.models.lingbot_v2 import (
+    main_lingbotv2 as _main_lingbotv2,
+)  # noqa: E402, F401

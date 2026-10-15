@@ -29,8 +29,8 @@ from phyai.kernel.registry import (
 
 
 #: Operations that genuinely have no CPU implementation. Written down so a
-#: fourth cannot join the set unnoticed.
-NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn"})
+#: further operation cannot join the set unnoticed.
+NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn", "moe"})
 
 
 @pytest.fixture(scope="module")
