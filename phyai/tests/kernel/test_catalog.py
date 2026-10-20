@@ -29,8 +29,8 @@ from phyai.kernel.registry import (
 
 
 #: Operations that genuinely have no CPU implementation. Written down so a
-#: fourth cannot join the set unnoticed.
-NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn"})
+#: further operation cannot join the set unnoticed.
+NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn", "moe"})
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +61,7 @@ def _toy_impl(kernel_id: str, when=None, **kwargs) -> Impl:
 
 
 def test_every_declared_module_registers_something(catalog):
-    assert len(OP_MODULES) == 8
+    assert len(OP_MODULES) == 9
     assert len(catalog.ops()) >= len(OP_MODULES)
     for spec in catalog.ops():
         assert catalog.impls(spec.name), f"{spec.name} has no implementations"
