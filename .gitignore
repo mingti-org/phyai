@@ -116,3 +116,6 @@ docs/compose/
 
 # npm
 node_modules/
+
+# Independent native robot environment
+.venv-robot/

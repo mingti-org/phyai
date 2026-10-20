@@ -1,0 +1,111 @@
+# ==============================================================================
+# AgileX (Dual Piper Arms) Robot Deployment Client Configuration
+# ==============================================================================
+# This configuration controls the robot-side deployment client process for AgileX.
+# It interfaces with the Orbbec RGB camera nodes and Piper CAN motor drivers via ROS 2,
+# manages 200 Hz joint/gripper command interpolation, and connects to the resident
+# model server over ZMQ RPC.
+#
+# Inspect merged settings without hardware or RPC:
+#   python -m examples.deployment.agilex --print-config
+#
+# Override settings on the command line:
+#   python -m examples.deployment.agilex schedule.execution_horizon=20 control.control_hz=200.0
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Execution Duration Limit
+# ------------------------------------------------------------------------------
+# Maximum number of send_action commands before initiating graceful shutdown.
+# Set to null to run continuously until interrupted with Ctrl-C.
+max_steps: null
+
+# ------------------------------------------------------------------------------
+# Robot Hardware & Native ROS 2 Parameters
+# ------------------------------------------------------------------------------
+robot:
+  # ROS 2 domain ID matching the Piper driver and camera launch environment (default: 0).
+  # Set to null to inherit ROS_DOMAIN_ID from the shell environment.
+  domain_id: 0
+
+  # Base name for ROS 2 nodes instantiated by this client.
+  node_name: phyai_agilex
+
+  # Maximum timeout (in seconds) for publishing single-tick commands.
+  io_timeout_s: 0.1
+
+  # Native ROS 2 topic names for the three Orbbec RGB cameras.
+  camera_topics:
+    front_camera: /camera_f/color/image_raw
+    left_camera: /camera_l/color/image_raw
+    right_camera: /camera_r/color/image_raw
+
+  # Mapping from model input camera identifiers to robot observation field names.
+  model_cameras:
+    front: front_camera
+    left: left_camera
+    right: right_camera
+
+  # Dual arm JointState feedback topic names (containing 6 joint angles + 1 gripper position per arm).
+  state_topics:
+    left: /puppet/joint_left
+    right: /puppet/joint_right
+
+  # Dual arm JointState command topic names published at control_hz (200 Hz).
+  command_topics:
+    left: /joint_left_states
+    right: /joint_right_states
+
+  # ROS 2 Quality of Service (QoS) profiles:
+  #   camera: "sensor_data" (best-effort, volatile, depth=10)
+  #   state:  "sensor_data" (best-effort, volatile, depth=10)
+  #   command:"reliable"    (reliable delivery, volatile, depth=10)
+  qos:
+    camera: sensor_data
+    state: sensor_data
+    command: reliable
+
+# ------------------------------------------------------------------------------
+# Remote Model Policy RPC Connection
+# ------------------------------------------------------------------------------
+remote:
+  # ZMQ RPC endpoint where serve_pi05.py is listening.
+  endpoint: tcp://127.0.0.1:5555
+
+  # Timeout (in seconds) for standard RPC calls (info, begin, predict, end).
+  timeout_s: 2.0
+
+  # Timeout (in seconds) for the first warmup inference call.
+  warmup_timeout_s: 120.0
+
+# ------------------------------------------------------------------------------
+# Control Loop Timing & Freshness Budgets
+# ------------------------------------------------------------------------------
+control:
+  # Actuator command publishing rate in Hz (200 Hz = 5 ms period).
+  control_hz: 200.0
+
+  # Maximum allowable sensor receive age at observation time in seconds.
+  max_sample_age_s: 0.5
+
+  # Timeout for acquiring a fresh, complete sensor snapshot in seconds.
+  observation_timeout_s: 10.0
+
+  # Maximum wait time for an in-flight prediction to finish upon shutdown.
+  shutdown_timeout_s: 2.0
+
+  # Maximum tolerated delay past a scheduled send tick (10 ms).
+  max_control_lateness_s: 0.01
+
+# ------------------------------------------------------------------------------
+# Action Chunk Scheduling Strategy
+# ------------------------------------------------------------------------------
+schedule:
+  # Trajectory execution strategy: stop-and-refill chunks.
+  strategy: stop_and_refill
+
+  # Action consumption rate in Hz (30 Hz = ~33.3 ms per target).
+  action_hz: 30.0
+
+  # Number of predicted targets executed per chunk (25 targets @ 30 Hz = 0.833 s duration).
+  execution_horizon: 25

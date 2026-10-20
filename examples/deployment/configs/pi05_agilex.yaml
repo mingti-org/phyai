@@ -1,0 +1,49 @@
+# ==============================================================================
+# Model Server Configuration for AgileX (Dual Piper) Pi0.5 Checkpoints
+# ==============================================================================
+# Configures serve_pi05.py for AgileX LeRobot-style checkpoints (Enactive / Cobot).
+# Because LeRobot exports do not serialize camera order or unpadded action dimensions
+# in the checkpoint root, camera_names and action_dim are explicitly declared here.
+#
+# Usage:
+#   python -m examples.deployment.serve_pi05 \
+#     --config examples/deployment/configs/pi05_agilex.yaml \
+#     policy.checkpoint=/path/to/checkpoint
+# ==============================================================================
+
+# Default manipulation task instruction for AgileX.
+task: Place the red cube on the green cube.
+
+# ZMQ socket binding endpoint for policy RPC.
+endpoint: tcp://127.0.0.1:5555
+
+# Inactive client lease timeout in seconds.
+lease_timeout_s: 60.0
+
+policy:
+  # Path to the converted AgileX Pi0.5 checkpoint directory.
+  checkpoint: ???
+
+  # Kernel selection policy.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+
+  # CPU noise generator seed.
+  seed: 42
+
+  # Denoising Euler steps: null preserves the checkpoint default (10 steps for Enactive).
+  num_inference_steps: null
+
+  # Use CUDA graph replay.
+  use_cuda_graph: true
+
+  # Engine runtime thread count.
+  num_threads: 16
+
+processor:
+  # null uses native checkpoint pipelines; external factories remain optional.
+  factory: null
+  options: {}
+  camera_names: [front, left, right]
+  action_dim: 14
+  action_dtype: float32
+  image_resize_backend: pil
