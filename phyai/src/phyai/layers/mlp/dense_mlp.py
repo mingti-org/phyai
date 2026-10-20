@@ -36,7 +36,7 @@ from phyai.layers.linear import (
 )
 
 
-_GATED_ACTS = ("silu", "gelu", "gelu_tanh")
+_GATED_ACTS = ("silu", "gelu", "gelu_tanh", "situ")
 _PLAIN_ACTS = ("gelu", "gelu_tanh")
 _TANH_ALIASES = ("gelu_tanh", "gelu_pytorch_tanh", "gelu_new")
 
@@ -119,7 +119,7 @@ class DenseMLP(nn.Module):
         the size of *each* of ``gate``, ``up``, and the input to
         ``down``.
     activation:
-        ``"silu"`` | ``"gelu"`` | ``"gelu_tanh"``. Aliases
+        ``"silu"`` | ``"gelu"`` | ``"gelu_tanh"`` | ``"situ"``. Aliases
         ``gelu_pytorch_tanh`` / ``gelu_new`` map to ``gelu_tanh``.
     gated:
         If ``True`` (default), build the gated SwiGLU/GeGLU path. If
@@ -156,7 +156,7 @@ class DenseMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         *,
-        activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
+        activation: Literal["silu", "gelu", "gelu_tanh", "situ"] = "silu",
         gated: bool = True,
         bias: bool = False,
         group: str = "dense_tp",
@@ -252,7 +252,7 @@ class DenseMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gated:
             fused, _ = self.gate_up_proj(x)
-            if self.cast_before_multiply:
+            if self.cast_before_multiply and self.activation != "situ":
                 gate, up = fused.chunk(2, dim=-1)
                 if self.activation == "silu":
                     activated = F.silu(gate)

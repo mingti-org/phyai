@@ -15,6 +15,7 @@ from phyai_kernel.triton.rms_norm import (
     rmsnorm_hf,
 )
 from phyai_kernel.triton.rms_norm_silu_mul import rmsnorm_silu_mul
+from phyai_kernel.triton.situ import situ_and_mul
 
 __all__ = [
     "adarmsnorm",
@@ -30,4 +31,5 @@ __all__ = [
     "rmsnorm",
     "rmsnorm_hf",
     "rmsnorm_silu_mul",
+    "situ_and_mul",
 ]

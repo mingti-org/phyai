@@ -18,6 +18,7 @@ from phyai_kernel.triton import (
     rmsnorm,
     rmsnorm_hf,
     rmsnorm_silu_mul,
+    situ_and_mul,
 )
 
 try:
@@ -42,4 +43,5 @@ __all__ = [
     "rmsnorm",
     "rmsnorm_hf",
     "rmsnorm_silu_mul",
+    "situ_and_mul",
 ]

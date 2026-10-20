@@ -16,6 +16,7 @@ dependencies = [
     "flash-linear-attention>=0.5.1",
     "transformers==5.8.1",
     "huggingface-hub",
+    "gradio>=6.30.0,<7",
     "tqdm",
     "pyyaml",
     "setproctitle",

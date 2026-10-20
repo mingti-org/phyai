@@ -66,6 +66,12 @@
                 "pages": [
                   "models/qwen-image/generation"
                 ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "models/moss-image/generation"
+                ]
               }
             ]
           },
@@ -150,6 +156,12 @@
                 "group": "Qwen-Image",
                 "pages": [
                   "zh/models/qwen-image/generation"
+                ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "zh/models/moss-image/generation"
                 ]
               }
             ]
