@@ -16,6 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Local vocabulary encoding for the Xiaomi U0 inference example.
+xiaomi_u0 = ["tiktoken>=0.7,<1"]
 # fastokens accelerates phyai_utils_tools.tokenizer and processor utilities.
 fastokenizer = ["fastokens>=0.2.0"]
 
