@@ -1,0 +1,13 @@
+# Recording settings only; deployment behavior stays in the client YAML.
+output_root: .cache/robot-traces
+queue_capacity: 4096
+image_capacity: 64
+flush_timeout_s: 30.0
+# Directory containing robot.urdf and its local mesh resources.
+robot_assets: null
+# Optional model bundle metadata; model weights are never copied.
+model_bundle: null
+# The existing H.264 stream is recorded without opening another image decoder.
+capture_video: true
+# Subscribe to feedback, mux output, control modes, and DAgger events.
+passive_ros: true

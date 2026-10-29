@@ -1,0 +1,16 @@
+{
+  "name": "phyai-debug-viewer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test.mjs"
+  },
+  "dependencies": {
+    "three": "0.180.0",
+    "urdf-loader": "0.12.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

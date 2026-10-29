@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PhyAI Trace Inspector</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">PHYAI / OFFLINE DIAGNOSTICS</p>
+        <h1>Trace inspector</h1>
+      </div>
+      <div id="record-status" role="status">Opening trace</div>
+    </header>
+    <main>
+      <div id="notice" role="status"></div>
+      <section class="toolbar" aria-label="Playback controls">
+        <button id="play">Play</button
+        ><button id="prev" aria-label="Previous request">
+          Previous request</button
+        ><button id="next" aria-label="Next request">Next request</button
+        ><label
+          >Speed
+          <select id="speed">
+            <option>.25</option>
+            <option>.5</option>
+            <option selected>1</option>
+            <option>2</option>
+            <option>4</option>
+          </select></label
+        ><output id="clock">0.00s</output
+        ><label
+          >Window
+          <select id="window">
+            <option>5</option>
+            <option selected>10</option>
+            <option>30</option>
+            <option>60</option>
+          </select>
+          s</label
+        >
+      </section>
+      <input
+        id="timeline"
+        type="range"
+        min="0"
+        max="1"
+        step=".005"
+        value="0"
+        aria-label="Trace time"
+      />
+      <canvas
+        id="events"
+        height="48"
+        aria-label="Request, inference, execution and control mode timeline"
+      ></canvas>
+      <div class="top-grid">
+        <section class="panel scene-panel">
+          <div class="heading">
+            <h2>Robot pose</h2>
+            <label
+              >Target
+              <select id="pose-mode">
+                <option value="command">Sent command</option>
+                <option value="action">Selected prediction</option>
+                <option value="final">Mux output</option>
+              </select></label
+            ><button id="reset">Reset view</button>
+          </div>
+          <div id="scene">
+            <div id="scene-status">Loading robot geometry</div>
+          </div>
+          <div class="legend">
+            <span class="actual">Actual feedback</span
+            ><span class="target">Target / prediction</span
+            ><span id="limits"></span>
+          </div>
+          <p class="hint">
+            Drag to orbit; scroll to zoom. Click an arm link to select its
+            joint. Grippers are shown in charts.
+          </p>
+        </section>
+        <section class="panel images">
+          <div class="heading">
+            <h2>Exact model inputs</h2>
+            <span id="input-label">No request selected</span>
+          </div>
+          <figure class="head">
+            <img
+              id="head_left"
+              alt="Head camera input for the selected request"
+            />
+            <figcaption>HEAD LEFT</figcaption>
+          </figure>
+          <div class="wrists">
+            <figure>
+              <img id="left_wrist" alt="Left wrist input" />
+              <figcaption>LEFT WRIST</figcaption>
+            </figure>
+            <figure>
+              <img id="right_wrist" alt="Right wrist input" />
+              <figcaption>RIGHT WRIST</figcaption>
+            </figure>
+          </div>
+          <p class="hint">
+            Request snapshots are held until the next request. These are not a
+            continuous video stream.
+          </p>
+        </section>
+      </div>
+      <section class="panel">
+        <div class="heading">
+          <h2>Prediction chunk</h2>
+          <label
+            >Request
+            <select id="request"></select></label
+          ><label
+            >Step
+            <input
+              id="action-step"
+              type="range"
+              min="0"
+              max="49"
+              value="0"
+            /><output id="action-label">0</output></label
+          >
+        </div>
+        <canvas
+          id="chunk"
+          height="150"
+          aria-label="Full predicted chunk with executed and discarded portions"
+        ></canvas>
+        <p class="hint" id="chunk-note">
+          Select a request to inspect its complete action horizon.
+        </p>
+      </section>
+      <section class="panel">
+        <div class="heading">
+          <h2>Tracking</h2>
+          <div>
+            <button data-arm="left" class="selected">Left arm</button
+            ><button data-arm="right">Right arm</button>
+          </div>
+          <label
+            >Focus
+            <select id="joint">
+              <option value="-1">All joints</option>
+            </select></label
+          >
+        </div>
+        <div class="legend">
+          <span class="actual">Feedback</span
+          ><span class="target">Client command</span
+          ><span class="final">Mux output</span
+          ><span class="predicted">Prediction</span>
+        </div>
+        <div id="joint-plots"></div>
+        <div class="heading">
+          <h3>Target minus feedback</h3>
+          <span class="hint"
+            >Same-time comparison; no artificial delay correction</span
+          >
+        </div>
+        <canvas
+          id="error"
+          height="150"
+          aria-label="Joint command tracking errors"
+        ></canvas>
+        <div class="grippers">
+          <canvas
+            id="grip-left"
+            height="130"
+            aria-label="Left gripper command and feedback"
+          ></canvas
+          ><canvas
+            id="grip-right"
+            height="130"
+            aria-label="Right gripper command and feedback"
+          ></canvas>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="heading">
+          <h2>Freshness and timing</h2>
+          <label
+            >Measure<select id="age-stage">
+              <option value="request">At request</option>
+              <option value="read">At observation read</option>
+              <option value="check">At freshness gate</option>
+            </select></label
+          >
+          <label
+            >Source
+            <select id="age-source">
+              <option value="all">All sources</option>
+            </select></label
+          ><span class="hint"
+            >Callback age is distinct from sensor acquisition age</span
+          >
+        </div>
+        <canvas
+          id="age"
+          height="170"
+          aria-label="Per-source request age and configured maximum"
+        ></canvas>
+        <div class="legend" id="age-legend"></div>
+        <canvas
+          id="age-execution"
+          height="130"
+          aria-label="Observation age at actual command send"
+        ></canvas
+        ><canvas
+          id="latency"
+          height="130"
+          aria-label="Request duration and command send duration"
+        ></canvas
+        ><canvas
+          id="interval"
+          height="130"
+          aria-label="Actual command send intervals and configured control period"
+        ></canvas>
+      </section>
+      <footer id="integrity">Trace integrity</footer>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
