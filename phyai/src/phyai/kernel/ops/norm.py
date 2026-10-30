@@ -139,6 +139,14 @@ ADARMSNORM = OpSpec(
     doc="RMSNorm modulated by an external (scale, shift, gate) triple.",
 )
 
+GATED_RESIDUAL_ADARMSNORM = OpSpec(
+    name="gated_residual_adarmsnorm",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "modulation"),
+    signature="(a, b, gate, modulation, residual_out, norm_out, eps) -> (Tensor, Tensor)",
+    doc="BF16-rounded gated residual, then FP32 RMS/affine with grouped row modulation; disjoint caller-owned outputs.",
+)
+
 RMSNORM_SILU_MUL = OpSpec(
     name="rmsnorm_silu_mul",
     dims=("tokens", "hidden"),
@@ -307,6 +315,37 @@ def _triton_adarmsnorm(facts, params):
     return adarmsnorm
 
 
+def _cuda_gated_residual_adarmsnorm(facts, params):
+    from phyai_kernel.cuda.jit.pending_gate_adarms_broadcast import prepare, run
+
+    call = prepare()
+
+    def fused(a, b, gate, modulation, residual_out, norm_out, eps):
+        return run(a, b, gate, modulation, residual_out, norm_out, eps, call)
+
+    return fused
+
+
+def _torch_gated_residual_adarmsnorm(facts, params):
+    import torch
+
+    def fused(a, b, gate, modulation, residual_out, norm_out, eps):
+        gate = gate.repeat_interleave(a.shape[0] // gate.shape[0], dim=0)
+        modulation = modulation.repeat_interleave(
+            a.shape[0] // modulation.shape[0], dim=0
+        )
+        residual_out.copy_(torch.addcmul(a, b, gate))
+        promoted = residual_out.float()
+        normalized = promoted * torch.rsqrt(
+            promoted.square().mean(dim=-1, keepdim=True) + eps
+        )
+        scale, shift, _ = modulation.float().chunk(3, dim=-1)
+        norm_out.copy_(normalized * (1 + scale) + shift)
+        return residual_out, norm_out
+
+    return fused
+
+
 def _torch_adarmsnorm(facts, params):
     import torch
 
@@ -348,12 +387,37 @@ def register(catalog: Catalog) -> None:
         LAYERNORM,
         CHANNEL_L2_NORM,
         ADARMSNORM,
+        GATED_RESIDUAL_ADARMSNORM,
         RMSNORM_SILU_MUL,
     ):
         catalog.register_op(spec)
 
     catalog.register_many(
         (
+            Impl(
+                kernel_id="phyai_kernel.gated_residual_adarmsnorm.sm110",
+                op="gated_residual_adarmsnorm",
+                when=all_of(
+                    NVIDIA,
+                    lib.has("phyai_kernel"),
+                    device.arch == "sm110",
+                    dtype.input == "bf16",
+                    dtype.modulation == "bf16",
+                    shape.hidden == 1024,
+                    shape.tokens >= 1,
+                    shape.tokens <= 4096,
+                ),
+                prepare=_cuda_gated_residual_adarmsnorm,
+                priority=Priority.OPTIMIZED,
+            ),
+            Impl(
+                kernel_id="torch.gated_residual_adarmsnorm",
+                op="gated_residual_adarmsnorm",
+                when=all_of(dtype.input == "bf16", dtype.modulation == "bf16"),
+                prepare=_torch_gated_residual_adarmsnorm,
+                priority=Priority.REFERENCE,
+                reference=True,
+            ),
             # RMSNorm.
             Impl(
                 kernel_id="flashinfer.rmsnorm",

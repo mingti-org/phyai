@@ -18,6 +18,16 @@ ROPE = OpSpec(
     signature="(positions, q, k, cos_sin_cache) -> tuple[Tensor, Tensor]",
 )
 
+ROPE_STRIDED = OpSpec(
+    name="rope_strided",
+    dims=ROPE.dims,
+    dtypes=ROPE.dtypes,
+    attributes=ROPE.attributes,
+    optional_attributes=ROPE.optional_attributes,
+    signature=ROPE.signature,
+    doc="Full NeoX RoPE accepting aligned QKV row views without input materialization.",
+)
+
 
 FLASHINFER_ROPE = all_of(
     lib.has("flashinfer"),
@@ -107,10 +117,97 @@ def _eager(facts, params):
     return rope
 
 
+def strided_input_supported(tensor, heads: int) -> bool:
+    """Check the vector-load alignment and complete storage span, without a sync."""
+    import torch
+
+    if tensor.dtype != torch.bfloat16 or tensor.ndim != 3:
+        return False
+    n, h, d = tensor.shape
+    pitch, head_stride, element_stride = tensor.stride()
+    return (
+        1 <= n <= 4096
+        and (h, d) == (heads, 256)
+        and (head_stride, element_stride) == (256, 1)
+        and heads * 256 <= pitch <= 2**24
+        and pitch % 8 == 0
+        and tensor.data_ptr() % 16 == 0
+        and 2 * (tensor.storage_offset() + (n - 1) * pitch + heads * 256)
+        <= tensor.untyped_storage().nbytes()
+    )
+
+
+def _flashinfer_strided(facts, params):
+    import torch
+    from flashinfer.rope import apply_rope_with_cos_sin_cache
+
+    def rope(positions, q, k, cos_sin_cache):
+        if not (
+            strided_input_supported(q, 8)
+            and strided_input_supported(k, 1)
+            and q.is_cuda
+            and k.device == q.device == positions.device == cos_sin_cache.device
+            and q.shape[0] == k.shape[0]
+            and positions.shape == (q.shape[0],)
+            and positions.dtype == torch.int32
+            and positions.is_contiguous()
+            and cos_sin_cache.ndim == 2
+            and cos_sin_cache.shape[1] == 256
+            and cos_sin_cache.dtype == torch.float32
+            and cos_sin_cache.is_contiguous()
+            and cos_sin_cache.data_ptr() % 16 == 0
+        ):
+            raise ValueError(
+                "strided RoPE requires aligned canonical CUDA Q/K and metadata"
+            )
+        q_out, k_out = apply_rope_with_cos_sin_cache(
+            positions=positions,
+            query=q.view(q.shape[0], 2048),
+            key=k.view(k.shape[0], 256),
+            head_size=256,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=True,
+        )
+        return q_out.view(q.shape), k_out.view(k.shape)
+
+    return rope
+
+
 def register(catalog: Catalog) -> None:
     catalog.register_op(ROPE)
+    catalog.register_op(ROPE_STRIDED)
     catalog.register_many(
         (
+            Impl(
+                kernel_id="flashinfer.rope_strided.sm110",
+                op="rope_strided",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    FLASHINFER_ROPE,
+                    device.arch == "sm110",
+                    dtype.input == "bf16",
+                    shape.head_dim == 256,
+                    shape.heads_q == 8,
+                    shape.heads_k == 1,
+                    shape.tokens >= 1,
+                    shape.tokens <= 4096,
+                    attrs.interleave == False,  # noqa: E712 -- symbolic predicate
+                    attrs.rank == 3,
+                ),
+                prepare=_flashinfer_strided,
+                metadata={
+                    "package": "flashinfer",
+                    "note": "aligned strided input adapter",
+                },
+            ),
+            Impl(
+                kernel_id="eager.rope_strided",
+                op="rope_strided",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=attrs.rope_type.is_set(),
+                prepare=_eager,
+            ),
             Impl(
                 kernel_id="flashinfer.rope",
                 op="rope",
@@ -132,4 +229,4 @@ def register(catalog: Catalog) -> None:
     )
 
 
-__all__ = ["ROPE", "register"]
+__all__ = ["ROPE", "ROPE_STRIDED", "strided_input_supported", "register"]

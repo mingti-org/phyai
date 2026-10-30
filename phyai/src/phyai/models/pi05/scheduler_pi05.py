@@ -295,6 +295,7 @@ class PI05Scheduler(Scheduler):
         # re-planning (and its host sync) is skipped entirely.
         self._layout_cache: dict[tuple, _PI05Layout] = {}
         self._last_layout_key: tuple | None = None
+        self.optimization = None
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
@@ -312,6 +313,9 @@ class PI05Scheduler(Scheduler):
         graph now unrolls the whole denoise loop and reads the table
         in-graph.
         """
+        from phyai.models.pi05.graph_optimization import attach
+
+        self.optimization = attach(self)
         self.vision_runner.setup()
         self.llm_runner.setup(self._n_per_sample_buckets)
 
@@ -383,7 +387,9 @@ class PI05Scheduler(Scheduler):
     # Prefix preparation (shared by inference and rollout)               #
     # ------------------------------------------------------------------ #
 
-    def _prepare_prefix(self, request: PI05Request) -> tuple[torch.Tensor, _PI05Layout]:
+    def _prepare_prefix(
+        self, request: PI05Request, *, require_hidden: bool = True
+    ) -> tuple[torch.Tensor | None, _PI05Layout]:
         """Populate prefix K/V and plan expert attention."""
         cfg = self.cfg
         device = self.device
@@ -398,7 +404,13 @@ class PI05Scheduler(Scheduler):
         # step and across all Euler steps. Reading ``lang_lens`` to the
         # host (one tiny sync for the key) replaces the several large syncs
         # the per-step rebuild used to incur; a cache hit rebuilds nothing.
+        if request.lang_lens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("lang_lens must contain integer token counts")
         lang_lens_cpu = tuple(int(x) for x in request.lang_lens.tolist())
+        if any(
+            length < 0 or length > cfg.tokenizer_max_length for length in lang_lens_cpu
+        ):
+            raise ValueError("lang_lens must be in [0, tokenizer_max_length]")
         n_per_sample = self._bucket_n_per_sample(max(lang_lens_cpu, default=0))
         key = (actual_B, lang_lens_cpu)
         layout = self._layout_cache.get(key)
@@ -424,7 +436,8 @@ class PI05Scheduler(Scheduler):
             image_embs: torch.Tensor | None = None
             for b in range(actual_B):
                 vision_out = self.vision_runner.forward(
-                    VisionForwardBatch(pixel_values=pixel_values[b])
+                    VisionForwardBatch(pixel_values=pixel_values[b]),
+                    action_only=not require_hidden,
                 )
                 flat = vision_out.flatten(0, 1)  # (image_token_count, D)
                 if image_embs is None:
@@ -482,7 +495,9 @@ class PI05Scheduler(Scheduler):
                 write_indices=layout.write_indices,
             )
             prefix_out = self.llm_runner.forward(
-                llm_batch, n_per_sample=layout.n_per_sample
+                llm_batch,
+                n_per_sample=layout.n_per_sample,
+                require_hidden=require_hidden,
             )
 
         # 5. Plan the expert joint-attention metadata — same gating as the
@@ -513,7 +528,7 @@ class PI05Scheduler(Scheduler):
 
         actual_B = int(request.pixel_values.shape[0])
         max_B = self.max_batch_size
-        self._prepare_prefix(request)
+        self._prepare_prefix(request, require_hidden=False)
 
         # Sample noise (or use the user's, padded) and run the whole
         # Euler loop as one captured-graph replay. The expert runner
@@ -565,6 +580,7 @@ class PI05Scheduler(Scheduler):
         prefix_values = None
         if request.compute_values and self.cfg.value_after_vlm:
             assert self.model.value_head is not None  # checked by validation
+            assert prefix_out is not None  # full-hidden route is mandatory for values
             with event_scope("pi05.prefix_value"):
                 prefix_out_3d = prefix_out.view(
                     self.max_batch_size, layout.n_per_sample, -1

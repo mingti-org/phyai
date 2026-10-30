@@ -120,6 +120,10 @@ class envs:
 
     # Runtime settings.
     PHYAI_USE_CUDA_GRAPH = EnvField("PHYAI_USE_CUDA_GRAPH", None, _parse_bool)
+    # Experimental Pi0.5 dataflow optimizations. Unsupported instances stay native.
+    PHYAI_PI05_THOR_OPTIMIZATIONS = EnvField(
+        "PHYAI_PI05_THOR_OPTIMIZATIONS", False, _parse_bool
+    )
     PHYAI_FREEZE_KERNEL_CHOICES = EnvField(
         "PHYAI_FREEZE_KERNEL_CHOICES", None, _parse_bool
     )

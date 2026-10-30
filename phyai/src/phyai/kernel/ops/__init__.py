@@ -19,6 +19,7 @@ OP_MODULES: tuple[str, ...] = (
     "rope",
     "attention",
     "conv",
+    "cache",
 )
 
 

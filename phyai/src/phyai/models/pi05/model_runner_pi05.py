@@ -128,6 +128,8 @@ class PI05VisionRunner(ModelRunner):
         self.image_size = int(vision_tower.config.image_size)
         self.num_channels = int(vision_tower.config.num_channels)
         self.graph: CudaGraph | None = None
+        self.action_graph: CudaGraph | None = None
+        self.optimization = None
 
     def setup(self) -> None:
         logger.info("Entering PI05VisionRunner.setup")
@@ -153,14 +155,29 @@ class PI05VisionRunner(ModelRunner):
         }
         self.graph = CudaGraph()
         self.graph.capture(self._fwd, example)
+        if self.optimization is not None:
+            self.action_graph = CudaGraph()
 
-    def _fwd(self, *, pixel_values: torch.Tensor) -> torch.Tensor:
+            def forward_action(**inputs):
+                return self._fwd(**inputs, action_only=True)
+
+            self.action_graph.capture(forward_action, example)
+
+    def _fwd(
+        self, *, pixel_values: torch.Tensor, action_only: bool = False
+    ) -> torch.Tensor:
+        if action_only and self.optimization is not None:
+            return self.optimization.vision(pixel_values)
         return self.vision_tower(pixel_values)
 
-    def forward(self, batch: VisionForwardBatch) -> torch.Tensor:
+    def forward(
+        self, batch: VisionForwardBatch, *, action_only: bool = False
+    ) -> torch.Tensor:
+        if action_only and self.action_graph is not None:
+            return self.action_graph.replay({"pixel_values": batch.pixel_values})
         if self.graph is not None:
             return self.graph.replay({"pixel_values": batch.pixel_values})
-        return self.vision_tower(batch.pixel_values)
+        return self._fwd(pixel_values=batch.pixel_values, action_only=action_only)
 
 
 # ============================================================================ #
@@ -244,6 +261,10 @@ class PI05LLMRunner(ModelRunner):
         # per inference); ``n_per_sample`` here is the *largest* bucket and
         # sizes the wrapper's static buffers.
         self.graphs: dict[int, CudaGraph] = {}
+        # The action route returns no hidden states; full/value callers keep
+        # using the original graphs. Both sets own separate static inputs.
+        self.action_graphs: dict[int, CudaGraph] = {}
+        self.optimization = None
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
@@ -290,6 +311,8 @@ class PI05LLMRunner(ModelRunner):
                 self._capture_plan, self._capture_seed_metadata(n_ps)
             )
             self.graphs[n_ps] = self._capture_graph(n_ps)
+            if self.optimization is not None:
+                self.action_graphs[n_ps] = self._capture_graph(n_ps, action_only=True)
 
     def _capture_seed_metadata(self, n_per_sample: int) -> PagedAttnMetadata:
         # Per-sample padded q layout for this bucket — fixed across all
@@ -337,7 +360,9 @@ class PI05LLMRunner(ModelRunner):
             write_indices=write_indices,
         )
 
-    def _capture_graph(self, n_per_sample: int) -> CudaGraph:
+    def _capture_graph(
+        self, n_per_sample: int, *, action_only: bool = False
+    ) -> CudaGraph:
         n = self.batch_size * n_per_sample
         example = {
             "hidden_states": torch.zeros(
@@ -347,7 +372,14 @@ class PI05LLMRunner(ModelRunner):
             "write_indices": torch.zeros(n, dtype=torch.int64, device=self.device),
         }
         graph = CudaGraph()
-        graph.capture(self._fwd, example)
+        if action_only:
+
+            def forward_action(**inputs):
+                return self._fwd(**inputs, action_only=True)
+
+            graph.capture(forward_action, example)
+        else:
+            graph.capture(self._fwd, example)
         return graph
 
     # ------------------------------------------------------------------ #
@@ -360,16 +392,20 @@ class PI05LLMRunner(ModelRunner):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         write_indices: torch.Tensor,
-    ) -> torch.Tensor:
+        action_only: bool = False,
+    ) -> torch.Tensor | None:
         """Run paligemma's 18 layers, writing K/V into ``self.kv_pool``."""
+        plan = self.optimization if action_only else None
         ctx = PagedAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
-            kv_pool=self.kv_pool,
+            kv_pool=self.kv_pool if plan is None else plan.pool,
             write_indices=write_indices,
         )
+        if plan is not None:
+            return plan.prefix(self.paligemma_lm, hidden_states, position_ids, ctx)
         return self.paligemma_lm(hidden_states, position_ids, self.rope, ctx)
 
     def plan_inference(self, meta: PagedAttnMetadata) -> None:
@@ -385,8 +421,12 @@ class PI05LLMRunner(ModelRunner):
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
 
     def forward(
-        self, batch: LLMForwardBatch, *, n_per_sample: int | None = None
-    ) -> torch.Tensor:
+        self,
+        batch: LLMForwardBatch,
+        *,
+        n_per_sample: int | None = None,
+        require_hidden: bool = True,
+    ) -> torch.Tensor | None:
         """Run the prefix forward and return flattened final hidden states.
 
         ``n_per_sample`` selects which captured graph to replay (the
@@ -394,28 +434,37 @@ class PI05LLMRunner(ModelRunner):
         the largest bucket. Ignored in the non-cuda-graph path. A captured
         output aliases graph-static storage and must be consumed before the
         next replay of the same bucket.
+
+        ``require_hidden=False`` permits the opt-in action-only route. Its
+        return value is always ``None``; value/rollout callers retain the
+        complete final hidden states through the default route.
         """
         if self.use_cuda_graph and self.graphs:
             n_ps = n_per_sample if n_per_sample is not None else self.n_per_sample
-            graph = self.graphs.get(n_ps)
+            action_only = not require_hidden and self.optimization is not None
+            graphs = self.action_graphs if action_only else self.graphs
+            graph = graphs.get(n_ps)
             if graph is None:
                 raise ValueError(
                     f"no captured LLM graph for n_per_sample={n_ps}; "
-                    f"captured buckets: {sorted(self.graphs)}."
+                    f"captured buckets: {sorted(graphs)}."
                 )
-            return graph.replay(
+            result = graph.replay(
                 {
                     "hidden_states": batch.hidden_states,
                     "position_ids": batch.position_ids,
                     "write_indices": batch.write_indices,
                 }
             )
+            return result if require_hidden else None
         # Non-cuda-graph path.
-        return self._fwd(
+        result = self._fwd(
             hidden_states=batch.hidden_states,
             position_ids=batch.position_ids,
             write_indices=batch.write_indices,
+            action_only=not require_hidden,
         )
+        return result if require_hidden else None
 
 
 # ============================================================================ #
@@ -546,6 +595,7 @@ class PI05ExpertRunner(ModelRunner):
         # hands it to the (stateless) norms, so the ``dense`` projections stay
         # out of the captured graph. ``None`` until the schedule is bound.
         self._mod_tables: ExpertModulationTables | None = None
+        self.optimization = None
 
     def set_write_indices(self, write_indices_suffix: torch.Tensor) -> None:
         """Bind the suffix-slab slot indices once at scheduler setup."""
@@ -778,6 +828,8 @@ class PI05ExpertRunner(ModelRunner):
         self,
         x_t: torch.Tensor,
         step: int,
+        *,
+        optimize: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one expert step and return velocity plus raw suffix features.
 
@@ -791,22 +843,32 @@ class PI05ExpertRunner(ModelRunner):
         # the embedding dtype. This avoids repeated bf16 update error.
         action_emb = self.heads.embed_action(x_t.to(self.params_dtype))
         suffix_h = action_emb.reshape(self.batch_size * self.chunk_size, -1)
+        plan = self.optimization if optimize else None
         ctx = PagedAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
-            kv_pool=self.kv_pool,
+            kv_pool=self.kv_pool if plan is None else plan.pool,
             write_indices=self.write_indices_suffix_buf,
         )
-        suffix_out = self.expert_stack(
-            suffix_h,
-            self.pos_ids_suffix_buf,
-            None,
-            self.rope,
-            ctx,
-            modulation=self._mod_tables.step(step),
-        )
+        if plan is None:
+            suffix_out = self.expert_stack(
+                suffix_h,
+                self.pos_ids_suffix_buf,
+                None,
+                self.rope,
+                ctx,
+                modulation=self._mod_tables.step(step),
+            )
+        else:
+            suffix_out = plan.expert(
+                self.expert_stack,
+                suffix_h,
+                self.pos_ids_suffix_buf,
+                ctx,
+                self._mod_tables.step(step),
+            )
         suffix_out_3d = suffix_out.view(self.batch_size, self.chunk_size, -1)
         return self.heads.project_action(suffix_out_3d), suffix_out_3d
 
@@ -863,7 +925,7 @@ class PI05ExpertRunner(ModelRunner):
             t = self._timesteps[step]
             delta = t - self._timesteps[step + 1]
             sqrt_delta = torch.sqrt(delta)
-            v_t, suffix_out = self._one_step(x_t, step)
+            v_t, suffix_out = self._one_step(x_t, step, optimize=False)
             v_t = v_t.to(torch.float32)
             values.append(self._compute_suffix_value(suffix_out))
 
