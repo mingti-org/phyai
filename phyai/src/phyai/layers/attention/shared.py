@@ -106,6 +106,7 @@ def select_paged_backend(
             "causal": bool(getattr(layer, "causal", True)),
             "layer_id": getattr(layer, "layer_id", None),
             "runner": runner_tag,
+            "batch_size": getattr(runner, "batch_size", None),
         },
         mode="capture" if capture else "eager",
         prefer=getattr(layer, "prefer", ()),

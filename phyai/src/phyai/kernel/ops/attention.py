@@ -7,7 +7,7 @@ import importlib
 from typing import Mapping
 
 from phyai.utils import get_logger
-from phyai.kernel.facts import lib, attrs, dtype, shape, device
+from phyai.kernel.facts import lib, attrs, dtype, shape, device, model, role
 from phyai.kernel.opspec import Impl, OpSpec, Priority, returns_instance
 from phyai.kernel.policy import PolicyError
 from phyai.kernel.registry import Catalog
@@ -44,7 +44,7 @@ ATTENTION_PAGED = OpSpec(
     dims=("tokens", "heads", "kv_heads", "head_dim"),
     dtypes=("input",),
     attributes=("layout", "causal"),
-    optional_attributes=("layer_id", "runner"),
+    optional_attributes=("layer_id", "runner", "batch_size"),
     signature="(runner) -> PagedAttentionBackend",
     returns=returns_instance(object, constructed_with=("runner",)),
     requires_reference=False,
@@ -331,6 +331,37 @@ def register(catalog: Catalog) -> None:
                 metadata={"package": "torch", "note": "debug reference"},
             ),
             # Paged-KV attention.
+            Impl(
+                kernel_id="phyai_kernel.attention_paged.sm110_expert",
+                op="attention_paged",
+                priority=Priority.GENERAL,
+                when=all_of(
+                    NVIDIA_FLASHINFER,
+                    lib.has("phyai_kernel"),
+                    lib.has("cutlass"),
+                    model.family == "pi05",
+                    role == "expert",
+                    device.arch == "sm110",
+                    dtype.input == "bf16",
+                    attrs.layout == "paged",
+                    attrs.causal == False,
+                    attrs.runner.is_set(),
+                    attrs.runner == "pi05.expert",
+                    attrs.batch_size.is_set(),
+                    attrs.batch_size == 1,
+                    shape.tokens == 50,
+                    shape.heads == 8,
+                    shape.kv_heads == 1,
+                    shape.head_dim == 256,
+                ),
+                prepare=_backend_prepare(
+                    (
+                        "phyai.layers.attention.paged.backends.sm110",
+                        "SM110ExpertBackend",
+                    )
+                ),
+                metadata={"package": "phyai-kernel", "note": "opt-in Pi05 expert"},
+            ),
             Impl(
                 kernel_id="flashinfer.attention_paged",
                 op="attention_paged",

@@ -15,7 +15,7 @@ top-level :func:`phyai.weights.load_pretrained` walks
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,7 @@ import torch.nn as nn
 import phyai.parallel as P
 from phyai.engine_config import get_engine_config
 from phyai.kernel.call import CallSite
+from phyai.kernel.execution import current_execution
 from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.active import get_active_plan
@@ -46,6 +47,7 @@ def _resolve_linear_kernel(
     M: int,
     N: int,
     K: int,
+    bias: torch.Tensor | None = None,
 ):
     """Select the GEMM implementation for one call.
 
@@ -55,13 +57,17 @@ def _resolve_linear_kernel(
     row claiming eligibility for a format its code cannot execute.
     """
 
-    # One binding per layer, created on first use and stashed on the layer.
+    # Separate inference and rollout bindings keep frozen choices phase-local.
     # Lazy rather than in ``__init__`` because this adapter also serves the tied
     # vocabulary head, which is not a ``LinearBase``.
-    site = getattr(layer, "gemm_call", None)
+    execution = current_execution()
+    site_name = "gemm_call" if execution == "inference" else "gemm_rollout_call"
+    site = getattr(layer, site_name, None)
     if site is None or site.role != layer.kernel_role:
-        site = CallSite("gemm", role=layer.kernel_role)
-        layer.gemm_call = site
+        site = CallSite("gemm", role=layer.kernel_role, attrs={"execution": execution})
+        setattr(layer, site_name, site)
+
+    from phyai.runtime.cuda_graph_manager import capture_stream_overridden
 
     return site.select(
         device=x.device,
@@ -69,9 +75,22 @@ def _resolve_linear_kernel(
             "input": x.dtype,
             "output": layer.params_dtype,
             "weight": layer.weight.dtype,
+            "bias": bias.dtype if bias is not None else None,
         },
         quant=layer.spec.physical_signature,
         dims={"M": M, "N": N, "K": K},
+        attrs={
+            "bias": bias is not None,
+            "stream_override": capture_stream_overridden(),
+            "weight_contiguous": layer.weight.is_contiguous(),
+            "weight_aligned": layer.weight.data_ptr() % 16 == 0,
+            "requires_grad": torch.is_grad_enabled()
+            and (
+                x.requires_grad
+                or layer.weight.requires_grad
+                or (bias is not None and bias.requires_grad)
+            ),
+        },
     )
 
 
@@ -133,12 +152,15 @@ class LinearBase(nn.Module):
             kernel_role or type(self).__name__.removesuffix("Linear").lower()
         )
         self._bias_requested = bias
+        self.weight_post_load_hooks: dict[str, Callable[[LinearBase], None]] = {}
 
     def post_load(self) -> None:
-        """Spec-driven post-load fixup (e.g. fp8 per-tensor -> per-channel)."""
+        """Refresh spec storage, then any backend-derived weight buffers."""
         proc = getattr(self.spec, "process_after_loading", None)
         if callable(proc):
             proc(self)
+        for hook in self.weight_post_load_hooks.values():
+            hook(self)
 
     @staticmethod
     def _attach_optional_scales(layer: nn.Module, hf_base: str) -> None:
@@ -235,14 +257,15 @@ class ReplicatedLinear(LinearBase):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        bias = self.bias if not self.skip_bias_add else None
         kernel = _resolve_linear_kernel(
             self,
             x,
             M=_M_of(x),
             N=self.out_features,
             K=self.in_features,
+            bias=bias,
         )
-        bias = self.bias if not self.skip_bias_add else None
         y = kernel.execute(self, x, bias)
         return y, (self.bias if self.skip_bias_add else None)
 
@@ -360,14 +383,15 @@ class ColumnParallelLinear(LinearBase):
         if self.sequence_parallel:
             x = P.all_gather(x, group=self.group, dim=0, mesh=self.mesh_name)
 
+        bias = self.bias if not self.skip_bias_add else None
         kernel = _resolve_linear_kernel(
             self,
             x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
+            bias=bias,
         )
-        bias = self.bias if not self.skip_bias_add else None
         y = kernel.execute(self, x, bias)
 
         if self.gather_output and self.tp_size > 1:
@@ -679,18 +703,19 @@ class RowParallelLinear(LinearBase):
             shard = x.shape[-1] // self.tp_size
             x = x.narrow(-1, self.tp_rank * shard, shard).contiguous()
 
+        # Only rank 0 adds the bias to avoid double counting post-reduce.
+        add_bias = (
+            self.bias
+            if (self.bias is not None and self.tp_rank == 0 and not self.skip_bias_add)
+            else None
+        )
         kernel = _resolve_linear_kernel(
             self,
             x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
-        )
-        # Only rank 0 adds the bias to avoid double counting post-reduce.
-        add_bias = (
-            self.bias
-            if (self.bias is not None and self.tp_rank == 0 and not self.skip_bias_add)
-            else None
+            bias=add_bias,
         )
         y = kernel.execute(self, x, add_bias)
 

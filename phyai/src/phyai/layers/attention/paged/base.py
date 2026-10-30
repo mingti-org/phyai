@@ -48,9 +48,18 @@ class PagedAttnMetadata(BaseAttnMetadata):
     paged_kv_last_page_len: torch.Tensor | None = None
     write_indices: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
+    # Host capacity per sample, including padded prefix and suffix slots.
+    # Actual valid lengths remain in the paged metadata tensors.
+    max_kv_tokens: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.max_kv_tokens is not None and (
+            isinstance(self.max_kv_tokens, bool)
+            or not isinstance(self.max_kv_tokens, int)
+            or self.max_kv_tokens < 0
+        ):
+            raise ValueError("max_kv_tokens must be a nonnegative host integer or None")
         if self.mode == AttnMode.IDLE:
             return
         if self.layout == AttnLayout.RAGGED_3D and self.cu_seqlens_q is None:
@@ -102,6 +111,20 @@ class PagedAttentionBackend(
     AttentionBackendBase[PagedAttnMetadata, PagedAttnPlanHandle]
 ):
     """ABC for paged-KV attention backends."""
+
+    def graph_capture_keys(self, *, rollout: bool = False) -> tuple[str | None, ...]:
+        """Kernel variants that need separate graphs; ordinary backends use one."""
+        return (None,)
+
+    def set_graph_capture_key(self, key: str | None) -> None:
+        if key is not None:
+            raise ValueError(f"{type(self).__name__} has no graph variant {key!r}")
+
+    def graph_replay_key(
+        self, meta: PagedAttnMetadata, *, rollout: bool = False
+    ) -> str | None:
+        """Select from host metadata, without copying device values to the CPU."""
+        return None
 
     def init_cuda_graph_state(
         self,

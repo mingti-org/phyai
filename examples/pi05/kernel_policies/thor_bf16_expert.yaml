@@ -1,0 +1,12 @@
+schema: phyai.kernel/v1
+profile: static
+rules:
+  - id: pi05-thor-expert
+    match:
+      op: attention_paged
+      role: expert
+      model.family: pi05
+      device.arch: sm110
+    prefer:
+      - phyai_kernel.attention_paged.sm110_expert
+      - flashinfer.attention_paged
