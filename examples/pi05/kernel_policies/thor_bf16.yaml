@@ -1,0 +1,87 @@
+# Select explicitly with KernelConfig.config_path or PHYAI_KERNEL_CONFIG.
+schema: phyai.kernel/v1
+profile: static
+rules:
+  - id: pi05-thor-bf16-gemm
+    match:
+      op: gemm
+      model.family: pi05
+      device.arch: sm110
+      quant.format: bf16
+    prefer:
+      - phyai_kernel.gemm.sm110
+      - flashinfer.gemm.bf16
+      - torch.gemm.bf16
+  - id: pi05-thor-expert
+    match:
+      op: attention_paged
+      role: expert
+      model.family: pi05
+      device.arch: sm110
+    prefer:
+      - phyai_kernel.attention_paged.sm110_expert
+      - flashinfer.attention_paged
+  - id: pi05-thor-dense-mlp
+    match: {op: dense_mlp, model.family: pi05, device.arch: sm110}
+    prefer: [phyai_kernel.dense_mlp.sm110, torch.dense_mlp]
+  - id: pi05-thor-vision-layout
+    match: {op: tensor_layout, model.family: pi05, device.arch: sm110}
+    prefer: [phyai_kernel.tensor_layout.sm110, torch.tensor_layout]
+  # Keep the action head on the reference path to satisfy the full-model
+  # numerical gate across the ten-step denoising loop.
+  - id: pi05-thor-action-head-reference
+    priority: 100
+    match:
+      op: gemm
+      model.family: pi05
+      device.arch: sm110
+      quant.format: bf16
+      shape.M: 50
+      shape.N: 32
+      shape.K: 1024
+    prefer:
+      - flashinfer.gemm.bf16
+      - torch.gemm.bf16
+  # Prefer reference GEMM for these measured slower Prefix712 geometries.
+  - id: pi05-thor-prefix712-g11-reference
+    priority: 110
+    match:
+      op: gemm
+      model.family: pi05
+      device.arch: sm110
+      quant.format: bf16
+      shape.M: 712
+      shape.N: 2048
+      shape.K: 2048
+      attrs.bias: false
+    prefer:
+      - flashinfer.gemm.bf16
+      - torch.gemm.bf16
+  - id: pi05-thor-prefix712-g13-reference
+    priority: 110
+    match:
+      op: gemm
+      model.family: pi05
+      device.arch: sm110
+      quant.format: bf16
+      shape.M: 712
+      shape.N: 2560
+      shape.K: 2048
+      attrs.bias: false
+    prefer:
+      - flashinfer.gemm.bf16
+      - torch.gemm.bf16
+  - id: pi05-thor-prefix712-g14-reference
+    priority: 110
+    match:
+      op: gemm
+      model.family: pi05
+      device.arch: sm110
+      quant.format: bf16
+      shape.M: 712
+      shape.N: 32768
+      shape.K: 2048
+      attrs.bias: false
+    prefer:
+      - flashinfer.gemm.bf16
+      - torch.gemm.bf16

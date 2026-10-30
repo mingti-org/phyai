@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.kernel.call import CallSite, token_shape
 from phyai.layers.attention.paged import PagedAttention, PagedAttnCtx
 from phyai.layers.conv import Conv2d
 from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm
@@ -108,6 +109,9 @@ class SiglipVisionEmbeddings(nn.Module):
             params_dtype = get_engine_config().device.params_dtype
         self.config = config
         self.prefix = prefix
+        self._layout_call = CallSite(
+            "tensor_layout", role="vision.embeddings", prefer=("torch.tensor_layout",)
+        )
         self.patch_embedding = Conv2d(
             in_channels=config.num_channels,
             out_channels=config.hidden_size,
@@ -146,7 +150,13 @@ class SiglipVisionEmbeddings(nn.Module):
         h_patch = self.patch_embedding(pixel_values)  # (B, hidden, H/p, W/p)
         embeds = h_patch.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
         embeds = embeds + self.position_embedding().to(h_patch.dtype)
-        return embeds.to(self.patch_embedding.weight.dtype)
+        embeds = embeds.to(self.patch_embedding.weight.dtype)
+        layout = self._layout_call.select(
+            device=embeds.device,
+            dtype={"input": embeds.dtype},
+            dims=token_shape(embeds, hidden=embeds.shape[-1]),
+        )
+        return layout.execute(embeds)
 
 
 class SiglipVisionEncoder(nn.Module):

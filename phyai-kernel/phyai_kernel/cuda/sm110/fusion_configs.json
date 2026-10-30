@@ -1,0 +1,65 @@
+{
+  "560": {
+    "source": "prefix_gated_epi16.cu",
+    "defines": {
+      "TM": 256,
+      "TN": 192,
+      "TK": 64,
+      "TWO": 1,
+      "CM": 2,
+      "CN": 1,
+      "ORIENT": 1,
+      "PACKED": 0,
+      "STAGES": 4,
+      "STREAMK": 0,
+      "BIAS": 0,
+      "NO_C": 1,
+      "ACC_STAGES": 1,
+      "CUTLASS_ENABLE_GDC_FOR_SM100": 1,
+      "THOR_TMEM_COLUMNS": 512,
+      "GATED_CHUNK": 48
+    }
+  },
+  "624": {
+    "source": "prefix_gated_buckets.cu",
+    "defines": {
+      "TM": 256,
+      "TN": 224,
+      "TK": 64,
+      "TWO": 1,
+      "CM": 2,
+      "CN": 1,
+      "ORIENT": 1,
+      "PACKED": 0,
+      "STAGES": 4,
+      "STREAMK": 0,
+      "BIAS": 0,
+      "NO_C": 1,
+      "ACC_STAGES": 1,
+      "CUTLASS_ENABLE_GDC_FOR_SM100": 1,
+      "THOR_TMEM_COLUMNS": 512,
+      "GATED_CHUNK": 32
+    }
+  },
+  "712": {
+    "source": "prefix_gated_buckets.cu",
+    "defines": {
+      "TM": 256,
+      "TN": 256,
+      "TK": 64,
+      "TWO": 1,
+      "CM": 2,
+      "CN": 1,
+      "ORIENT": 1,
+      "PACKED": 0,
+      "STAGES": 4,
+      "STREAMK": 0,
+      "BIAS": 0,
+      "NO_C": 1,
+      "ACC_STAGES": 1,
+      "CUTLASS_ENABLE_GDC_FOR_SM100": 1,
+      "THOR_TMEM_COLUMNS": 512,
+      "GATED_CHUNK": 128
+    }
+  }
+}

@@ -1,0 +1,12 @@
+schema: phyai.kernel/v1
+profile: static
+rules:
+  - id: pi05-thor-kv-scatter
+    match: {op: kv_scatter, model.family: pi05, device.arch: sm110}
+    prefer: [phyai_kernel.kv_scatter.sm110, torch.kv_scatter]
+  - id: pi05-thor-dense-mlp
+    match: {op: dense_mlp, model.family: pi05, device.arch: sm110}
+    prefer: [phyai_kernel.dense_mlp.sm110, torch.dense_mlp]
+  - id: pi05-thor-vision-layout
+    match: {op: tensor_layout, model.family: pi05, device.arch: sm110}
+    prefer: [phyai_kernel.tensor_layout.sm110, torch.tensor_layout]

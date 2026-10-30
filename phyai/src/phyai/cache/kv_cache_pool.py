@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import torch
 
+from phyai.kernel.call import CallSite
+
 
 class KVCachePool:
     """Layer-stacked K/V tensor pool with paged-attention-compatible layout.
@@ -91,6 +93,12 @@ class KVCachePool:
         self.page_size = int(page_size)
         self.dtype = dtype
         self.device = torch.device(device)
+        self._write_call = CallSite(
+            "kv_scatter",
+            role="cache.write",
+            prefer=("torch.kv_scatter",),
+            dims={"heads": self.num_kv_heads, "head_dim": self.head_dim},
+        )
 
         shape = (
             self.num_slots,
@@ -178,8 +186,34 @@ class KVCachePool:
         # captureable CUDA op. ``[indices, 0]`` selects all (kv_heads,
         # head_dim) at the first (and only) page slot.
         # TODO: The index put can be accelerate using 2d index put triton kernel.
-        self.k_buffers[layer_id][slot_indices, 0] = k
-        self.v_buffers[layer_id][slot_indices, 0] = v
+        key_cache, value_cache = self.kv_buffer(layer_id)
+        compatible = (
+            k.device
+            == v.device
+            == slot_indices.device
+            == key_cache.device
+            == value_cache.device
+            and not (
+                torch.is_grad_enabled()
+                and any(t.requires_grad for t in (k, v, key_cache, value_cache))
+            )
+            and slot_indices.is_contiguous()
+            and key_cache.is_contiguous()
+            and value_cache.is_contiguous()
+            and k.numel() > 0
+        )
+        selection = self._write_call.select(
+            device=k.device,
+            dtype={
+                "input": k.dtype,
+                "value": v.dtype,
+                "cache": key_cache.dtype,
+                "indices": slot_indices.dtype,
+            },
+            dims={"tokens": n},
+            attrs={"compatible": compatible},
+        )
+        selection.execute(slot_indices, k, v, key_cache, value_cache)
 
     # ------------------------------------------------------------------ #
     # Reads                                                              #

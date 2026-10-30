@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from phyai.cache import KVCachePool
+from phyai.kernel.execution import execution_phase
 from phyai.utils import get_logger
 from phyai.models.pi05.forward_batch_pi05 import (
     LLMForwardBatch,
@@ -529,6 +530,8 @@ class PI05ExpertRunner(ModelRunner):
         self._capture_plan: PagedAttnPlanHandle | None = None
         self.graph: CudaGraph | None = None
         self.rollout_graph: CudaGraph | None = None
+        self.graph_variants: dict[str | None, CudaGraph] = {}
+        self.rollout_graph_variants: dict[str | None, CudaGraph] = {}
 
         # Euler schedule, bound by the scheduler via ``bind_euler_schedule``
         # *before* ``setup()``. The captured graph unrolls all
@@ -657,10 +660,21 @@ class PI05ExpertRunner(ModelRunner):
             self._capture_plan = self.attn_backend.init_capture_metadata(
                 self._capture_seed_metadata()
             )
-            if self.capture_rollout:
-                self._capture_rollout_graph()
-            else:
+            self._capture_graph_variants(
+                inference=not self.capture_rollout, rollout=self.capture_rollout
+            )
+
+    def _capture_graph_variants(self, *, inference: bool, rollout: bool) -> None:
+        if inference:
+            for key in self.attn_backend.graph_capture_keys():
+                self.attn_backend.set_graph_capture_key(key)
                 self._capture_graph()
+                self.graph_variants[key] = self.graph
+        if rollout:
+            for key in self.attn_backend.graph_capture_keys(rollout=True):
+                self.attn_backend.set_graph_capture_key(key)
+                self._capture_rollout_graph()
+                self.rollout_graph_variants[key] = self.rollout_graph
 
     def recapture_after_weight_update(self) -> bool:
         """Rebuild expert graphs after their trainable weights change.
@@ -674,20 +688,22 @@ class PI05ExpertRunner(ModelRunner):
             return False
 
         torch.cuda.synchronize(self.device)
-        if self.graph is not None:
-            self.graph.reset()
-            self.graph = None
-        if self.rollout_graph is not None:
-            self.rollout_graph.reset()
-            self.rollout_graph = None
+        for graph in (
+            *self.graph_variants.values(),
+            *self.rollout_graph_variants.values(),
+        ):
+            graph.reset()
+        self.graph_variants.clear()
+        self.rollout_graph_variants.clear()
+        self.graph = None
+        self.rollout_graph = None
 
         self._capture_plan = self.attn_backend.init_capture_metadata(
             self._capture_seed_metadata()
         )
-        if had_inference_graph:
-            self._capture_graph()
-        if had_rollout_graph:
-            self._capture_rollout_graph()
+        self._capture_graph_variants(
+            inference=had_inference_graph, rollout=had_rollout_graph
+        )
         return True
 
     def _capture_seed_metadata(self) -> PagedAttnMetadata:
@@ -839,6 +855,7 @@ class PI05ExpertRunner(ModelRunner):
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
         return x_t
 
+    @execution_phase("rollout")
     def _fwd_rollout_loop(
         self,
         *,
@@ -914,6 +931,13 @@ class PI05ExpertRunner(ModelRunner):
         self.pos_ids_suffix_buf.copy_(meta.position_ids.to(torch.int32))
         if self.use_cuda_graph:
             self.attn_backend.replay_metadata(self._capture_plan, meta)
+            key = self.attn_backend.graph_replay_key(meta)
+            self.attn_backend.set_graph_capture_key(key)
+            if self.graph_variants:
+                self.graph = self.graph_variants[key]
+            if self.rollout_graph_variants:
+                rollout_key = self.attn_backend.graph_replay_key(meta, rollout=True)
+                self.rollout_graph = self.rollout_graph_variants[rollout_key]
         else:
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
 

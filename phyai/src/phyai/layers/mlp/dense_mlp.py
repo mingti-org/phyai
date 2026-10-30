@@ -180,6 +180,7 @@ class DenseMLP(nn.Module):
             raise ValueError("cast_before_multiply requires a gated MLP")
         self.bias_enabled = bias
         self.prefix = prefix
+        self._mlp_call = CallSite("dense_mlp", role="mlp", prefer=("torch.dense_mlp",))
         if sequence_parallel is None:
             sequence_parallel = get_engine_config().parallel.dense.sequence_parallel
 
@@ -250,6 +251,58 @@ class DenseMLP(nn.Module):
             self._act_fn = _resolve_plain_act(activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        projection = self.gate_up_proj if self.gated else self.fc1
+        bias = projection.bias
+        from phyai.runtime.cuda_graph_manager import capture_stream_overridden
+
+        compatible = (
+            not capture_stream_overridden()
+            and projection.tp_size == 1
+            and not projection.sequence_parallel
+            and not projection.gather_output
+            and not projection.skip_bias_add
+            and not self.cast_before_multiply
+            and projection.weight.is_contiguous()
+            and projection.weight.data_ptr() % 16 == 0
+            and projection.weight.device == x.device
+            and (
+                bias is None
+                or (
+                    bias.is_contiguous()
+                    and bias.device == x.device
+                    and bias.data_ptr() % 16 == 0
+                )
+            )
+            and projection.spec.physical_signature.format == "bf16"
+            and not (
+                torch.is_grad_enabled()
+                and (
+                    x.requires_grad
+                    or projection.weight.requires_grad
+                    or (bias is not None and bias.requires_grad)
+                )
+            )
+        )
+        handle = self._mlp_call.select(
+            device=x.device,
+            dtype={
+                "input": x.dtype,
+                "weight": projection.weight.dtype,
+                "bias": bias.dtype if bias is not None else None,
+            },
+            dims=token_shape(
+                x, hidden=self.hidden_size, intermediate=self.intermediate_size
+            ),
+            attrs={
+                "activation": self.activation,
+                "gated": self.gated,
+                "bias": self.bias_enabled,
+                "compatible": compatible,
+            },
+        )
+        return handle.execute(self, x)
+
+    def forward_unfused(self, x: torch.Tensor) -> torch.Tensor:
         if self.gated:
             fused, _ = self.gate_up_proj(x)
             if self.cast_before_multiply and self.activation != "situ":

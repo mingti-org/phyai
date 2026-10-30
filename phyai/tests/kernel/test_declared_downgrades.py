@@ -103,18 +103,27 @@ def test_adarmsnorm_lands_on_triton_because_no_flashinfer_row_exists(
     }
 
 
-def test_the_paged_stacks_are_flashinfer_only(selector) -> None:
-    """Replaces ``_engine_to_paged_backend``, which raised for any other name.
-
-    The catalog carries the same fact, so an ineligible host now gets a
-    ``NoKernelError`` listing every rejection reason rather than a hand-written
-    sentence.
-    """
-
-    catalog = build_catalog()
-    for op in ("attention_paged",):
-        vendors = {row.kernel_id.split(".")[0] for row in catalog.impls(op)}
-        assert vendors == {"flashinfer"}, (op, vendors)
+def test_paged_stack_keeps_flashinfer_as_default(selector) -> None:
+    """Specialized opt-in Expert rows preserve the ordinary paged backend."""
+    rows = build_catalog().impls("attention_paged")
+    assert [row.kernel_id for row in rows] == [
+        "flashinfer.attention_paged",
+        "flashinfer.attention_paged.cudnn",
+        "flashinfer.attention_paged.fa2",
+        "flashinfer.attention_paged.fa3",
+        "flashinfer.attention_paged.trtllm-gen",
+        "phyai_kernel.attention_paged.sm110_expert",
+    ]
+    assert (
+        chosen(
+            selector,
+            "attention_paged",
+            dtype={"input": "bf16", "output": "bf16"},
+            shape={"tokens": 50, "heads": 8, "kv_heads": 1, "head_dim": 256},
+            attrs={"causal": False, "layout": "paged"},
+        )
+        == "flashinfer.attention_paged"
+    )
 
 
 def test_rope_falls_back_to_eager_on_its_own(selector) -> None:
