@@ -15,20 +15,20 @@ top-level :func:`phyai.weights.load_pretrained` walks
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 import phyai.parallel as P
-from phyai.engine_config import get_engine_config
 from phyai.kernel.call import CallSite
-from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant import AllocationRequest
+from phyai.engine_config import get_engine_config
+from phyai.parallel.state import resolve_mesh
+from phyai.weights.shards import _Leg, fused, sharded, replicated, packed_sharded
+from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant.active import get_active_plan
 from phyai.layers.quant.materialize import materialize
-from phyai.parallel.state import resolve_mesh
-from phyai.weights.shards import _Leg, fused, packed_sharded, replicated, sharded
 
 
 def _M_of(x: torch.Tensor) -> int:
@@ -40,7 +40,7 @@ def _M_of(x: torch.Tensor) -> int:
 
 
 def _resolve_linear_kernel(
-    layer: "LinearBase",
+    layer: LinearBase,
     x: torch.Tensor,
     *,
     M: int,
@@ -63,14 +63,17 @@ def _resolve_linear_kernel(
         site = CallSite("gemm", role=layer.kernel_role)
         layer.gemm_call = site
 
+    signature = layer.spec.physical_signature
     return site.select(
         device=x.device,
         dtype={
             "input": x.dtype,
-            "output": layer.params_dtype,
+            "output": x.dtype
+            if signature.format in {"bf16", "fp16"}
+            else layer.params_dtype,
             "weight": layer.weight.dtype,
         },
-        quant=layer.spec.physical_signature,
+        quant=signature,
         dims={"M": M, "N": N, "K": K},
     )
 

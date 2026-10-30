@@ -16,8 +16,9 @@ def _bench_args(facts, device):
     catalog's priority order stands.
     """
 
-    import torch
     from types import SimpleNamespace
+
+    import torch
 
     from phyai.kernel.call import torch_dtype
     from phyai.kernel.facts import MISSING
@@ -29,7 +30,13 @@ def _bench_args(facts, device):
         raise NotImplementedError("benchmark needs the M, N and K dimensions")
     dt = torch_dtype(str(facts.lookup("dtype.input")))
     x = torch.randn(int(m), int(k), device=device, dtype=dt)
-    weight = torch.randn(int(n), int(k), device=device, dtype=dt)
+    weight_dtype = facts.lookup("dtype.weight")
+    weight = torch.randn(
+        int(n),
+        int(k),
+        device=device,
+        dtype=dt if weight_dtype in (MISSING, None) else torch_dtype(str(weight_dtype)),
+    )
     return (SimpleNamespace(weight=weight), x, None)
 
 
@@ -113,10 +120,24 @@ def _torch_nvfp4_reference(facts, params):
 def _torch_dense(facts, params):
     """Prepare the unquantized torch linear implementation."""
 
+    import torch
     import torch.nn.functional as F
 
+    promote_weight = (
+        facts.lookup("dtype.input") == "fp32" and facts.lookup("dtype.weight") == "bf16"
+    )
+
     def dense(layer, x, bias):
-        return F.linear(x, layer.weight, bias)
+        if not promote_weight:
+            return F.linear(x, layer.weight, bias)
+        # The catalog admits only FP32 activations with BF16 stored weights.
+        # AMP must not lower this explicitly requested computation precision.
+        with torch.amp.autocast(x.device.type, enabled=False):
+            return F.linear(
+                x,
+                layer.weight.float(),
+                None if bias is None else bias.float(),
+            )
 
     return dense
 
@@ -255,7 +276,18 @@ def register(catalog: Catalog) -> None:
             op="gemm",
             priority=Priority.REFERENCE,
             reference=True,
-            when=quant.format.in_({"bf16", "fp16"}),
+            when=all_of(
+                quant.format.in_({"bf16", "fp16"}),
+                any_of(
+                    dtype.input == dtype.weight,
+                    all_of(
+                        quant.format == "bf16",
+                        dtype.input == "fp32",
+                        dtype.weight == "bf16",
+                    ),
+                ),
+                dtype.output == dtype.input,
+            ),
             prepare=_torch_dense,
             metadata={"package": "torch", "note": "F.linear"},
         ),

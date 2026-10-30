@@ -120,6 +120,7 @@ class RMSNorm(nn.Module):
         prefix: str = "",
         kernel_role: str = "norm",
         cast_before_affine: bool = False,
+        explicit_fp32_math: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -129,6 +130,7 @@ class RMSNorm(nn.Module):
         self.kernel_role = kernel_role
         self.elementwise_affine = elementwise_affine
         self.cast_before_affine = cast_before_affine and elementwise_affine
+        self.explicit_fp32_math = explicit_fp32_math
         if self.cast_before_affine and self.variant != "rms":
             raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
@@ -145,6 +147,12 @@ class RMSNorm(nn.Module):
             role=kernel_role,
             prefer=self._prefer,
             dims={"hidden": hidden_size},
+            attrs={
+                "math": "explicit_fp32" if explicit_fp32_math else None,
+                "cast_before_affine": self.cast_before_affine
+                if explicit_fp32_math
+                else None,
+            },
         )
         self._fused_call = CallSite(
             "rmsnorm_add",
@@ -157,7 +165,7 @@ class RMSNorm(nn.Module):
             self.weight = nn.Parameter(weight, requires_grad=False)
         else:
             self.register_buffer("weight", weight, persistent=False)
-        if self.cast_before_affine:
+        if self.cast_before_affine and not explicit_fp32_math:
             self.register_buffer(
                 "_unit_weight", torch.ones_like(self.weight), persistent=False
             )
@@ -187,6 +195,10 @@ class RMSNorm(nn.Module):
         *,
         preserve_3d_layout: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.explicit_fp32_math and (residual is not None or preserve_3d_layout):
+            raise ValueError(
+                "explicit_fp32_math does not support fused residual or layout options"
+            )
         if preserve_3d_layout and (
             residual is not None or x.dim() != 3 or x.stride(-1) != 1
         ):
@@ -198,7 +210,11 @@ class RMSNorm(nn.Module):
             raise ValueError(
                 "cast_before_affine requires matching activation and weight dtypes"
             )
-        weight = self._unit_weight if self.cast_before_affine else self.weight
+        weight = (
+            self._unit_weight
+            if self.cast_before_affine and not self.explicit_fp32_math
+            else self.weight
+        )
         dtypes: dict[str, object] = {
             "input": x.dtype,
             "weight": weight.dtype,
@@ -245,7 +261,7 @@ class RMSNorm(nn.Module):
         )
         if preserve_3d_layout:
             out = handle.execute(x, weight.data, self.variance_epsilon)
-            if self.cast_before_affine:
+            if self.cast_before_affine and not self.explicit_fp32_math:
                 out = out * self.weight
             return out
         needs_reshape = x.dim() != 2
@@ -253,7 +269,7 @@ class RMSNorm(nn.Module):
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])
         out = handle.execute(x, weight.data, self.variance_epsilon)
-        if self.cast_before_affine:
+        if self.cast_before_affine and not self.explicit_fp32_math:
             out = out * self.weight
         return out.reshape(orig_shape) if needs_reshape else out
 
@@ -420,6 +436,7 @@ class LayerNorm(nn.Module):
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str = "layernorm",
+        explicit_fp32_math: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size <= 0:
@@ -432,6 +449,7 @@ class LayerNorm(nn.Module):
         self.has_bias = bias
         self.prefix = prefix
         self.kernel_role = kernel_role
+        self.explicit_fp32_math = explicit_fp32_math
         if device is None:
             device = get_engine_config().device.target
         self._prefer = backend_preference("layernorm", backend)
@@ -440,7 +458,10 @@ class LayerNorm(nn.Module):
             role=kernel_role,
             prefer=self._prefer,
             dims={"hidden": hidden_size},
-            attrs={"bias": bias},
+            attrs={
+                "bias": bias,
+                "math": "explicit_fp32" if explicit_fp32_math else None,
+            },
         )
 
         # Affine parameters have to be allocated now, before any input tensor
@@ -464,15 +485,18 @@ class LayerNorm(nn.Module):
         requested = dtype_name(
             dtype if dtype is not None else torch.get_default_dtype()
         )
-        chosen = param_dtypes(
-            "layernorm",
-            activation=activation,
-            known={"attrs.bias": bias},
-            preferred={"weight": requested, "bias": requested},
-            prefer=self._prefer,
-        )
-        param_dtype = torch_dtype(chosen["weight"])
-        beta_dtype = torch_dtype(chosen.get("bias", chosen["weight"]))
+        if explicit_fp32_math:
+            param_dtype = beta_dtype = dtype or torch.get_default_dtype()
+        else:
+            chosen = param_dtypes(
+                "layernorm",
+                activation=activation,
+                known={"attrs.bias": bias},
+                preferred={"weight": requested, "bias": requested},
+                prefer=self._prefer,
+            )
+            param_dtype = torch_dtype(chosen["weight"])
+            beta_dtype = torch_dtype(chosen.get("bias", chosen["weight"]))
 
         weight = torch.ones(hidden_size, dtype=param_dtype, device=device)
         if elementwise_affine:
@@ -515,7 +539,9 @@ class LayerNorm(nn.Module):
             },
             dims=token_shape(x),
         )
-        needs_reshape = x.dim() != 2
+        # Explicit statistics preserve the input layout: materializing a strided
+        # tensor can change FP32 reduction order and its rounding.
+        needs_reshape = x.dim() != 2 and not self.explicit_fp32_math
         if needs_reshape:
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])

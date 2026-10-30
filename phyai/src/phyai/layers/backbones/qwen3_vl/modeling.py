@@ -173,6 +173,7 @@ class Qwen3VLVisionRotaryEmbedding(RotaryEmbedding):
         dim: int,
         theta: float = 10000.0,
         *,
+        dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__(
@@ -182,6 +183,8 @@ class Qwen3VLVisionRotaryEmbedding(RotaryEmbedding):
             backend="eager",
             device=device,
         )
+        if dtype is not None:
+            self.inv_freq = self.inv_freq.to(dtype=dtype)
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
         # position_ids: (num_patches, 2) -> freqs (num_patches, 2 * (dim//2)).

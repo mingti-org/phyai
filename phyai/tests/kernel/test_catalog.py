@@ -9,28 +9,26 @@ from inside a layer's forward pass.
 
 from __future__ import annotations
 
+import sys
 import json
 import subprocess
-import sys
 
 import pytest
-
-from phyai.kernel.facts import FactKind, device, dtype
 from phyai.kernel.ops import OP_MODULES
 from phyai.kernel.ops import attention as attention_ops
+from phyai.kernel.facts import FactKind, dtype, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
-from phyai.kernel.predicate import all_of
 from phyai.kernel.registry import (
     Catalog,
     UnknownKernelError,
     UnknownOperationError,
     build_catalog,
 )
-
+from phyai.kernel.predicate import all_of
 
 #: Operations that genuinely have no CPU implementation. Written down so a
-#: fourth cannot join the set unnoticed.
-NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn"})
+#: further operation cannot join the set unnoticed.
+NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn", "moe"})
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +59,7 @@ def _toy_impl(kernel_id: str, when=None, **kwargs) -> Impl:
 
 
 def test_every_declared_module_registers_something(catalog):
-    assert len(OP_MODULES) == 8
+    assert len(OP_MODULES) == 9
     assert len(catalog.ops()) >= len(OP_MODULES)
     for spec in catalog.ops():
         assert catalog.impls(spec.name), f"{spec.name} has no implementations"
@@ -262,7 +260,11 @@ def test_building_the_catalog_imports_neither_layers_nor_flashinfer():
         "print('flashinfer' in sys.modules)\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.split("\n")[:2] == ["[]", "False"], result.stdout
