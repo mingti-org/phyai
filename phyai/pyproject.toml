@@ -29,6 +29,7 @@ dependencies = [
 phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
+deployment = ["phyai-robot[zmq,images,video]"]
 fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
@@ -43,6 +44,7 @@ raw-options = { root = "..", fallback_version = "0.1.0" }
 packages = ["src/phyai"]
 
 [tool.uv.sources]
+phyai-robot = { workspace = true }
 phyai-kernel = { workspace = true }
 phyai-ext = { workspace = true }
 phyai-gateway = { workspace = true }

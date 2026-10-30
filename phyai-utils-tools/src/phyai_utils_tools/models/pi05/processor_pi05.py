@@ -105,7 +105,11 @@ class PI05Processor(BaseModelProcessor):
     dependency). ``dataset_stats`` is an optional ``{feature_name: {stat: ...}}``
     dict keyed by lerobot feature names (:data:`STATE_FEATURE`,
     :data:`ACTION_FEATURE`); absent ⇒ identity normalization (pi05_base default).
-    ``normalize_pixels`` toggles the ``[0, 1] -> [-1, 1]`` image map.
+    ``normalize_pixels`` maps float pixels in ``[0, 1]`` or uint8 pixels in
+    ``[0, 255]`` to ``[-1, 1]``. ``image_resize_backend="pil"`` selects PIL
+    bilinear resizing of RGB uint8 inputs; the default remains ``"torch"``.
+    Postprocessing also accepts an action/state transition for checkpoints
+    whose serialized pipeline converts deltas to absolute targets.
     """
 
     def __init__(
@@ -121,6 +125,7 @@ class PI05Processor(BaseModelProcessor):
         dataset_stats: dict[str, dict[str, Any]] | None = None,
         normalize_pixels: bool = False,
         image_pad_value: float = 0.0,
+        image_resize_backend: str = "torch",
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
@@ -133,6 +138,7 @@ class PI05Processor(BaseModelProcessor):
         self.dataset_stats = dataset_stats
         self.normalize_pixels = bool(normalize_pixels)
         self.image_pad_value = float(image_pad_value)
+        self.image_resize_backend = image_resize_backend
         self.device = device
         self.params_dtype = params_dtype
         self.tokenizer = (
@@ -152,8 +158,8 @@ class PI05Processor(BaseModelProcessor):
         )
 
     @staticmethod
-    def _action_to_transition(action: torch.Tensor) -> Transition:
-        return {ACTION: action}
+    def _action_to_transition(action: torch.Tensor | Transition) -> Transition:
+        return action.copy() if isinstance(action, dict) else {ACTION: action}
 
     @staticmethod
     def _transition_to_action(transition: Transition) -> torch.Tensor:
@@ -168,6 +174,7 @@ class PI05Processor(BaseModelProcessor):
                 num_images=self.num_images,
                 num_channels=self.num_channels,
                 pad_value=self.image_pad_value,
+                backend=self.image_resize_backend,
             )
         ]
         if self.normalize_pixels:
@@ -200,9 +207,14 @@ class PI05Processor(BaseModelProcessor):
         )
 
     def build_postprocessor(self) -> ProcessorPipeline:
+        # Only actions are unnormalized. A caller-supplied raw state, used as a
+        # delta anchor, must reach later steps unchanged.
+        action_stats = {
+            k: v for k, v in (self.dataset_stats or {}).items() if k == ACTION_FEATURE
+        }
         steps = [
             UnnormalizerStep(
-                features=_features_for_stats(self.dataset_stats),
+                features=_features_for_stats(action_stats),
                 norm_map=PI05_NORM_MAP,
                 stats=self.dataset_stats,
                 device=self.device,
@@ -232,6 +244,7 @@ class PI05Processor(BaseModelProcessor):
         action_dim: int | None = None,
         normalize_pixels: bool = False,
         image_pad_value: float = 0.0,
+        image_resize_backend: str = "torch",
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
         **hub_kwargs: Any,
@@ -288,6 +301,7 @@ class PI05Processor(BaseModelProcessor):
         obj.dataset_stats = None
         obj.normalize_pixels = bool(normalize_pixels)
         obj.image_pad_value = float(image_pad_value)
+        obj.image_resize_backend = image_resize_backend
         obj.device = device
         obj.params_dtype = params_dtype
         obj.tokenizer = tok

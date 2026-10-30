@@ -15,7 +15,10 @@ Importing this package registers every step with
 
 from __future__ import annotations
 
-from phyai_utils_tools.processing.steps.action_steps import SliceActionStep
+from phyai_utils_tools.processing.steps.action_steps import (
+    DeltaActionStep,
+    SliceActionStep,
+)
 from phyai_utils_tools.processing.steps.batch_steps import AddBatchDimensionStep
 from phyai_utils_tools.processing.steps.device_steps import DeviceStep
 from phyai_utils_tools.processing.steps.image_steps import (
@@ -31,10 +34,12 @@ from phyai_utils_tools.processing.steps.normalize_steps import (
 )
 from phyai_utils_tools.processing.steps.rename_steps import RenameObservationsStep
 from phyai_utils_tools.processing.steps.text_steps import TokenizerStep
+from phyai_utils_tools.processing.steps.state_steps import StateConstantsStep
 
 __all__ = [
     "AddBatchDimensionStep",
     "DeviceStep",
+    "DeltaActionStep",
     "FeatureType",
     "NormalizationMode",
     "NormalizeImageStep",
@@ -43,6 +48,7 @@ __all__ = [
     "RenameObservationsStep",
     "ResizeWithPadStep",
     "SliceActionStep",
+    "StateConstantsStep",
     "TokenizerStep",
     "UnnormalizerStep",
 ]
