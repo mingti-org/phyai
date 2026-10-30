@@ -69,6 +69,11 @@ def capture_on_stream(stream: "torch.cuda.Stream | None") -> Generator[None]:
         _capture_stream_override.reset(token)
 
 
+def capture_stream_overridden() -> bool:
+    """Whether a caller requires an explicit capture stream or partition."""
+    return _capture_stream_override.get() is not None
+
+
 class CudaGraphError(RuntimeError):
     """Raised when a :class:`CudaGraph` operation is invoked out of order."""
 
@@ -222,8 +227,9 @@ class CudaGraph:
         graph_kwargs: dict[str, Any] = {}
         if self.mempool is not None:
             graph_kwargs["pool"] = self.mempool
-        if override is not None:
-            graph_kwargs["stream"] = override
+        # Preserve stream-owned plans prepared by warmup. An explicit override
+        # still controls capture when a green context is active.
+        graph_kwargs["stream"] = override if override is not None else s
         with graph_capture(), torch.cuda.graph(self._graph, **graph_kwargs):
             self._output = fn(**self._input_buffers)
 

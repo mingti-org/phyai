@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from phyai.kernel.facts import lib, dtype, quant, shape, device
+from phyai.kernel.facts import lib, attrs, dtype, model, quant, shape, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
 from phyai.kernel.registry import Catalog
-from phyai.kernel.predicate import all_of, any_of
+from phyai.kernel.predicate import all_of, any_of, implies
 
 
 def _bench_args(facts, device):
@@ -30,15 +30,28 @@ def _bench_args(facts, device):
     dt = torch_dtype(str(facts.lookup("dtype.input")))
     x = torch.randn(int(m), int(k), device=device, dtype=dt)
     weight = torch.randn(int(n), int(k), device=device, dtype=dt)
-    return (SimpleNamespace(weight=weight), x, None)
+    bias = (
+        torch.randn(int(n), device=device, dtype=dt)
+        if facts.lookup("attrs.bias") is True
+        else None
+    )
+    return (SimpleNamespace(weight=weight), x, bias)
 
 
 GEMM = OpSpec(
     name="gemm",
     dims=("M", "N", "K"),
     dtypes=("input", "output"),
-    optional_dtypes=("weight",),
+    optional_dtypes=("weight", "bias"),
     attributes=(),
+    optional_attributes=(
+        "bias",
+        "weight_contiguous",
+        "weight_aligned",
+        "requires_grad",
+        "stream_override",
+        "execution",
+    ),
     signature="(layer, x, bias) -> Tensor",
     bench_args=_bench_args,
     doc="Linear projection, possibly with quantized weights.",
@@ -125,6 +138,64 @@ def _humming(facts, params):
     from phyai.layers.linear.backends.humming import prepare
 
     return prepare(facts, params)
+
+
+def _sm110(facts, params):
+    from phyai.layers.linear.backends.sm110 import prepare
+
+    return prepare(facts, params)
+
+
+def _register_sm110(catalog: Catalog) -> None:
+    from phyai_kernel.cuda.sm110.gemm import configurations
+
+    shapes = any_of(
+        *(
+            all_of(
+                shape.M == row["m"],
+                shape.N == row["n"],
+                shape.K == row["k"],
+                attrs.bias == row["bias"],
+            )
+            for row in configurations()
+        )
+    )
+    catalog.register(
+        Impl(
+            kernel_id="phyai_kernel.gemm.sm110",
+            op="gemm",
+            priority=Priority.GENERAL,
+            when=all_of(
+                NVIDIA_FLASHINFER,
+                lib.has("phyai_kernel"),
+                lib.has("cutlass"),
+                model.family == "pi05",
+                device.arch == "sm110",
+                quant.format == "bf16",
+                dtype.input == "bf16",
+                dtype.output == "bf16",
+                dtype.weight == "bf16",
+                implies(attrs.bias, all_of(dtype.bias.is_set(), dtype.bias == "bf16")),
+                attrs.bias.is_set(),
+                attrs.weight_contiguous.is_set(),
+                attrs.weight_aligned.is_set(),
+                attrs.execution.is_set(),
+                attrs.execution == "inference",
+                attrs.stream_override.is_set(),
+                attrs.stream_override == False,
+                attrs.requires_grad.is_set(),
+                attrs.requires_grad == False,
+                attrs.weight_contiguous == True,
+                attrs.weight_aligned == True,
+                shapes,
+            ),
+            prepare=_sm110,
+            metadata={
+                "package": "phyai-kernel",
+                "note": "opt-in SM110 BF16 geometries",
+            },
+        )
+    )
 
 
 def _register_humming(catalog: Catalog) -> None:
@@ -300,6 +371,7 @@ def register(catalog: Catalog) -> None:
     )
     catalog.register_many(rows)
     _register_humming(catalog)
+    _register_sm110(catalog)
 
 
 __all__ = ["GEMM", "register"]

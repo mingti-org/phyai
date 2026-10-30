@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from phyai.cache import KVCachePool
+from phyai.kernel.execution import execution_phase
 from phyai.utils import get_logger
 from phyai.models.pi05.forward_batch_pi05 import (
     LLMForwardBatch,
@@ -839,6 +840,7 @@ class PI05ExpertRunner(ModelRunner):
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
         return x_t
 
+    @execution_phase("rollout")
     def _fwd_rollout_loop(
         self,
         *,
