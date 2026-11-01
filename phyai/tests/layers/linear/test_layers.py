@@ -272,7 +272,9 @@ def test_qkv_gqa_replicas_share_kv_rows(fake_mesh):
     assert layer_r0.num_kv_replicas == 2
     assert layer_r0.output_partition_sizes == [16, 8, 8]
     assert layer_r0.weight.shape == (32, 32)
-    disk_k = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32)
+    # K has num_kv_heads * head_dim = 16 global rows, split into two
+    # replicated slots. The fixture must match the checkpoint contract.
+    disk_k = torch.arange(16 * 32, dtype=torch.float32).reshape(16, 32)
     layer_r0.weight.weight_loader(layer_r0.weight, disk_k, "k")
     # Q legs are 16 rows (offset 0); K leg goes to offset 16, size 8.
     k_at_r0 = layer_r0.weight.data.narrow(0, 16, 8).clone()
