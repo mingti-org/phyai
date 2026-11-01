@@ -245,10 +245,12 @@ def _official_eager_paged_attention(
         key_heads = key.transpose(0, 1)
         value_heads = value.transpose(0, 1)
 
-        attention_scores = torch.matmul(
-            query_heads,
-            key_heads.transpose(-2, -1),
-        )
+        # FP32 operands alone do not stop AMP from lowering matmul precision.
+        with torch.amp.autocast(q.device.type, enabled=False):
+            attention_scores = torch.matmul(
+                query_heads,
+                key_heads.transpose(-2, -1),
+            )
         attention_scores = attention_scores * layer.scale
 
         if layer.causal:
@@ -282,12 +284,13 @@ def _official_eager_paged_attention(
             dtype=torch.float32,
         )
 
-        outputs.append(
-            torch.matmul(
-                probabilities,
-                value_heads,
-            ).transpose(0, 1)
-        )
+        with torch.amp.autocast(q.device.type, enabled=False):
+            outputs.append(
+                torch.matmul(
+                    probabilities,
+                    value_heads,
+                ).transpose(0, 1)
+            )
 
     return torch.cat(outputs, dim=0)
 

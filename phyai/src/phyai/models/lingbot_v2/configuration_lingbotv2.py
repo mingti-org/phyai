@@ -347,6 +347,17 @@ class LingBotV2ExpertConfig(PretrainedConfig):
         if self.final_norm_adarms and not self.use_adarms:
             raise ValueError("final_norm_adarms=True requires use_adarms=True.")
 
+        if not self.use_adarms or self.final_norm_adarms:
+            raise ValueError(
+                "LingBot V2 supports adaptive layer norms and a plain final norm "
+                "only (use_adarms=True, final_norm_adarms=False)."
+            )
+        if self.hidden_act != "silu" or self.mlp_bias:
+            raise ValueError(
+                "LingBot V2 supports bias-free SwiGLU expert MLPs only "
+                "(hidden_act='silu', mlp_bias=False)."
+            )
+
     @property
     def num_key_value_groups(self) -> int:
         """Number of query-head groups sharing each key/value head."""

@@ -209,53 +209,6 @@ def get_vision_bilinear_indices_and_weights(
     return bilinear_indices, bilinear_weights
 
 
-def _attach_fused_qkv_loaders(
-    layer: ColumnParallelLinear,
-    checkpoint_prefix: str,
-) -> None:
-    """Load a checkpoint's single ``[Q; K; V]`` tensor into TP-local legs.
-
-    Qwen3-VL vision attention stores Q/K/V in one fused tensor, whereas
-    :class:`QKVParallelLinear` expects three checkpoint tensors. This loader
-    preserves the fused checkpoint contract while placing one local slice from
-    each leg into the column-parallel destination.
-    """
-
-    if not checkpoint_prefix:
-        return
-    global_sizes = tuple(layer.output_sizes_global)
-    local_sizes = tuple(layer.output_partition_sizes)
-    rank = layer.tp_rank
-
-    def _load_fused_qkv(
-        parameter: nn.Parameter,
-        loaded: torch.Tensor,
-        _shard_id=None,
-    ) -> None:
-        if loaded.shape[0] != sum(global_sizes):
-            raise ValueError(
-                f"{checkpoint_prefix} leading dim {loaded.shape[0]} does not "
-                f"match fused QKV width {sum(global_sizes)}."
-            )
-        source_offset = 0
-        destination_offset = 0
-        for global_size, local_size in zip(global_sizes, local_sizes):
-            source = loaded.narrow(
-                0,
-                source_offset + rank * local_size,
-                local_size,
-            )
-            parameter.data.narrow(0, destination_offset, local_size).copy_(source)
-            source_offset += global_size
-            destination_offset += local_size
-
-    layer.weight.hf_keys = [(f"{checkpoint_prefix}.weight", None)]
-    layer.weight.weight_loader = _load_fused_qkv
-    if layer.bias is not None:
-        layer.bias.hf_keys = [(f"{checkpoint_prefix}.bias", None)]
-        layer.bias.weight_loader = _load_fused_qkv
-
-
 class Qwen3VLVisionPatchEmbed(nn.Module):
     """Full-patch Conv3D or its mathematically equivalent GEMM."""
 
@@ -462,10 +415,6 @@ class Qwen3VLVisionAttention(nn.Module):
             bias=True,
             params_dtype=params_dtype,
             prefix=f"{prefix}.qkv" if prefix else "",
-        )
-        _attach_fused_qkv_loaders(
-            self.qkv,
-            f"{prefix}.qkv" if prefix else "",
         )
         self.num_heads_local = self.qkv.output_partition_sizes[0] // self.head_dim
         self.proj = RowParallelLinear(
@@ -1027,6 +976,11 @@ class LingBotV2TokenMoE(nn.Module):
             )
         if config.router_bias:
             raise NotImplementedError("The released LingBot V2 router is bias-free.")
+        if not config.use_router_correction_bias:
+            raise NotImplementedError(
+                "use_router_correction_bias=False is unsupported: LingBot V2 "
+                "routing requires the checkpoint's expert correction bias."
+            )
 
         self.num_experts = config.num_experts
         self.top_k = config.top_k
@@ -1171,9 +1125,9 @@ class LingBotV2TokenMoE(nn.Module):
             tp_rank=self.tp_rank,
         )
         if self.tp_size > 1:
-            # Only the routed expert output is reduced.  The shared expert
-            # is replicated, so folding it in here would multiply its
-            # contribution by tp_size.
+            # Reduce only routed partials over moe_tp. DenseMLP handles the
+            # shared branch's own dense_tp reduction; adding it here would
+            # reduce that completed contribution a second time.
             routed = P.all_reduce(routed, group="moe_tp", mesh=self.mesh)
 
         shared = self.shared_expert(hidden_flat)
