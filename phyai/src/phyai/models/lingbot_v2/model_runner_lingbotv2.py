@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from itertools import pairwise
 from dataclasses import dataclass
 
 import torch
@@ -11,31 +10,34 @@ from phyai.cache import KVCachePool, StaticCache
 from phyai.utils import get_logger
 from phyai.layers.attention import (
     AttnMode,
+    AttnCtx,
+    AttnMetadata,
     AttnLayout,
     PagedAttnCtx,
     PagedAttention,
     PagedAttnMetadata,
     PagedAttnPlanHandle,
-    PagedAttentionBackend,
 )
 from phyai.runtime.model_runner import ModelRunner
+from phyai.layers.attention.shared import select_paged_backend
 from phyai.layers.rotary_embedding import InterleavedMRotaryEmbedding
 from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphError
 from phyai.models.lingbot_v2.modeling_lingbotv2 import (
     LingBotV2Model,
     Qwen3VLTextModel,
-    Qwen3VLVisionModel,
     LingBotV2ExpertStack,
     LingBotV2ActionTimeHeads,
     build_lingbot_v2_mrope_position_ids,
 )
+
+from phyai.models.lingbot_v2.vision import Qwen3VLVisionModel, VisionPositionInputs
 
 logger = get_logger(__name__)
 
 
 @dataclass
 class LingBotV2VisionForwardBatch:
-    """Packed patch vectors and one (t,h,w) row per image."""
+    """Packed patch vectors and one CPU (t,h,w) row per image."""
 
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
@@ -48,7 +50,7 @@ class LingBotV2PrefixForwardBatch:
     hidden_states: torch.Tensor
     position_ids: torch.Tensor
     write_indices: torch.Tensor
-    visual_pos_masks: torch.Tensor | None = None
+    visual_token_indices: torch.Tensor | None = None
     deepstack_visual_embeds: list[torch.Tensor] | None = None
 
 
@@ -85,7 +87,7 @@ def _ar_attn_proto(text_model: Qwen3VLTextModel) -> PagedAttention:
         raise ValueError("text model has no layers.")
     attention = text_model.layers[0].attn
     if not isinstance(attention, PagedAttention):
-        raise TypeError("LingBot prefix runner requires text attn_kind='paged'.")
+        raise TypeError("LingBot prefix runner requires PagedAttention.")
     return attention
 
 
@@ -118,259 +120,17 @@ def _close_backend(*backends: object) -> None:
         raise first_error
 
 
-@dataclass(frozen=True)
-class _LingBotV2EagerPlan(PagedAttnPlanHandle):
-    """Host-planned ragged slices for official FP32 eager attention."""
-
-    q_slices: tuple[tuple[int, int], ...]
-    kv_slices: tuple[tuple[int, int], ...]
-    paged_kv_indices: torch.Tensor
-
-
 @dataclass
 class _LingBotV2EulerGraphState:
-    """One fixed-layout full-Euler CUDA graph and its bound metadata."""
+    """A captured Euler loop and the backend plans it owns."""
 
     graph: CudaGraph
-    state_plan: _LingBotV2EagerPlan
-    action_plan: _LingBotV2EagerPlan
-    state_position_ids: torch.Tensor
-    action_position_ids: torch.Tensor
-    state_write_indices: torch.Tensor
-    action_write_indices: torch.Tensor
-
-
-def _offset_slices(
-    offsets: torch.Tensor,
-    name: str,
-) -> tuple[tuple[int, int], ...]:
-    if offsets.ndim != 1 or offsets.numel() < 2:
-        raise ValueError(f"{name} must be a 1-D offset tensor with at least 2 entries.")
-    values = tuple(int(value) for value in offsets.detach().cpu().tolist())
-    return tuple(pairwise(values))
-
-
-def _build_eager_plan(
-    meta: PagedAttnMetadata,
-) -> _LingBotV2EagerPlan:
-    if (
-        meta.cu_seqlens_q is None
-        or meta.paged_kv_indptr is None
-        or meta.paged_kv_indices is None
-    ):
-        raise ValueError(
-            "LingBot official eager attention requires cu_seqlens_q, "
-            "paged_kv_indptr, and paged_kv_indices."
-        )
-
-    q_slices = _offset_slices(
-        meta.cu_seqlens_q,
-        "cu_seqlens_q",
-    )
-    kv_slices = _offset_slices(
-        meta.paged_kv_indptr,
-        "paged_kv_indptr",
-    )
-
-    if len(q_slices) != len(kv_slices):
-        raise ValueError(
-            f"query batch size {len(q_slices)} does not match KV batch "
-            f"size {len(kv_slices)}."
-        )
-
-    return _LingBotV2EagerPlan(
-        q_slices=q_slices,
-        kv_slices=kv_slices,
-        paged_kv_indices=meta.paged_kv_indices.to(torch.int64),
-    )
-
-
-def _official_eager_paged_attention(
-    layer: PagedAttention,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    ctx: PagedAttnCtx,
-) -> torch.Tensor:
-    """Match LingBot V2's FP32 eager joint attention over paged K/V."""
-
-    if ctx.mode.is_idle():
-        return q.new_zeros(q.shape)
-
-    if not isinstance(ctx.plan, _LingBotV2EagerPlan):
-        raise TypeError(
-            "LingBot official eager attention expected "
-            "_LingBotV2EagerPlan, "
-            f"got {type(ctx.plan).__name__}."
-        )
-
-    q = q.float()
-    k = k.float()
-    v = v.float()
-
-    ctx.kv_pool.write_kv(
-        layer.layer_id,
-        ctx.write_indices,
-        k,
-        v,
-    )
-
-    outputs: list[torch.Tensor] = []
-
-    for (q_start, q_end), (kv_start, kv_end) in zip(
-        ctx.plan.q_slices,
-        ctx.plan.kv_slices,
-    ):
-        query = q[q_start:q_end]
-
-        slots = ctx.plan.paged_kv_indices[kv_start:kv_end]
-
-        key, value = ctx.kv_pool.gather_kv(
-            layer.layer_id,
-            slots,
-        )
-
-        if layer.num_heads != layer.num_kv_heads:
-            groups = layer.num_heads // layer.num_kv_heads
-            key = key.repeat_interleave(
-                groups,
-                dim=1,
-            )
-            value = value.repeat_interleave(
-                groups,
-                dim=1,
-            )
-
-        query_heads = query.transpose(0, 1)
-        key_heads = key.transpose(0, 1)
-        value_heads = value.transpose(0, 1)
-
-        # FP32 operands alone do not stop AMP from lowering matmul precision.
-        with torch.amp.autocast(q.device.type, enabled=False):
-            attention_scores = torch.matmul(
-                query_heads,
-                key_heads.transpose(-2, -1),
-            )
-        attention_scores = attention_scores * layer.scale
-
-        if layer.causal:
-            query_length = query.shape[0]
-            key_length = key.shape[0]
-
-            query_positions = (
-                torch.arange(
-                    query_length,
-                    device=q.device,
-                )
-                + key_length
-                - query_length
-            )
-
-            key_positions = torch.arange(
-                key_length,
-                device=q.device,
-            )
-
-            causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-
-            attention_scores = attention_scores.masked_fill(
-                ~causal_mask.unsqueeze(0),
-                -2.3819763e38,
-            )
-
-        probabilities = torch.softmax(
-            attention_scores,
-            dim=-1,
-            dtype=torch.float32,
-        )
-
-        with torch.amp.autocast(q.device.type, enabled=False):
-            outputs.append(
-                torch.matmul(
-                    probabilities,
-                    value_heads,
-                ).transpose(0, 1)
-            )
-
-    return torch.cat(outputs, dim=0)
-
-
-class _LingBotV2OfficialARBackend(PagedAttentionBackend):
-    """Model-local prefix backend matching the official eager FP32 path."""
-
-    name = "lingbot-v2-official-eager"
-
-    def init_forward_metadata(
-        self,
-        meta: PagedAttnMetadata,
-    ) -> PagedAttnPlanHandle:
-        """Create an eager plan for one paged prefix layout."""
-
-        return _build_eager_plan(meta)
-
-    def forward(
-        self,
-        layer: PagedAttention,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        ctx: PagedAttnCtx,
-    ) -> torch.Tensor:
-        """Execute the official eager prefix attention path."""
-
-        return _official_eager_paged_attention(
-            layer,
-            q,
-            k,
-            v,
-            ctx,
-        )
-
-
-class _LingBotV2OfficialDiffusionBackend(PagedAttentionBackend):
-    """Model-local action backend matching the official eager FP32 path."""
-
-    name = "lingbot-v2-official-eager"
-
-    def supports_capture(self) -> bool:
-        """The fixed-layout Torch sequence is CUDA-graph safe."""
-
-        return True
-
-    def init_forward_metadata(
-        self,
-        meta: PagedAttnMetadata,
-    ) -> PagedAttnPlanHandle:
-        """Create an eager plan for one expert attention layout."""
-
-        return _build_eager_plan(meta)
-
-    def forward(
-        self,
-        layer: PagedAttention,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        ctx: PagedAttnCtx,
-    ) -> torch.Tensor:
-        """Execute the official eager expert attention path."""
-
-        return _official_eager_paged_attention(
-            layer,
-            q,
-            k,
-            v,
-            ctx,
-        )
+    state_plan: PagedAttnPlanHandle
+    action_plan: PagedAttnPlanHandle
 
 
 class LingBotV2VisionRunner(ModelRunner):
-    """Variable-grid Qwen3-VL vision runner.
-
-    The vision helpers inspect grid_thw on the host,
-    so this path remains eager until PHYAI has a
-    graph-safe, bucketed Qwen3-VL vision planner.
-    """
+    """Cache vision positions by grid and plan attention once per forward."""
 
     def __init__(
         self,
@@ -382,38 +142,60 @@ class LingBotV2VisionRunner(ModelRunner):
         self.vision_model = vision_model
         self.params_dtype = params_dtype
         self.device = torch.device(device)
+        self._positions: dict[tuple[tuple[int, ...], ...], VisionPositionInputs] = {}
 
     def setup(self) -> None:
-        """Initialize eager vision execution."""
-
-        logger.info(
-            "LingBotV2VisionRunner uses eager variable-grid execution.",
-        )
+        """Invalidate cached positions after weights have been loaded."""
+        self._positions.clear()
 
     def reset(self) -> None:
-        """Vision execution has no request-local runtime state."""
+        """Keep reusable geometry across requests."""
 
     def close(self) -> None:
-        """Vision eager execution owns no external runtime resources."""
+        """Release cached geometry and positional embeddings."""
+        self._positions.clear()
 
     def forward(
-        self,
-        batch: LingBotV2VisionForwardBatch,
-    ) -> tuple[
-        torch.Tensor,
-        list[torch.Tensor],
-    ]:
-        """Encode packed image patches."""
+        self, batch: LingBotV2VisionForwardBatch
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Encode packed image patches with one shared attention context."""
+        grid = batch.image_grid_thw
+        if grid.device.type != "cpu":
+            raise ValueError("LingBot vision planning requires CPU image_grid_thw.")
+        key = tuple(tuple(row) for row in grid.tolist())
+        positions = self._positions.get(key)
+        if positions is None:
+            positions = self.vision_model.prepare_positions(grid)
+            self._positions[key] = positions
 
+        attention = self.vision_model.blocks[0].attn.attn
+        query_shape = positions.pos_embeds[
+            :, : attention.num_heads * attention.head_dim
+        ].view(positions.pos_embeds.shape[0], attention.num_heads, attention.head_dim)
+        backend = attention._ensure_backend(q=query_shape, layout=AttnLayout.RAGGED_3D)
+        metadata = AttnMetadata(
+            mode=AttnMode.PREFILL,
+            layout=AttnLayout.RAGGED_3D,
+            batch_size=positions.cu_seqlens.numel() - 1,
+            num_query_tokens=positions.pos_embeds.shape[0],
+            cu_seqlens_q=positions.cu_seqlens,
+            cu_seqlens_kv=positions.cu_seqlens,
+            layer_proto=attention,
+            q_dtype=self.params_dtype,
+            kv_dtype=self.params_dtype,
+        )
+        context = AttnCtx(
+            backend=backend,
+            plan=backend.init_forward_metadata(metadata),
+            mode=metadata.mode,
+            layout=metadata.layout,
+            cu_seqlens_q=positions.cu_seqlens,
+            cu_seqlens_kv=positions.cu_seqlens,
+        )
         return self.vision_model(
-            batch.pixel_values.to(
-                device=self.device,
-                dtype=self.params_dtype,
-            ),
-            batch.image_grid_thw.to(
-                device=self.device,
-                dtype=torch.int64,
-            ),
+            batch.pixel_values.to(device=self.device, dtype=self.params_dtype),
+            positions,
+            attn_ctx=context,
         )
 
 
@@ -449,13 +231,13 @@ class LingBotV2PrefixRunner(ModelRunner):
         self.prefix_base = 1
         self.suffix_base = self.prefix_base + int(prefix_capacity)
 
+        self.attn_proto = _ar_attn_proto(self.text_model)
         self.kv_pool = KVCachePool(
             num_layers=self.config.num_layers,
-            num_slots=(1 + int(prefix_capacity) + int(suffix_capacity)),
-            num_kv_heads=(self.config.text.num_key_value_heads),
+            num_slots=1 + int(prefix_capacity) + int(suffix_capacity),
+            num_kv_heads=self.attn_proto.num_kv_heads,
             head_dim=self.config.text.head_dim,
-            # Official V2 promotes Q/K/V before MRoPE
-            # and stores FP32 K/V for reuse.
+            # Joint attention retains FP32 K/V after MRoPE.
             dtype=torch.float32,
             device=self.device,
         )
@@ -472,41 +254,38 @@ class LingBotV2PrefixRunner(ModelRunner):
             capacity=int(suffix_capacity),
         )
 
-        self.attn_proto = _ar_attn_proto(self.text_model)
-
-        self.attn_backend: PagedAttentionBackend = _LingBotV2OfficialARBackend()
+        self.attn_backend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=torch.float32,
+            num_tokens=self.max_num_tokens,
+            capture=False,
+            runner_tag="lingbot_v2.prefix",
+        )
 
         self._plan: PagedAttnPlanHandle | None = None
-
         self._current_query: torch.Tensor | None = None
-
         self._future_query: torch.Tensor | None = None
-
         self._vision_start: torch.Tensor | None = None
-
         self._vision_end: torch.Tensor | None = None
 
     def setup(self) -> None:
         """Allocate prefix attention metadata and caches."""
 
-        logger.info(
-            "Entering LingBotV2PrefixRunner.setup",
-        )
-
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.max_batch_size,
             max_num_tokens=self.max_num_tokens,
-            max_paged_kv_indices=(self.max_paged_kv_indices),
+            max_paged_kv_indices=self.max_paged_kv_indices,
             device=self.device,
-            params_dtype=self.params_dtype,
+            params_dtype=torch.float32,
             layer_proto=self.attn_proto,
         )
 
         with torch.no_grad():
             current_query, future_query = self.model.dual_query(1)
-
             self._current_query = current_query[0].to(self.params_dtype)
-
             self._future_query = future_query[0].to(self.params_dtype)
 
             if self.config.use_vision_boundaries:
@@ -557,28 +336,13 @@ class LingBotV2PrefixRunner(ModelRunner):
             raise RuntimeError("prefix runner setup must run before embedding inputs.")
 
         language = self.model.embed_language(
-            input_ids.to(
-                device=self.device,
-                dtype=torch.int64,
-            )
+            input_ids.to(device=self.device, dtype=torch.int64)
         ).to(self.params_dtype)
 
         return LingBotV2PrefixEmbeddings(
             language=language,
-            current_query=(
-                self._current_query.unsqueeze(0).expand(
-                    batch_size,
-                    -1,
-                    -1,
-                )
-            ),
-            future_query=(
-                self._future_query.unsqueeze(0).expand(
-                    batch_size,
-                    -1,
-                    -1,
-                )
-            ),
+            current_query=self._current_query.unsqueeze(0).expand(batch_size, -1, -1),
+            future_query=self._future_query.unsqueeze(0).expand(batch_size, -1, -1),
             vision_start=self._vision_start,
             vision_end=self._vision_end,
         )
@@ -595,8 +359,8 @@ class LingBotV2PrefixRunner(ModelRunner):
             input_ids,
             attention_mask,
             image_grid_thw,
-            image_token_id=(self.config.image_token_id),
-            spatial_merge_size=(self.config.vision.spatial_merge_size),
+            image_token_id=self.config.image_token_id,
+            spatial_merge_size=self.config.vision.spatial_merge_size,
         )
 
     def plan_inference(
@@ -627,13 +391,16 @@ class LingBotV2PrefixRunner(ModelRunner):
             write_indices=batch.write_indices,
         )
 
-        self.text_model(
+        k, v = self.text_model.prefill(
             batch.hidden_states,
             cos=cos,
             sin=sin,
             attn_ctx=context,
-            visual_pos_masks=(batch.visual_pos_masks),
-            deepstack_visual_embeds=(batch.deepstack_visual_embeds),
+            visual_token_indices=batch.visual_token_indices,
+            deepstack_visual_embeds=batch.deepstack_visual_embeds,
+        )
+        self.kv_pool.write_kv(
+            self.text_model.layers[-1].layer_idx, batch.write_indices, k, v
         )
 
     def close(self) -> None:
@@ -647,8 +414,17 @@ class LingBotV2PrefixRunner(ModelRunner):
         self._vision_end = None
 
 
+@dataclass(frozen=True)
+class _LingBotV2StepCondition:
+    """Time features and affine parameters shared by state and action tokens."""
+
+    cond: torch.Tensor
+    input_modulations: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    post_modulations: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+
+
 class LingBotV2ExpertRunner(ModelRunner):
-    """State/action expert runtime with optional Euler CUDA graph."""
+    """Run the action expert with cached conditions and optional Euler graphs."""
 
     def __init__(
         self,
@@ -671,263 +447,200 @@ class LingBotV2ExpertRunner(ModelRunner):
         self.heads = heads
         self.mrope = mrope
         self.kv_pool = kv_pool
-
         self.max_batch_size = int(max_batch_size)
         self.chunk_size = int(chunk_size)
         self.max_action_dim = int(max_action_dim)
         self.num_inference_steps = int(num_inference_steps)
         self.max_num_tokens = int(max_num_tokens)
         self.max_paged_kv_indices = int(max_paged_kv_indices)
-
         self.params_dtype = params_dtype
         self.device = torch.device(device)
-
         self.attn_proto = _diffusion_attn_proto(expert_stack)
-
-        self.state_backend: PagedAttentionBackend = _LingBotV2OfficialDiffusionBackend()
-
-        self.action_backend: PagedAttentionBackend = (
-            _LingBotV2OfficialDiffusionBackend()
+        capture = bool(use_cuda_graph) and self.device.type == "cuda"
+        self.state_backend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=torch.float32,
+            num_tokens=self.max_batch_size,
+            capture=capture,
+            runner_tag="lingbot_v2.state",
         )
-
-        self.cuda_graph_requested = bool(use_cuda_graph)
-
+        self.action_backend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=torch.float32,
+            num_tokens=self.max_num_tokens,
+            capture=capture,
+            runner_tag="lingbot_v2.action",
+        )
         self.use_cuda_graph = (
-            self.cuda_graph_requested
-            and self.device.type == "cuda"
+            capture
             and self.state_backend.supports_capture()
             and self.action_backend.supports_capture()
         )
-
-        self._state_plan: PagedAttnPlanHandle | None = None
-
-        self._action_plan: PagedAttnPlanHandle | None = None
-
-        self._state_position_ids: torch.Tensor | None = None
-
-        self._action_position_ids: torch.Tensor | None = None
-
-        self._state_write_indices: torch.Tensor | None = None
-
-        self._action_write_indices: torch.Tensor | None = None
-
         self._time_schedule: torch.Tensor | None = None
-
         self._dt: torch.Tensor | None = None
-
-        self._euler_graphs: dict[
-            tuple[object, ...],
-            _LingBotV2EulerGraphState,
-        ] = {}
-
+        self._step_conditions: tuple[_LingBotV2StepCondition, ...] = ()
+        self._euler_graphs: dict[tuple[object, ...], _LingBotV2EulerGraphState] = {}
         self._failed_graph_keys: set[tuple[object, ...]] = set()
+        self.reset()
 
     def setup(self) -> None:
-        """Initialize expert attention and graph bookkeeping."""
-
-        logger.info(
-            "Entering LingBotV2ExpertRunner.setup",
-        )
-
+        """Prepare the fixed time schedule and its learned affine parameters."""
+        self._euler_graphs.clear()
+        self._failed_graph_keys.clear()
+        self._step_conditions = ()
+        self.reset()
         common = {
             "max_batch_size": self.max_batch_size,
             "max_paged_kv_indices": self.max_paged_kv_indices,
             "device": self.device,
-            "params_dtype": self.params_dtype,
+            "params_dtype": torch.float32,
             "layer_proto": self.attn_proto,
         }
-
         self.state_backend.init_cuda_graph_state(
-            max_num_tokens=(self.max_batch_size),
-            **common,
+            max_num_tokens=self.max_batch_size, **common
         )
-
         self.action_backend.init_cuda_graph_state(
-            max_num_tokens=(self.max_num_tokens),
-            **common,
+            max_num_tokens=self.max_num_tokens, **common
         )
-
         if self.num_inference_steps <= 0:
             raise ValueError("num_inference_steps must be positive.")
-
         self._dt = torch.tensor(
             -1.0 / self.num_inference_steps,
             dtype=self.params_dtype,
             device=self.device,
         )
-
-        time = torch.tensor(
-            1.0,
-            dtype=self.params_dtype,
-            device=self.device,
-        )
-
-        schedule: list[torch.Tensor] = []
-
+        time = torch.tensor(1.0, dtype=self.params_dtype, device=self.device)
+        schedule = []
         for _ in range(self.num_inference_steps):
             schedule.append(time.clone())
             time += self._dt
-
         self._time_schedule = torch.stack(schedule)
+        with torch.no_grad():
+            self._step_conditions = tuple(
+                self._prepare_condition(time.expand(self.max_batch_size))
+                for time in self._time_schedule
+            )
 
-        logger.info(
-            "LingBotV2ExpertRunner CUDA Graph is %s; "
-            "full Euler graphs are captured lazily "
-            "per fixed attention layout.",
-            ("enabled" if self.use_cuda_graph else "disabled"),
+    def _prepare_condition(self, time: torch.Tensor) -> _LingBotV2StepCondition:
+        cond = self.heads.time_condition(time)
+        return _LingBotV2StepCondition(
+            cond=cond,
+            input_modulations=tuple(
+                layer.input_layernorm.compute_modulation(cond)
+                for layer in self.expert_stack.layers
+            ),
+            post_modulations=tuple(
+                layer.post_attention_layernorm.compute_modulation(cond)
+                for layer in self.expert_stack.layers
+            ),
         )
 
     def reset(self) -> None:
-        """Clear request-specific expert plans."""
-
-        self._state_plan = None
-        self._action_plan = None
-        self._state_position_ids = None
-        self._action_position_ids = None
-        self._state_write_indices = None
-        self._action_write_indices = None
+        """Discard request-specific attention plans and rotary positions."""
+        self._state_metadata: PagedAttnMetadata | None = None
+        self._action_metadata: PagedAttnMetadata | None = None
+        self._state_plan: PagedAttnPlanHandle | None = None
+        self._action_plan: PagedAttnPlanHandle | None = None
+        self._position_inputs: dict[str, torch.Tensor] = {}
+        self._layout_key: tuple[object, ...] = ()
 
     def plan_inference(
         self,
         state_metadata: PagedAttnMetadata,
         action_metadata: PagedAttnMetadata,
     ) -> None:
-        """Plan state and action attention."""
-
-        if state_metadata.position_ids is None or action_metadata.position_ids is None:
-            raise ValueError("LingBot expert metadata requires 3-D MRoPE position_ids.")
-
-        if (
-            state_metadata.write_indices is None
-            or action_metadata.write_indices is None
-        ):
-            raise ValueError("LingBot expert metadata requires KV write_indices.")
-
-        self._state_position_ids = state_metadata.position_ids
-        self._action_position_ids = action_metadata.position_ids
-
-        self._state_write_indices = state_metadata.write_indices
-        self._action_write_indices = action_metadata.write_indices
-
+        """Plan from CPU offsets and compute rotary embeddings from GPU positions."""
+        layout = []
+        for name, metadata in (("state", state_metadata), ("action", action_metadata)):
+            if metadata.position_ids is None or metadata.write_indices is None:
+                raise ValueError(
+                    "LingBot expert metadata requires positions and KV write indices."
+                )
+            if metadata.cu_seqlens_q is None or metadata.paged_kv_indptr is None:
+                raise ValueError(
+                    "LingBot expert metadata requires query and KV offsets."
+                )
+            if (
+                metadata.cu_seqlens_q.device.type != "cpu"
+                or metadata.paged_kv_indptr.device.type != "cpu"
+            ):
+                raise ValueError("LingBot query and KV offsets must remain on CPU.")
+            cos, sin = self.mrope.get_cos_sin(metadata.position_ids)
+            if name == "state":
+                cos, sin = (
+                    cos.reshape(-1, cos.shape[-1]),
+                    sin.reshape(-1, sin.shape[-1]),
+                )
+            self._position_inputs[f"{name}_cos"] = cos
+            self._position_inputs[f"{name}_sin"] = sin
+            self._position_inputs[f"{name}_write_indices"] = metadata.write_indices
+            layout.append(
+                (
+                    tuple(metadata.cu_seqlens_q.tolist()),
+                    tuple(metadata.paged_kv_indptr.tolist()),
+                )
+            )
+        self._layout_key = tuple(layout)
+        self._state_metadata = state_metadata
+        self._action_metadata = action_metadata
         self._state_plan = self.state_backend.init_forward_metadata(state_metadata)
-
         self._action_plan = self.action_backend.init_forward_metadata(action_metadata)
 
-    def forward(
+    def _contexts(
         self,
-        batch: LingBotV2ExpertForwardBatch,
-    ) -> torch.Tensor:
-        """Run expert stack and return predicted action chunk."""
-
-        required = (
-            self._state_plan,
-            self._action_plan,
-            self._state_position_ids,
-            self._action_position_ids,
-            self._state_write_indices,
-            self._action_write_indices,
-        )
-
-        if any(value is None for value in required):
-            raise RuntimeError("plan_inference must be called before expert forward.")
-
-        return self._forward_with_runtime(
-            state=batch.state,
-            x_t=batch.x_t,
-            time=batch.time,
-            state_plan=self._require_eager_plan(
-                self._state_plan,
-                "state",
-            ),
-            action_plan=self._require_eager_plan(
-                self._action_plan,
-                "action",
-            ),
-            state_position_ids=(self._state_position_ids),
-            action_position_ids=(self._action_position_ids),
-            state_write_indices=(self._state_write_indices),
-            action_write_indices=(self._action_write_indices),
-        )
-
-    @staticmethod
-    def _require_eager_plan(
-        plan: PagedAttnPlanHandle | None,
-        name: str,
-    ) -> _LingBotV2EagerPlan:
-        if not isinstance(
-            plan,
-            _LingBotV2EagerPlan,
-        ):
-            raise TypeError(
-                f"LingBot V2 {name} attention "
-                "expected an eager plan, "
-                f"got {type(plan).__name__}."
-            )
-        return plan
-
-    def _forward_with_runtime(
-        self,
-        *,
-        state: torch.Tensor,
-        x_t: torch.Tensor,
-        time: torch.Tensor,
-        state_plan: _LingBotV2EagerPlan,
-        action_plan: _LingBotV2EagerPlan,
-        state_position_ids: torch.Tensor,
-        action_position_ids: torch.Tensor,
+        state_plan: PagedAttnPlanHandle,
+        action_plan: PagedAttnPlanHandle,
         state_write_indices: torch.Tensor,
         action_write_indices: torch.Tensor,
+    ) -> tuple[PagedAttnCtx, PagedAttnCtx]:
+        return (
+            PagedAttnCtx(
+                backend=self.state_backend,
+                plan=state_plan,
+                mode=AttnMode.PREFILL,
+                layout=AttnLayout.RAGGED_3D,
+                kv_pool=self.kv_pool,
+                write_indices=state_write_indices,
+            ),
+            PagedAttnCtx(
+                backend=self.action_backend,
+                plan=action_plan,
+                mode=AttnMode.PREFILL,
+                layout=AttnLayout.RAGGED_3D,
+                kv_pool=self.kv_pool,
+                write_indices=action_write_indices,
+            ),
+        )
+
+    def _velocity(
+        self,
+        state_hidden: torch.Tensor,
+        x_t: torch.Tensor,
+        condition: _LingBotV2StepCondition,
+        *,
+        state_context: PagedAttnCtx,
+        action_context: PagedAttnCtx,
+        state_cos: torch.Tensor,
+        state_sin: torch.Tensor,
+        action_cos: torch.Tensor,
+        action_sin: torch.Tensor,
     ) -> torch.Tensor:
-        """Evaluate one flow-matching velocity."""
-
-        batch_size = int(state.shape[0])
-
-        state_hidden = self.heads.embed_state(state).reshape(
-            batch_size,
-            -1,
-        )
-
-        action_hidden, cond = self.heads.embed_action_time(
-            x_t,
-            time,
-        )
-
-        state_cos, state_sin = self.mrope.get_cos_sin(state_position_ids)
-
-        action_cos, action_sin = self.mrope.get_cos_sin(action_position_ids)
-
-        state_cos = state_cos.reshape(
-            -1,
-            state_cos.shape[-1],
-        )
-
-        state_sin = state_sin.reshape(
-            -1,
-            state_sin.shape[-1],
-        )
-
-        state_context = PagedAttnCtx(
-            backend=self.state_backend,
-            plan=state_plan,
-            mode=AttnMode.PREFILL,
-            layout=AttnLayout.RAGGED_3D,
-            kv_pool=self.kv_pool,
-            write_indices=(state_write_indices),
-        )
-
-        action_context = PagedAttnCtx(
-            backend=self.action_backend,
-            plan=action_plan,
-            mode=AttnMode.PREFILL,
-            layout=AttnLayout.RAGGED_3D,
-            kv_pool=self.kv_pool,
-            write_indices=(action_write_indices),
-        )
-
-        for layer in self.expert_stack.layers:
-            input_modulation = layer.input_layernorm.compute_modulation(cond)
-            post_modulation = layer.post_attention_layernorm.compute_modulation(cond)
-
+        batch_size = state_hidden.shape[0]
+        cond = condition.cond[:batch_size]
+        action_hidden = self.heads.embed_action(x_t, cond)
+        for index, layer in enumerate(self.expert_stack.layers):
+            input_modulation = tuple(
+                t[:batch_size] for t in condition.input_modulations[index]
+            )
+            post_modulation = tuple(
+                t[:batch_size] for t in condition.post_modulations[index]
+            )
             state_hidden = layer(
                 state_hidden,
                 cond=cond,
@@ -938,7 +651,6 @@ class LingBotV2ExpertRunner(ModelRunner):
                 sin=state_sin,
                 attn_ctx=state_context,
             )
-
             action_hidden = layer(
                 action_hidden,
                 cond=cond,
@@ -949,326 +661,146 @@ class LingBotV2ExpertRunner(ModelRunner):
                 sin=action_sin,
                 attn_ctx=action_context,
             )
+        return self.heads.project_action(self.expert_stack.norm(action_hidden))
 
-        action_hidden = self.expert_stack.norm(action_hidden)
-
-        return self.heads.project_action(action_hidden)
+    def forward(self, batch: LingBotV2ExpertForwardBatch) -> torch.Tensor:
+        """Evaluate one supplied diffusion time, outside the fixed Euler schedule."""
+        if self._state_plan is None or self._action_plan is None:
+            raise RuntimeError("plan_inference must run before expert forward.")
+        inputs = self._position_inputs
+        state_context, action_context = self._contexts(
+            self._state_plan,
+            self._action_plan,
+            inputs["state_write_indices"],
+            inputs["action_write_indices"],
+        )
+        return self._velocity(
+            self.heads.embed_state(batch.state).reshape(batch.state.shape[0], -1),
+            batch.x_t,
+            self._prepare_condition(batch.time),
+            state_context=state_context,
+            action_context=action_context,
+            state_cos=inputs["state_cos"],
+            state_sin=inputs["state_sin"],
+            action_cos=inputs["action_cos"],
+            action_sin=inputs["action_sin"],
+        )
 
     def _euler_loop(
         self,
         *,
-        state: torch.Tensor,
+        state_hidden: torch.Tensor,
         noise: torch.Tensor,
-        state_plan: _LingBotV2EagerPlan,
-        action_plan: _LingBotV2EagerPlan,
-        state_position_ids: torch.Tensor,
-        action_position_ids: torch.Tensor,
+        state_plan: PagedAttnPlanHandle,
+        action_plan: PagedAttnPlanHandle,
+        state_cos: torch.Tensor,
+        state_sin: torch.Tensor,
+        action_cos: torch.Tensor,
+        action_sin: torch.Tensor,
         state_write_indices: torch.Tensor,
         action_write_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fixed BF16 time schedule and Euler updates."""
-
-        if self._time_schedule is None or self._dt is None:
+        if not self._step_conditions or self._dt is None:
             raise RuntimeError("setup must run before the LingBot V2 Euler loop.")
-
-        batch_size = int(state.shape[0])
-
+        state_context, action_context = self._contexts(
+            state_plan, action_plan, state_write_indices, action_write_indices
+        )
         x_t = noise.clone()
-
-        for step in range(self.num_inference_steps):
-            velocity = self._forward_with_runtime(
-                state=state,
-                x_t=x_t,
-                time=(self._time_schedule[step].expand(batch_size)),
-                state_plan=state_plan,
-                action_plan=action_plan,
-                state_position_ids=(state_position_ids),
-                action_position_ids=(action_position_ids),
-                state_write_indices=(state_write_indices),
-                action_write_indices=(action_write_indices),
+        for condition in self._step_conditions:
+            velocity = self._velocity(
+                state_hidden,
+                x_t,
+                condition,
+                state_context=state_context,
+                action_context=action_context,
+                state_cos=state_cos,
+                state_sin=state_sin,
+                action_cos=action_cos,
+                action_sin=action_sin,
             )
-
             x_t += self._dt * velocity
-
         return x_t
 
-    def _current_graph_key(
-        self,
-        state: torch.Tensor,
-        noise: torch.Tensor,
-    ) -> tuple[object, ...]:
-        state_plan = self._require_eager_plan(
-            self._state_plan,
-            "state",
-        )
-
-        action_plan = self._require_eager_plan(
-            self._action_plan,
-            "action",
-        )
-
-        return (
-            tuple(state.shape),
-            state.dtype,
-            state.device,
-            tuple(noise.shape),
-            noise.dtype,
-            noise.device,
-            state_plan.q_slices,
-            state_plan.kv_slices,
-            tuple(state_plan.paged_kv_indices.shape),
-            action_plan.q_slices,
-            action_plan.kv_slices,
-            tuple(action_plan.paged_kv_indices.shape),
-        )
-
     def _capture_euler_graph(
-        self,
-        state: torch.Tensor,
-        noise: torch.Tensor,
+        self, inputs: dict[str, torch.Tensor]
     ) -> _LingBotV2EulerGraphState:
-        state_plan = self._require_eager_plan(
-            self._state_plan,
-            "state",
-        )
+        assert self._state_metadata is not None and self._action_metadata is not None
+        state_plan = self.state_backend.init_capture_metadata(self._state_metadata)
+        action_plan = self.action_backend.init_capture_metadata(self._action_metadata)
 
-        action_plan = self._require_eager_plan(
-            self._action_plan,
-            "action",
-        )
-
-        assert self._state_position_ids is not None
-        assert self._action_position_ids is not None
-        assert self._state_write_indices is not None
-        assert self._action_write_indices is not None
-
-        captured_state_plan = _LingBotV2EagerPlan(
-            q_slices=(state_plan.q_slices),
-            kv_slices=(state_plan.kv_slices),
-            paged_kv_indices=(state_plan.paged_kv_indices.clone()),
-        )
-
-        captured_action_plan = _LingBotV2EagerPlan(
-            q_slices=(action_plan.q_slices),
-            kv_slices=(action_plan.kv_slices),
-            paged_kv_indices=(action_plan.paged_kv_indices.clone()),
-        )
-
-        state_position_ids = self._state_position_ids.clone()
-
-        action_position_ids = self._action_position_ids.clone()
-
-        state_write_indices = self._state_write_indices.clone()
-
-        action_write_indices = self._action_write_indices.clone()
-
-        def _captured_loop(
-            *,
-            state: torch.Tensor,
-            noise: torch.Tensor,
-        ) -> torch.Tensor:
+        def captured_loop(**inputs: torch.Tensor) -> torch.Tensor:
             return self._euler_loop(
-                state=state,
-                noise=noise,
-                state_plan=(captured_state_plan),
-                action_plan=(captured_action_plan),
-                state_position_ids=(state_position_ids),
-                action_position_ids=(action_position_ids),
-                state_write_indices=(state_write_indices),
-                action_write_indices=(action_write_indices),
+                state_plan=state_plan, action_plan=action_plan, **inputs
             )
 
         graph = CudaGraph()
+        graph.capture(captured_loop, inputs)
+        return _LingBotV2EulerGraphState(graph, state_plan, action_plan)
 
-        graph.capture(
-            _captured_loop,
-            {
-                "state": state,
-                "noise": noise,
-            },
+    def forward_euler(self, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Embed the state once, then run or replay the full Euler loop."""
+        if self._state_plan is None or self._action_plan is None:
+            raise RuntimeError("plan_inference must run before the Euler loop.")
+        inputs = {
+            "state_hidden": self.heads.embed_state(state).reshape(state.shape[0], -1),
+            "noise": noise,
+            **self._position_inputs,
+        }
+        key = (
+            self._layout_key,
+            tuple(
+                (name, tuple(t.shape), t.dtype, t.device) for name, t in inputs.items()
+            ),
         )
-
-        return _LingBotV2EulerGraphState(
-            graph=graph,
-            state_plan=captured_state_plan,
-            action_plan=captured_action_plan,
-            state_position_ids=(state_position_ids),
-            action_position_ids=(action_position_ids),
-            state_write_indices=(state_write_indices),
-            action_write_indices=(action_write_indices),
-        )
-
-    def _refresh_graph_metadata(
-        self,
-        graph_state: _LingBotV2EulerGraphState,
-    ) -> None:
-        state_plan = self._require_eager_plan(
-            self._state_plan,
-            "state",
-        )
-
-        action_plan = self._require_eager_plan(
-            self._action_plan,
-            "action",
-        )
-
-        assert self._state_position_ids is not None
-        assert self._action_position_ids is not None
-        assert self._state_write_indices is not None
-        assert self._action_write_indices is not None
-
-        graph_state.state_plan.paged_kv_indices.copy_(state_plan.paged_kv_indices)
-
-        graph_state.action_plan.paged_kv_indices.copy_(action_plan.paged_kv_indices)
-
-        graph_state.state_position_ids.copy_(self._state_position_ids)
-
-        graph_state.action_position_ids.copy_(self._action_position_ids)
-
-        graph_state.state_write_indices.copy_(self._state_write_indices)
-
-        graph_state.action_write_indices.copy_(self._action_write_indices)
-
-    def forward_euler(
-        self,
-        state: torch.Tensor,
-        noise: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run all Euler steps eagerly or replay CUDA graph."""
-
-        required = (
-            self._state_plan,
-            self._action_plan,
-            self._state_position_ids,
-            self._action_position_ids,
-            self._state_write_indices,
-            self._action_write_indices,
-        )
-
-        if any(value is None for value in required):
-            raise RuntimeError("plan_inference must be called before the Euler loop.")
-
-        batch_size = int(state.shape[0])
-
-        state_plan = self._require_eager_plan(
-            self._state_plan,
-            "state",
-        )
-
-        action_plan = self._require_eager_plan(
-            self._action_plan,
-            "action",
-        )
-
-        if not self.use_cuda_graph:
-            return self._euler_loop(
-                state=state,
-                noise=noise,
-                state_plan=state_plan,
-                action_plan=action_plan,
-                state_position_ids=(self._state_position_ids),
-                action_position_ids=(self._action_position_ids),
-                state_write_indices=(self._state_write_indices),
-                action_write_indices=(self._action_write_indices),
-            )
-
-        key = self._current_graph_key(
-            state,
-            noise,
-        )
-
-        if key in self._failed_graph_keys:
-            return self._euler_loop(
-                state=state,
-                noise=noise,
-                state_plan=state_plan,
-                action_plan=action_plan,
-                state_position_ids=(self._state_position_ids),
-                action_position_ids=(self._action_position_ids),
-                state_write_indices=(self._state_write_indices),
-                action_write_indices=(self._action_write_indices),
-            )
-
-        graph_state = self._euler_graphs.get(key)
-
-        if graph_state is None:
-            logger.info(
-                "Capturing LingBot V2 full %d-step Euler CUDA graph for batch_size=%d.",
-                self.num_inference_steps,
-                batch_size,
-            )
-
-            try:
-                graph_state = self._capture_euler_graph(
-                    state,
-                    noise,
+        if self.use_cuda_graph and key not in self._failed_graph_keys:
+            graph_state = self._euler_graphs.get(key)
+            if graph_state is None:
+                try:
+                    graph_state = self._capture_euler_graph(inputs)
+                except (CudaGraphError, RuntimeError) as error:
+                    self._failed_graph_keys.add(key)
+                    logger.warning_once(
+                        "LingBot V2 Euler graph capture failed; using uncaptured execution: %s",
+                        error,
+                    )
+                else:
+                    self._euler_graphs[key] = graph_state
+            if graph_state is not None:
+                assert (
+                    self._state_metadata is not None
+                    and self._action_metadata is not None
                 )
-
-            except (
-                CudaGraphError,
-                RuntimeError,
-            ) as error:
-                self._failed_graph_keys.add(key)
-
-                logger.warning(
-                    "LingBot V2 CUDA Graph capture "
-                    "failed for batch_size=%d; "
-                    "falling back to eager Euler "
-                    "execution: %s",
-                    batch_size,
-                    error,
+                self.state_backend.replay_metadata(
+                    graph_state.state_plan, self._state_metadata
                 )
-
-                return self._euler_loop(
-                    state=state,
-                    noise=noise,
-                    state_plan=state_plan,
-                    action_plan=action_plan,
-                    state_position_ids=(self._state_position_ids),
-                    action_position_ids=(self._action_position_ids),
-                    state_write_indices=(self._state_write_indices),
-                    action_write_indices=(self._action_write_indices),
+                self.action_backend.replay_metadata(
+                    graph_state.action_plan, self._action_metadata
                 )
-
-            self._euler_graphs[key] = graph_state
-
-        self._refresh_graph_metadata(graph_state)
-
-        return graph_state.graph.replay(
-            {
-                "state": state,
-                "noise": noise,
-            }
+                return graph_state.graph.replay(inputs)
+        return self._euler_loop(
+            state_plan=self._state_plan, action_plan=self._action_plan, **inputs
         )
 
     @property
     def cuda_graph_active(self) -> bool:
-        """Whether at least one Euler graph was captured."""
-
         return self.use_cuda_graph and bool(self._euler_graphs)
 
     @property
     def cuda_graph_count(self) -> int:
-        """Number of fixed-layout Euler graphs."""
-
         return len(self._euler_graphs)
 
     @property
-    def cuda_graph_fallback_count(
-        self,
-    ) -> int:
-        """Number of layouts that fell back to eager."""
-
+    def cuda_graph_fallback_count(self) -> int:
         return len(self._failed_graph_keys)
 
     def close(self) -> None:
-        """Release expert backends and graph state."""
-
+        """Release condition tables, graph state, and attention backends."""
         self.reset()
-
         self._euler_graphs.clear()
         self._failed_graph_keys.clear()
-
+        self._step_conditions = ()
+        self._time_schedule = None
+        self._dt = None
         _close_backend(self.state_backend, self.action_backend)
 
 

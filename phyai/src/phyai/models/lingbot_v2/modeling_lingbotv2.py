@@ -1,24 +1,19 @@
-"""LingBot-VLA 2.0 inference model modules.
-
-This file owns only weight-bearing modules and tensor-geometry helpers.
-Runners own attention planning, condition caching, and KV-cache storage;
-the WS1 scheduler owns request packing and Euler integration.
-"""
+"""LingBot-VLA 2.0 text and action modules."""
 
 from __future__ import annotations
 
 import math
 import itertools
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+from phyai_kernel.triton.lingbot_norm import lingbot_adarmsnorm
 
 import phyai.parallel as P
+from phyai.layers.activation import SiLU
 from phyai.layers.mlp import DenseMLP
 from phyai.kernel.call import CallSite
-from phyai.layers.conv import Conv3d
 from phyai.layers.quant import Bf16Spec
 from phyai.engine_config import get_engine_config, resolve_params_dtype
 from phyai.layers.linear import (
@@ -29,29 +24,20 @@ from phyai.layers.linear import (
 )
 from phyai.parallel.state import resolve_mesh
 from phyai.weights.shards import _Leg, fused, sharded, replicated
-from phyai.layers.layer_norm import RMSNorm, LayerNorm
+from phyai.models.lingbot_v2.norm import LingBotV2RMSNorm
 from phyai.layers.attention.paged import PagedAttnCtx, PagedAttention
 from phyai.layers.rotary_embedding import (
     InterleavedMRotaryEmbedding,
 )
-from phyai.layers.transformer_block import TransformerBlock
 from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
-from phyai.layers.attention.nocache.layer import Attention
-from phyai.layers.backbones.qwen3_vl.modeling import (
-    Qwen3VLVisionRotaryEmbedding,
-    apply_rotary_pos_emb_vision,
-)
+from phyai.models.lingbot_v2.vision import Qwen3VLVisionModel
 from phyai.models.lingbot_v2.configuration_lingbotv2 import (
     LingBotVLA2Config,
     Qwen3VLTextConfig,
     LingBotV2MoEConfig,
-    Qwen3VLVisionConfig,
     LingBotV2ExpertConfig,
     LingBotV2FlowMatchingConfig,
 )
-
-if TYPE_CHECKING:
-    from phyai.layers.attention import PagedAttnCtx
 
 
 def _official_topk_router(
@@ -78,672 +64,146 @@ def _official_topk_router(
     return routing_weights, selected_experts
 
 
-def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
-    """Per-frame attention boundaries (``cu_seqlens``) for the packed patches.
-
-    The vision tower flattens every image / video frame into one ragged sequence
-    of patches and runs **block-diagonal** attention: each temporal frame (an
-    ``h * w`` patch block) is its own window, so a patch only attends to patches
-    of the *same* frame, never across frames. This returns the cumulative-offset
-    ``indptr`` marking those frame boundaries -- exactly the ``cu_seqlens`` the
-    attention op consumes (``self.attn(..., cu_seqlens_q=cu, cu_seqlens_kv=cu)``).
-
-    Parameters
-    ----------
-    grid_thw:
-        ``(num_images, 3)`` int tensor; row ``i`` is ``(t, h, w)`` for image /
-        video ``i`` in **patch** units -- ``t`` temporal frames, each ``h * w``
-        patches. A still image has ``t = 1``; a video has ``t > 1``.
-
-    Returns
-    -------
-    cu_seqlens:
-        ``(num_frames + 1,)`` int32, ``num_frames = sum(t_i)``. Standard indptr
-        ``[0, len_0, len_0 + len_1, ...]``; frame ``f`` occupies the packed slice
-        ``[cu[f], cu[f + 1])`` and the final entry is the total patch count.
-
-    Example
-    -------
-    ``grid_thw = [[1, 2, 2], [2, 2, 3]]`` -- one image (1 frame, 2x2) plus one
-    video (2 frames, 2x3):
-
-    1. ``grid_thw[:, 1] * grid_thw[:, 2]`` -> patches per frame, per image:
-       ``[4, 6]``.
-    2. ``repeat_interleave(..., grid_thw[:, 0])`` repeats each by its frame count
-       ``t`` -> per-frame counts ``[4, 6, 6]`` (the image's 1 frame, then the
-       video's 2 frames).
-    3. ``cumsum`` -> per-frame end offsets ``[4, 10, 16]``.
-    4. ``F.pad(..., (1, 0))`` prepends 0 -> ``[0, 4, 10, 16]``.
-
-    16 patches pack into 3 windows: frame 0 ``[0, 4)`` (image), frame 1 ``[4, 10)``
-    and frame 2 ``[10, 16)`` (the video's two frames, mutually invisible). A
-    single-frame image collapses to ``[0, h*w]`` -- one window, a no-op block mask.
-    """
-    # Patches per frame (h * w), repeated once per temporal frame (t), then
-    # accumulated into running per-frame end-offsets.
-    cu = torch.repeat_interleave(
-        grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-    ).cumsum(dim=0, dtype=torch.int32)
-    # Prepend 0 -> standard indptr [0, len_0, len_0 + len_1, ...].
-    return F.pad(cu, (1, 0), value=0)
-
-
-def get_vision_position_ids(
-    grid_thw: torch.Tensor, spatial_merge_size: int
-) -> torch.Tensor:
-    """(row, col) position ids per patch for the axial 2-D vision RoPE.
-
-    Returns ``(total_patches, 2)`` long. Within each image the patches are laid
-    out in spatial-merge-block order so the merger's ``view(-1, merge**2 * C)``
-    groups the right 2x2 neighborhoods.
-    """
-    device = grid_thw.device
-    position_ids: list[torch.Tensor] = []
-    merge = spatial_merge_size
-    for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
-        hpos = torch.arange(h, device=device).unsqueeze(1).expand(-1, w)
-        hpos = (
-            hpos.reshape(h // merge, merge, w // merge, merge).transpose(1, 2).flatten()
-        )
-        wpos = torch.arange(w, device=device).unsqueeze(0).expand(h, -1)
-        wpos = (
-            wpos.reshape(h // merge, merge, w // merge, merge).transpose(1, 2).flatten()
-        )
-        position_ids.append(torch.stack([hpos, wpos], dim=-1).repeat(t, 1))
-    return torch.cat(position_ids, dim=0)
-
-
-def get_vision_bilinear_indices_and_weights(
-    grid_thw: torch.Tensor, num_grid_per_side: int, spatial_merge_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bilinear-interpolation corner indices/weights into the learned pos-embed.
-
-    The learned position embedding is a square ``num_grid_per_side`` grid;
-    each patch position is bilinearly interpolated from its 4 grid corners.
-    Returns ``(4, total_patches)`` long indices and ``(4, total_patches)`` float
-    weights, reordered into spatial-merge-block order to match the patches.
-    """
-    side = num_grid_per_side
-    merge = spatial_merge_size
-    device = grid_thw.device
-    idx_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
-    weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
-    for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
-        h_grid = torch.linspace(0, side - 1, h, device=device)
-        w_grid = torch.linspace(0, side - 1, w, device=device)
-        h_floor = h_grid.int()
-        w_floor = w_grid.int()
-        h_ceil = (h_floor + 1).clamp(max=side - 1)
-        w_ceil = (w_floor + 1).clamp(max=side - 1)
-        h_frac = h_grid - h_floor
-        w_frac = w_grid - w_floor
-        h_floor_offset = h_floor * side
-        h_ceil_offset = h_ceil * side
-        corner_indices = [
-            (h_floor_offset[:, None] + w_floor[None, :]).flatten(),
-            (h_floor_offset[:, None] + w_ceil[None, :]).flatten(),
-            (h_ceil_offset[:, None] + w_floor[None, :]).flatten(),
-            (h_ceil_offset[:, None] + w_ceil[None, :]).flatten(),
-        ]
-        corner_weights = [
-            ((1 - h_frac)[:, None] * (1 - w_frac)[None, :]).flatten(),
-            ((1 - h_frac)[:, None] * w_frac[None, :]).flatten(),
-            (h_frac[:, None] * (1 - w_frac)[None, :]).flatten(),
-            (h_frac[:, None] * w_frac[None, :]).flatten(),
-        ]
-        h_idx = torch.arange(h, device=device).view(h // merge, merge)
-        w_idx = torch.arange(w, device=device).view(w // merge, merge)
-        reorder = (
-            (h_idx[:, :, None, None] * w + w_idx[None, None, :, :])
-            .transpose(1, 2)
-            .flatten()
-            .repeat(t)
-        )
-        for i in range(4):
-            idx_parts[i].append(corner_indices[i][reorder])
-            weight_parts[i].append(corner_weights[i][reorder])
-    bilinear_indices = torch.stack([torch.cat(p) for p in idx_parts])
-    bilinear_weights = torch.stack([torch.cat(p) for p in weight_parts])
-    return bilinear_indices, bilinear_weights
-
-
-class Qwen3VLVisionPatchEmbed(nn.Module):
-    """Full-patch Conv3D or its mathematically equivalent GEMM."""
+class Qwen3VLTextBlock(nn.Module):
+    """Qwen text block with FP32 Q/K/V and LingBot normalization."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLTextConfig,
+        layer_idx: int,
         *,
-        params_dtype: torch.dtype | None = None,
-        backend: str = "conv3d",
-        device: torch.device | str | None = None,
-        prefix: str = "",
+        rope: InterleavedMRotaryEmbedding,
+        params_dtype: torch.dtype,
+        device: torch.device | str,
+        prefix: str,
+        attn_backend: str | None,
+        causal: bool,
     ) -> None:
         super().__init__()
-        if backend not in {"conv3d", "gemm"}:
-            raise ValueError(
-                "vision patch-embed backend must be 'conv3d' or 'gemm', "
-                f"got {backend!r}."
-            )
-        self.backend = backend
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.embed_dim = config.hidden_size
-        kernel = (self.temporal_patch_size, self.patch_size, self.patch_size)
-        self.patch_vector_dim = self.in_channels * math.prod(kernel)
-        projection_prefix = f"{prefix}.proj" if prefix else ""
-        if backend == "conv3d":
-            self.proj = Conv3d(
-                self.in_channels,
-                self.embed_dim,
-                kernel_size=kernel,
-                stride=kernel,
-                bias=True,
-                dtype=params_dtype,
-                device=device,
-                prefix=projection_prefix,
-            )
-        else:
-            self.proj = ReplicatedLinear(
-                self.patch_vector_dim,
-                self.embed_dim,
-                bias=True,
-                params_dtype=params_dtype,
-                spec=Bf16Spec(),
-                device=device,
-                prefix=projection_prefix,
-            )
-
-            def _load_conv3d_weight_as_gemm(
-                parameter: nn.Parameter,
-                loaded: torch.Tensor,
-                _shard_id=None,
-            ) -> None:
-                if loaded.numel() != parameter.numel():
-                    raise ValueError(
-                        "PatchEmbed checkpoint weight has "
-                        f"{loaded.numel()} values, expected {parameter.numel()}."
-                    )
-                parameter.data.copy_(loaded.reshape(parameter.shape))
-
-            self.proj.weight.weight_loader = _load_conv3d_weight_as_gemm
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the selected Conv3D or flattened GEMM patch projection."""
-
-        target_dtype = self.proj.weight.dtype
-        if self.backend == "gemm":
-            hidden_states = hidden_states.reshape(-1, self.patch_vector_dim)
-            hidden_states, _ = self.proj(hidden_states.to(dtype=target_dtype))
-            return hidden_states
-
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
-        return hidden_states
-
-
-class Qwen3VLVisionPatchMerger(nn.Module):
-    """Merge ``spatial_merge_size**2`` patches into one ``out_hidden_size`` token.
-
-    Two norm placements: pre-shuffle (``use_postshuffle_norm=False``) norms the
-    per-patch ``hidden`` width before the view-merge (the main merger);
-    post-shuffle norms the merged ``hidden * merge**2`` width (the deepstack
-    mergers).
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLVisionConfig,
-        *,
-        use_postshuffle_norm: bool = False,
-        params_dtype: torch.dtype | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.merged_dim = config.hidden_size * (config.spatial_merge_size**2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        norm_dim = self.merged_dim if use_postshuffle_norm else config.hidden_size
-        if params_dtype is None:
-            params_dtype = get_engine_config().device.params_dtype
-        device = get_engine_config().device.target
-        self.norm = LayerNorm(
-            norm_dim,
-            eps=1e-6,
-            dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.norm" if prefix else "",
-            explicit_fp32_math=True,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.merged_dim,
-            self.merged_dim,
-            gather_output=False,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.linear_fc1" if prefix else "",
-        )
-        self.linear_fc2 = RowParallelLinear(
-            self.merged_dim,
-            config.out_hidden_size,
-            input_is_parallel=True,
-            reduce_results=True,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.linear_fc2" if prefix else "",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project and merge each spatial patch group into one token."""
-
-        x = self.norm(x.view(-1, self.merged_dim) if self.use_postshuffle_norm else x)
-        x = x.view(-1, self.merged_dim)
-        x, _ = self.linear_fc1(x)
-        x = F.gelu(x)
-        x, _ = self.linear_fc2(x)
-        return x
-
-
-class Qwen3VLVisionMLP(nn.Module):
-    """Plain ``fc1 -> act -> fc2`` MLP with bias."""
-
-    def __init__(
-        self,
-        config: Qwen3VLVisionConfig,
-        *,
-        params_dtype: torch.dtype | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.linear_fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            gather_output=False,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.linear_fc1" if prefix else "",
-        )
-        self.linear_fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            input_is_parallel=True,
-            reduce_results=True,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.linear_fc2" if prefix else "",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the two-layer vision feed-forward network."""
-
-        x, _ = self.linear_fc1(x)
-        x = F.gelu(x, approximate="tanh")
-        x, _ = self.linear_fc2(x)
-        return x
-
-
-class Qwen3VLVisionAttention(nn.Module):
-    """Non-causal self-attention for ragged Qwen3-VL image grids."""
-
-    def __init__(
-        self,
-        config: Qwen3VLVisionConfig,
-        *,
-        params_dtype: torch.dtype | None = None,
-        attn_backend: str = "flashinfer",
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.dim = config.hidden_size
-        self.num_heads = config.num_heads
-        self.head_dim = self.dim // self.num_heads
-        self.qkv = ColumnParallelLinear(
-            self.dim,
-            self.dim * 3,
-            output_sizes=[self.dim, self.dim, self.dim],
-            gather_output=False,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.qkv" if prefix else "",
-        )
-        self.num_heads_local = self.qkv.output_partition_sizes[0] // self.head_dim
-        self.proj = RowParallelLinear(
-            self.dim,
-            self.dim,
-            input_is_parallel=True,
-            reduce_results=True,
-            bias=True,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.proj" if prefix else "",
-        )
-        self.attn = Attention(
-            num_heads=self.num_heads_local,
-            head_dim=self.head_dim,
-            causal=False,
-            backend=attn_backend,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Apply rotary self-attention independently to each image sequence."""
-
-        seq_length = hidden_states.shape[0]
-        qkv, _ = self.qkv(hidden_states)
-        q, k, v = (
-            qkv.reshape(seq_length, 3, self.num_heads_local, self.head_dim)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )  # each (seq, num_heads, head_dim)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-        # Attention expects ragged 3-D (N, H, D) with cu_seqlens for the
-        # block-diagonal per-frame mask.
-        out = self.attn(q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens)
-        out = out.reshape(seq_length, -1)
-        out, _ = self.proj(out)
-        return out
-
-
-class Qwen3VLVisionBlock(nn.Module):
-    """Prenorm ViT block: ``h + attn(ln1(h))`` then ``h + mlp(ln2(h))``."""
-
-    def __init__(
-        self,
-        config: Qwen3VLVisionConfig,
-        *,
-        params_dtype: torch.dtype | None = None,
-        attn_backend: str = "flashinfer",
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if params_dtype is None:
-            params_dtype = get_engine_config().device.params_dtype
-        device = get_engine_config().device.target
-        self.norm1 = LayerNorm(
+        self.layer_idx = layer_idx
+        self.head_dim = config.head_dim
+        self.rope = rope
+        attn_prefix = f"{prefix}.self_attn"
+        self.input_norm = LingBotV2RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.norm1" if prefix else "",
-            explicit_fp32_math=True,
-        )
-        self.norm2 = LayerNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.norm2" if prefix else "",
-            explicit_fp32_math=True,
-        )
-        self.attn = Qwen3VLVisionAttention(
-            config,
-            params_dtype=params_dtype,
-            attn_backend=attn_backend,
-            prefix=f"{prefix}.attn" if prefix else "",
-        )
-        self.mlp = Qwen3VLVisionMLP(
-            config,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.mlp" if prefix else "",
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Run one residual vision transformer block."""
-
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-
-
-class Qwen3VLVisionModel(nn.Module):
-    """Qwen3-VL native ViT vision tower."""
-
-    def __init__(
-        self,
-        config: Qwen3VLVisionConfig,
-        *,
-        params_dtype: torch.dtype | None = None,
-        attn_backend: str | None = None,
-        patch_embed_backend: str = "conv3d",
-        device: torch.device | str | None = None,
-        prefix: str = "visual",
-    ) -> None:
-        super().__init__()
-        params_dtype = resolve_params_dtype(params_dtype)
-        if device is None:
-            device = get_engine_config().device.target
-        self.config = config
-        self.prefix = prefix
-        self.spatial_merge_size = config.spatial_merge_size
-        self.spatial_merge_unit = config.spatial_merge_unit
-        self.num_grid_per_side = config.num_grid_per_side
-        self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
-
-        self.patch_embed = Qwen3VLVisionPatchEmbed(
-            config,
-            params_dtype=params_dtype,
-            backend=patch_embed_backend,
-            device=device,
-            prefix=f"{prefix}.patch_embed" if prefix else "",
-        )
-        # Learned position embedding table -- a plain replicated parameter,
-        # indexed by bilinear corner ids (not a vocab-parallel token lookup).
-        self.pos_embed_weight = nn.Parameter(
-            torch.zeros(
-                config.num_position_embeddings,
-                config.hidden_size,
-                dtype=params_dtype,
-                device=device,
-            ),
-            requires_grad=False,
-        )
-        if prefix:
-            self.pos_embed_weight.hf_keys = [(f"{prefix}.pos_embed.weight", None)]
-            self.pos_embed_weight.weight_loader = replicated()
-
-        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(
-            config.head_dim // 2,
-            dtype=params_dtype,
-            device=device,
-        )
-        self.blocks = nn.ModuleList(
-            [
-                Qwen3VLVisionBlock(
-                    config,
-                    params_dtype=params_dtype,
-                    attn_backend=attn_backend,
-                    prefix=f"{prefix}.blocks.{i}" if prefix else "",
-                )
-                for i in range(config.depth)
-            ]
-        )
-        self.merger = Qwen3VLVisionPatchMerger(
-            config,
-            use_postshuffle_norm=False,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.merger" if prefix else "",
-        )
-        self.deepstack_merger_list = nn.ModuleList(
-            [
-                Qwen3VLVisionPatchMerger(
-                    config,
-                    use_postshuffle_norm=True,
-                    params_dtype=params_dtype,
-                    prefix=f"{prefix}.deepstack_merger_list.{j}" if prefix else "",
-                )
-                for j in range(len(self.deepstack_visual_indexes))
-            ]
-        )
-
-    @property
-    def dtype(self) -> torch.dtype:
-        """Return the dtype used by the learned vision parameters."""
-
-        return self.pos_embed_weight.dtype
-
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Returns ``(merged_tokens, deepstack_features)``.
-
-        ``merged_tokens``: ``(num_patches // merge**2, out_hidden_size)``.
-        ``deepstack_features``: list of the same-shaped per-tap features.
-        """
-        bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
-            grid_thw, self.num_grid_per_side, self.spatial_merge_size
-        )
-        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size)
-        cu_seqlens = get_vision_cu_seqlens(grid_thw)
-
-        hidden_states = self.patch_embed(hidden_states)
-        bilinear_weights = bilinear_weights.to(self.pos_embed_weight.dtype)
-        pos_embeds = (
-            self.pos_embed_weight[bilinear_indices] * bilinear_weights[:, :, None]
-        ).sum(0)
-        hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
-
-        rotary_pos_emb = self.rotary_pos_emb(position_ids)
-        seq_len = hidden_states.shape[0]
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-
-        deepstack_feature_lists: list[torch.Tensor] = []
-        for layer_num, block in enumerate(self.blocks):
-            hidden_states = block(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-            )
-            if layer_num in self.deepstack_visual_indexes:
-                index = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature_lists.append(
-                    self.deepstack_merger_list[index](hidden_states)
-                )
-
-        merged_hidden_states = self.merger(hidden_states)
-        return merged_hidden_states, deepstack_feature_lists
-
-
-class Qwen3VLTextBlock(TransformerBlock):
-    """Qwen text block with the official FP32 joint-attention boundary."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        params_dtype = kwargs.get("params_dtype")
-        prefix = kwargs.get("prefix", "")
-        norm_eps = kwargs.get("norm_eps", 1e-6)
-        super().__init__(*args, **kwargs)
-        if params_dtype is None:
-            params_dtype = get_engine_config().device.params_dtype
-        device = get_engine_config().device.target
-        self.input_norm = RMSNorm(
-            self.hidden_size,
-            eps=norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.input_layernorm",
-            cast_before_affine=True,
-            explicit_fp32_math=True,
         )
-        self.pre_ff_norm = RMSNorm(
-            self.hidden_size,
-            eps=norm_eps,
+        self.pre_ff_norm = LingBotV2RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.post_attention_layernorm",
-            cast_before_affine=True,
-            explicit_fp32_math=True,
         )
-        if self.attn_qk_norm_enabled:
-            self.q_norm = RMSNorm(
-                self.head_dim,
-                eps=norm_eps,
-                dtype=params_dtype,
-                device=device,
-                prefix=f"{prefix}.self_attn.q_norm",
-                cast_before_affine=True,
-                explicit_fp32_math=True,
-            )
-            self.k_norm = RMSNorm(
-                self.head_dim,
-                eps=norm_eps,
-                dtype=params_dtype,
-                device=device,
-                prefix=f"{prefix}.self_attn.k_norm",
-                cast_before_affine=True,
-                explicit_fp32_math=True,
-            )
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            bias=config.attention_bias,
+            params_dtype=params_dtype,
+            device=device,
+            prefix=f"{attn_prefix}.qkv_proj",
+        )
+        q_width, k_width, _ = self.qkv_proj.output_partition_sizes
+        self.q_heads_local = q_width // config.head_dim
+        self.kv_heads_local = k_width // config.head_dim
+        self.q_norm = LingBotV2RMSNorm(
+            config.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=params_dtype,
+            device=device,
+            prefix=f"{attn_prefix}.q_norm",
+        )
+        self.k_norm = LingBotV2RMSNorm(
+            config.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=params_dtype,
+            device=device,
+            prefix=f"{attn_prefix}.k_norm",
+        )
+        self.attn = PagedAttention(
+            num_heads=self.q_heads_local,
+            num_kv_heads=self.kv_heads_local,
+            head_dim=config.head_dim,
+            layer_id=layer_idx,
+            causal=causal,
+            backend=attn_backend,
+            kernel_role="prefix",
+        )
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            group="attention_tp",
+            input_is_parallel=True,
+            bias=config.attention_bias,
+            params_dtype=params_dtype,
+            device=device,
+            prefix=f"{attn_prefix}.o_proj",
+        )
+        self.mlp = DenseMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            activation=config.hidden_act,
+            gated=True,
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            prefix=f"{prefix}.mlp",
+        )
+
+    def project_qkv(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused, _ = self.qkv_proj(self.input_norm(x))
+        q, k, v = fused.split(self.qkv_proj.output_partition_sizes, dim=-1)
+        leading = x.shape[:-1]
+        return (
+            q.reshape(*leading, self.q_heads_local, self.head_dim),
+            k.reshape(*leading, self.kv_heads_local, self.head_dim),
+            v.reshape(*leading, self.kv_heads_local, self.head_dim),
+        )
+
+    def prefix_kv(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Produce the final prefix K/V without attention or feed-forward output."""
+        _, k, v = self.project_qkv(x)
+        k = self.k_norm(k).float()
+        _, k = self.rope.apply(k, k, cos, sin)
+        return (
+            k.reshape(-1, self.kv_heads_local, self.head_dim),
+            v.reshape(-1, self.kv_heads_local, self.head_dim).float(),
+        )
 
     def forward(
         self,
         x: torch.Tensor,
         *,
-        positions: torch.Tensor | None = None,
-        attn_ctx=None,
-        cu_seqlens_q: torch.Tensor | None = None,
-        cu_seqlens_kv: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
-        """Run one text transformer block with the supplied attention context."""
-
-        residual = x
-        hidden_states = self.input_norm(x)
-        fused, _ = self.qkv_proj(hidden_states)
-        q_dim = self.q_heads_local * self.head_dim
-        kv_dim = self.kv_heads_local * self.head_dim
-        q, k, v = fused.split([q_dim, kv_dim, kv_dim], dim=-1)
-        leading = x.shape[:-1]
-        q = self.q_norm(q.reshape(*leading, self.q_heads_local, self.head_dim)).float()
-        k = self.k_norm(k.reshape(*leading, self.kv_heads_local, self.head_dim)).float()
-        v = v.reshape(*leading, self.kv_heads_local, self.head_dim).float()
-        q, k = self._apply_rope(q, k, positions, cos, sin)
-        attn_out = self._attn_forward(
-            q,
-            k,
-            v,
+        q, k, v = self.project_qkv(x)
+        q, k = self.rope.apply(self.q_norm(q).float(), self.k_norm(k).float(), cos, sin)
+        attn_out = self.attn(
+            q.reshape(-1, self.q_heads_local, self.head_dim),
+            k.reshape(-1, self.kv_heads_local, self.head_dim),
+            v.reshape(-1, self.kv_heads_local, self.head_dim).float(),
             attn_ctx,
-            cu_seqlens_q,
-            cu_seqlens_kv,
         )
-        attn_flat = attn_out.reshape(
-            *attn_out.shape[:-2], self.q_heads_local * self.head_dim
-        ).to(self.o_proj.weight.dtype)
-        out, _ = self.o_proj(attn_flat)
-        hidden_states = residual + self.post_attn_norm(out)
-
-        residual = hidden_states
-        hidden_states = self.pre_ff_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_ff_norm(hidden_states)
-        return residual + hidden_states
+        out, _ = self.o_proj(
+            attn_out.reshape(*x.shape[:-1], -1).to(self.o_proj.weight.dtype)
+        )
+        hidden_states = x + out
+        return hidden_states + self.mlp(self.pre_ff_norm(hidden_states))
 
 
 class Qwen3VLTextModel(nn.Module):
-    """Qwen3 decoder with interleaved 3-D M-RoPE + DeepStack injection."""
+    """Qwen3 prefix decoder with M-RoPE and DeepStack features."""
 
     def __init__(
         self,
@@ -751,27 +211,21 @@ class Qwen3VLTextModel(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
-        norm_backend: str | None = None,
         device: torch.device | str | None = None,
         prefix: str = "model.language_model",
-        text_attn_kind: str = "attention",
         attn_causal: bool = True,
     ) -> None:
         super().__init__()
         params_dtype = resolve_params_dtype(params_dtype)
-        if device is None:
-            device = get_engine_config().device.target
+        device = device if device is not None else get_engine_config().device.target
         self.config = config
-        self.prefix = prefix
-        self.text_attn_kind = text_attn_kind
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             params_dtype=params_dtype,
-            prefix=f"{prefix}.embed_tokens" if prefix else "",
+            device=device,
+            prefix=f"{prefix}.embed_tokens",
         )
-        # TODO(wch): rope kernel can be fused here. currently fail back to eager.
         self.rotary_emb = InterleavedMRotaryEmbedding(
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
@@ -779,61 +233,51 @@ class Qwen3VLTextModel(nn.Module):
             rope_theta=config.rope_theta,
             backend="eager",
             device=device,
-        )
-        self.rotary_emb.to(dtype=params_dtype)
-        layer_prefix = f"{prefix}.layers" if prefix else ""
+        ).to(dtype=params_dtype)
         self.layers = nn.ModuleList(
             [
                 Qwen3VLTextBlock(
-                    hidden_size=config.hidden_size,
-                    num_heads=config.num_attention_heads,
-                    num_kv_heads=config.num_key_value_heads,
-                    head_dim=config.head_dim,
-                    intermediate_size=config.intermediate_size,
-                    attn_kind=text_attn_kind,
-                    layer_idx=i,
-                    attn_causal=attn_causal,
-                    attn_bias=config.attention_bias,
-                    attn_qk_norm=True,
+                    config,
+                    i,
                     rope=self.rotary_emb,
-                    precompute_rope=True,
-                    mlp_gated=True,
-                    mlp_activation=config.hidden_act,
-                    mlp_bias=False,
-                    norm_type="rmsnorm",
-                    norm_eps=config.rms_norm_eps,
-                    attn_backend=attn_backend,
-                    norm_backend=norm_backend,
                     params_dtype=params_dtype,
-                    prefix=f"{layer_prefix}.{i}" if layer_prefix else "",
+                    device=device,
+                    prefix=f"{prefix}.layers.{i}",
+                    attn_backend=attn_backend,
+                    causal=attn_causal,
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
+        self.norm = LingBotV2RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
-            prefix=f"{prefix}.norm" if prefix else "",
-            cast_before_affine=True,
-            explicit_fp32_math=True,
+            prefix=f"{prefix}.norm",
         )
 
-    @staticmethod
-    def _deepstack_process(
+    def _run_layers(
+        self,
         hidden_states: torch.Tensor,
-        visual_pos_masks: torch.Tensor,
-        visual_embeds: torch.Tensor,
+        layers: Iterable[Qwen3VLTextBlock],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_ctx: PagedAttnCtx,
+        visual_token_indices: torch.Tensor | None,
+        deepstack_visual_embeds: list[torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Add a deepstack feature onto the visual-token positions only."""
-        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
-        visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        # No need to clone in inference framework
-        # hidden_states = hidden_states.clone()
-        hidden_states[visual_pos_masks, :] = (
-            hidden_states[visual_pos_masks, :] + visual_embeds
-        )
+        for layer_idx, layer in enumerate(layers):
+            hidden_states = layer(hidden_states, cos=cos, sin=sin, attn_ctx=attn_ctx)
+            if (
+                deepstack_visual_embeds is not None
+                and visual_token_indices is not None
+                and layer_idx < len(deepstack_visual_embeds)
+            ):
+                visual_features = deepstack_visual_embeds[layer_idx].to(hidden_states)
+                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                flat.index_add_(0, visual_token_indices, visual_features)
+                hidden_states = flat.view(hidden_states.shape)
         return hidden_states
 
     def forward(
@@ -842,31 +286,46 @@ class Qwen3VLTextModel(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: PagedAttnCtx | None = None,
-        visual_pos_masks: torch.Tensor | None = None,
+        attn_ctx: PagedAttnCtx,
+        visual_token_indices: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """The caller computes ``(cos, sin)`` once via
-        :meth:`RotaryEmbedding.get_cos_sin` and threads them through every layer.
-        """
-        if inputs_embeds.dim() == 2 and cos.dim() > 2:
-            cos = cos.reshape(-1, cos.shape[-1])
-            sin = sin.reshape(-1, sin.shape[-1])
-
-        hidden_states = inputs_embeds
-        for layer_idx, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, cos=cos, sin=sin, attn_ctx=attn_ctx)
-            if (
-                deepstack_visual_embeds is not None
-                and visual_pos_masks is not None
-                and layer_idx < len(deepstack_visual_embeds)
-            ):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
-                )
+        cos = cos.reshape(*inputs_embeds.shape[:-1], -1)
+        sin = sin.reshape(*inputs_embeds.shape[:-1], -1)
+        hidden_states = self._run_layers(
+            inputs_embeds,
+            self.layers,
+            cos,
+            sin,
+            attn_ctx,
+            visual_token_indices,
+            deepstack_visual_embeds,
+        )
         return self.norm(hidden_states)
+
+    def prefill(
+        self,
+        inputs_embeds: torch.Tensor,
+        *,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_ctx: PagedAttnCtx,
+        visual_token_indices: torch.Tensor | None = None,
+        deepstack_visual_embeds: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the prefix and return the final layer's K/V for the runner to store."""
+        cos = cos.reshape(*inputs_embeds.shape[:-1], -1)
+        sin = sin.reshape(*inputs_embeds.shape[:-1], -1)
+        hidden_states = self._run_layers(
+            inputs_embeds,
+            itertools.islice(self.layers, len(self.layers) - 1),
+            cos,
+            sin,
+            attn_ctx,
+            visual_token_indices,
+            deepstack_visual_embeds,
+        )
+        return self.layers[-1].prefix_kv(hidden_states, cos, sin)
 
 
 class LingBotV2AdaRMSNorm(nn.Module):
@@ -879,10 +338,10 @@ class LingBotV2AdaRMSNorm(nn.Module):
         *,
         eps: float,
         params_dtype: torch.dtype,
+        device: torch.device | str,
         prefix: str,
     ) -> None:
         super().__init__()
-        device = get_engine_config().device.target
         self.variance_epsilon = eps
         self.weight = nn.Parameter(
             torch.ones(hidden_size, dtype=params_dtype, device=device),
@@ -895,6 +354,7 @@ class LingBotV2AdaRMSNorm(nn.Module):
             hidden_size,
             bias=True,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.gamma",
         )
         self.beta = ReplicatedLinear(
@@ -902,10 +362,11 @@ class LingBotV2AdaRMSNorm(nn.Module):
             hidden_size,
             bias=True,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.beta",
         )
 
-        # The official implementation starts as an ordinary RMSNorm.
+        # Zero modulation initializes this layer as a weighted RMSNorm.
         with torch.no_grad():
             self.gamma.weight.zero_()
             if self.gamma.bias is not None:
@@ -931,19 +392,13 @@ class LingBotV2AdaRMSNorm(nn.Module):
     ) -> torch.Tensor:
         """Apply RMS normalization modulated by the diffusion condition."""
 
-        input_dtype = hidden_states.dtype
-        normed = hidden_states.float()
-        variance = normed.square().mean(dim=-1, keepdim=True)
-        normed = normed * torch.rsqrt(variance + self.variance_epsilon)
-        normed = self.weight.float() * normed
         if modulation is None:
             gamma, beta = self.compute_modulation(cond)
         else:
             gamma, beta = modulation
-        while gamma.dim() < normed.dim():
-            gamma = gamma.unsqueeze(-2)
-            beta = beta.unsqueeze(-2)
-        return ((1.0 + gamma.float()) * normed + beta.float()).to(input_dtype)
+        return lingbot_adarmsnorm(
+            hidden_states, self.weight, gamma, beta, eps=self.variance_epsilon
+        )
 
 
 class LingBotV2TokenMoE(nn.Module):
@@ -990,18 +445,14 @@ class LingBotV2TokenMoE(nn.Module):
             hidden_size,
             config.num_experts,
             bias=config.router_bias,
-            # Official BF16 deployment stores the gate in BF16, then promotes
-            # both operands for the routing GEMM.
             params_dtype=params_dtype,
+            out_dtype=torch.float32,
             spec=Bf16Spec(),
             device=device,
             prefix=f"{prefix}.gate",
             kernel_role="router",
         )
         mesh = resolve_mesh("model")
-        # `forward` runs the tensor-parallel collective, so the mesh has to
-        # outlive `__init__`; keeping it as a local alone made the
-        # `tp_size > 1` branch raise NameError at the first step.
         self.mesh = mesh
         self.tp_size = mesh.group_size("moe_tp")
         self.tp_rank = mesh.group_rank("moe_tp")
@@ -1091,6 +542,7 @@ class LingBotV2TokenMoE(nn.Module):
             gated=True,
             bias=False,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.shared_expert",
         )
 
@@ -1099,7 +551,7 @@ class LingBotV2TokenMoE(nn.Module):
 
         original_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, original_shape[-1])
-        router_logits, _ = self.gate(hidden_flat.float())
+        router_logits, _ = self.gate(hidden_flat)
         routing_weights, selected_experts = _official_topk_router(
             router_logits,
             self.e_score_correction_bias.float(),
@@ -1144,7 +596,7 @@ class LingBotV2ExpertLayer(nn.Module):
         layer_idx: int,
         *,
         params_dtype: torch.dtype,
-        attn_backend: str,
+        attn_backend: str | None,
         device: torch.device | str,
         prefix: str,
     ) -> None:
@@ -1158,6 +610,7 @@ class LingBotV2ExpertLayer(nn.Module):
             config.adarms_cond_dim,
             eps=config.rms_norm_eps,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.input_layernorm",
         )
         self.qkv_proj = QKVParallelLinear(
@@ -1167,6 +620,7 @@ class LingBotV2ExpertLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             bias=config.qkv_bias,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{attn_prefix}.qkv_proj",
         )
         q_width, k_width, _ = self.qkv_proj.output_partition_sizes
@@ -1175,8 +629,10 @@ class LingBotV2ExpertLayer(nn.Module):
         self.o_proj = RowParallelLinear(
             in_features=config.joint_attention_dim,
             out_features=config.hidden_size,
+            group="attention_tp",
             bias=config.output_bias,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{attn_prefix}.o_proj",
         )
         self.attn = PagedAttention(
@@ -1186,12 +642,14 @@ class LingBotV2ExpertLayer(nn.Module):
             num_kv_heads=self.kv_heads_local,
             causal=False,
             backend=attn_backend,
+            kernel_role="expert",
         )
         self.post_attention_layernorm = LingBotV2AdaRMSNorm(
             config.hidden_size,
             config.adarms_cond_dim,
             eps=config.rms_norm_eps,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.post_attention_layernorm",
         )
         if layer_idx in moe_config.layer_indices:
@@ -1210,6 +668,7 @@ class LingBotV2ExpertLayer(nn.Module):
                 gated=True,
                 bias=False,
                 params_dtype=params_dtype,
+                device=device,
                 prefix=f"{prefix}.mlp",
             )
 
@@ -1246,9 +705,7 @@ class LingBotV2ExpertLayer(nn.Module):
         # Official joint attention promotes every stream's Q/K/V before MRoPE.
         q, k, v = q.float(), k.float(), v.float()
         q, k = rope.apply(q, k, cos, sin)
-        # AdaRMSNorm keeps the action stream as (B, S, H), matching the
-        # official condition projection and token broadcast. Attention owns
-        # the ragged-token boundary and therefore receives flattened Q/K/V.
+        # Paged attention consumes flattened tokens; AdaNorm uses (B, S, H).
         q = q.reshape(-1, self.q_heads_local, self.head_dim)
         k = k.reshape(-1, self.kv_heads_local, self.head_dim)
         v = v.reshape(-1, self.kv_heads_local, self.head_dim)
@@ -1277,7 +734,7 @@ class LingBotV2ExpertStack(nn.Module):
         moe_config: LingBotV2MoEConfig,
         *,
         params_dtype: torch.dtype,
-        attn_backend: str,
+        attn_backend: str | None,
         device: torch.device | str,
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
@@ -1297,14 +754,12 @@ class LingBotV2ExpertStack(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
+        self.norm = LingBotV2RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm",
-            cast_before_affine=True,
-            explicit_fp32_math=True,
         )
 
 
@@ -1336,14 +791,13 @@ class LingBotV2ActionTimeHeads(nn.Module):
         flow_config: LingBotV2FlowMatchingConfig,
         *,
         params_dtype: torch.dtype,
+        device: torch.device | str,
         prefix: str = "model",
     ) -> None:
         super().__init__()
         self.expert_hidden = expert_config.hidden_size
         self.flow_config = flow_config
-        # These boundary projections stay replicated intentionally: their
-        # state/action side is only 55-wide and the expert stack consumes and
-        # returns a full residual tensor on every TP rank.
+        # Boundary projections consume and produce replicated residuals.
         replicated_specs = (
             ("state_proj", flow_config.max_state_dim, expert_config.hidden_size),
             ("action_in_proj", flow_config.max_action_dim, expert_config.hidden_size),
@@ -1358,6 +812,7 @@ class LingBotV2ActionTimeHeads(nn.Module):
                     out_features,
                     bias=True,
                     params_dtype=params_dtype,
+                    device=device,
                     prefix=f"{prefix}.{name}",
                 ),
             )
@@ -1367,6 +822,7 @@ class LingBotV2ActionTimeHeads(nn.Module):
             gather_output=False,
             bias=True,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.action_time_mlp_in",
         )
         self.action_time_mlp_out = RowParallelLinear(
@@ -1376,7 +832,18 @@ class LingBotV2ActionTimeHeads(nn.Module):
             reduce_results=True,
             bias=True,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.action_time_mlp_out",
+        )
+        self.activation = SiLU()
+        fraction = torch.linspace(
+            0.0, 1.0, self.expert_hidden // 2, dtype=torch.float32, device=device
+        )
+        min_period = flow_config.time_embedding_min_period
+        max_period = flow_config.time_embedding_max_period
+        period = min_period * (max_period / min_period) ** fraction
+        self.register_buffer(
+            "time_frequencies", 2.0 * math.pi / period, persistent=False
         )
 
     def embed_state(self, state: torch.Tensor) -> torch.Tensor:
@@ -1385,25 +852,28 @@ class LingBotV2ActionTimeHeads(nn.Module):
         out, _ = self.state_proj(state.to(self.state_proj.weight.dtype))
         return out
 
+    def time_condition(self, time: torch.Tensor) -> torch.Tensor:
+        phase = time.float().unsqueeze(1) * self.time_frequencies.unsqueeze(0)
+        return torch.cat([phase.sin(), phase.cos()], dim=-1).to(
+            self.action_in_proj.weight.dtype
+        )
+
+    def embed_action(self, actions: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        action_emb, _ = self.action_in_proj(
+            actions.to(self.action_in_proj.weight.dtype)
+        )
+        cond_tokens = cond.unsqueeze(1).expand(-1, action_emb.shape[1], -1)
+        fused = torch.cat([action_emb, cond_tokens], dim=-1)
+        fused, _ = self.action_time_mlp_in(fused)
+        fused, _ = self.action_time_mlp_out(self.activation(fused))
+        return fused
+
     def embed_action_time(
         self, actions: torch.Tensor, time: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Embed noisy actions and diffusion time into expert inputs."""
-
-        action_emb, _ = self.action_in_proj(
-            actions.to(self.action_in_proj.weight.dtype)
-        )
-        cond = create_sinusoidal_pos_embedding(
-            time,
-            self.expert_hidden,
-            min_period=self.flow_config.time_embedding_min_period,
-            max_period=self.flow_config.time_embedding_max_period,
-        ).to(action_emb.dtype)
-        cond_tokens = cond.unsqueeze(1).expand(-1, action_emb.shape[1], -1)
-        fused = torch.cat([action_emb, cond_tokens], dim=-1)
-        fused, _ = self.action_time_mlp_in(fused)
-        fused, _ = self.action_time_mlp_out(F.silu(fused))
-        return fused, cond
+        cond = self.time_condition(time)
+        return self.embed_action(actions, cond), cond
 
     def project_action(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project expert hidden states back to action coordinates."""
@@ -1467,9 +937,6 @@ class LingBotV2DualQuery(nn.Module):
             parameter.hf_keys = [(f"{prefix}.{name}", None)]
             parameter.weight_loader = replicated()
             setattr(self, name, parameter)
-        # Each rank starts from the same pooled query tensor. Row parallelism
-        # shards the wide 5120 input projection and reduces the full 2560-wide
-        # prefix token back onto every rank for the text stack.
         self.current_shared_task_proj = RowParallelLinear(
             config.query_hidden_size * 2,
             config.query_hidden_size,
@@ -1477,6 +944,7 @@ class LingBotV2DualQuery(nn.Module):
             reduce_results=True,
             bias=config.fusion_bias,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.current_shared_task_proj",
         )
         self.future_shared_task_proj = RowParallelLinear(
@@ -1486,6 +954,7 @@ class LingBotV2DualQuery(nn.Module):
             reduce_results=True,
             bias=config.fusion_bias,
             params_dtype=params_dtype,
+            device=device,
             prefix=f"{prefix}.future_shared_task_proj",
         )
 
@@ -1537,8 +1006,9 @@ def build_lingbot_v2_mrope_position_ids(
     image_token_id: int,
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    """Build Qwen3-VL ``(3, B, S)`` positions for packed LingBot prefixes."""
-
+    """Build CPU ``(3, B, S)`` positions from host-side prefix metadata."""
+    if any(t.device.type != "cpu" for t in (input_ids, attention_mask, image_grid_thw)):
+        raise ValueError("prefix position metadata must be on CPU")
     position_ids = torch.zeros(
         3, *input_ids.shape, dtype=torch.int64, device=input_ids.device
     )
@@ -1598,7 +1068,6 @@ class LingBotV2Model(nn.Module):
         vision_params_dtype: torch.dtype | None = None,
         vision_patch_embed_backend: str = "conv3d",
         attn_backend: str | None = None,
-        norm_backend: str | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
@@ -1606,11 +1075,6 @@ class LingBotV2Model(nn.Module):
         if device is None:
             device = get_engine_config().device.target
         vision_dtype = vision_params_dtype or params_dtype
-        if attn_backend not in (None, "flashinfer"):
-            raise NotImplementedError(
-                "LingBot V2 paged prefix/expert attention currently requires "
-                "FlashInfer-compatible paged attention."
-            )
         self.config = config
         self.params_dtype = params_dtype
         self.vision_params_dtype = vision_dtype
@@ -1626,10 +1090,8 @@ class LingBotV2Model(nn.Module):
             config.text,
             params_dtype=params_dtype,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
             device=device,
             prefix=self.TEXT_PREFIX,
-            text_attn_kind="paged",
             attn_causal=config.vlm_causal,
         )
         self.expert_stack = LingBotV2ExpertStack(
@@ -1648,6 +1110,7 @@ class LingBotV2Model(nn.Module):
             config.expert,
             config.flow_matching,
             params_dtype=params_dtype,
+            device=device,
         )
 
     @property
@@ -1700,19 +1163,7 @@ __all__ = [
     "LingBotV2ExpertStack",
     "LingBotV2Model",
     "LingBotV2TokenMoE",
-    "Qwen3VLTextModel",
-    "Qwen3VLVisionAttention",
-    "Qwen3VLVisionBlock",
-    "Qwen3VLVisionMLP",
-    "Qwen3VLVisionModel",
-    "Qwen3VLVisionPatchEmbed",
-    "Qwen3VLVisionPatchMerger",
-    "Qwen3VLVisionRotaryEmbedding",
-    "apply_rotary_pos_emb_vision",
     "build_lingbot_v2_mrope_position_ids",
     "create_sinusoidal_pos_embedding",
-    "get_vision_bilinear_indices_and_weights",
-    "get_vision_cu_seqlens",
-    "get_vision_position_ids",
     "lingbot_v2_weight_remap",
 ]

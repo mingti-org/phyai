@@ -12,6 +12,8 @@ import torch
 import pytest
 import torch.nn.functional as F
 from torch import nn
+from phyai.kernel.facts import Facts
+from phyai.kernel.ops.gemm import _torch_dense
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.linear.spec import Fp8Spec, Bf16Spec, Nvfp4Spec
 from phyai.layers.linear.backend import Granularity
@@ -111,7 +113,8 @@ def test_torch_serves_bf16_on_any_device():
     assert "torch.gemm.bf16" in _gemm_eligible(BF16, device="nvidia:SM100")
 
 
-def test_dense_row_accepts_fp32_router_but_flashinfer_does_not():
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp32"])
+def test_dense_rows_require_bf16_operands_for_fp32_output(input_dtype):
     from phyai.kernel.types import KernelQuery, PhysicalSignature
     from phyai.kernel.bootstrap import get_kernel_selector
 
@@ -120,7 +123,7 @@ def test_dense_row_accepts_fp32_router_but_flashinfer_does_not():
         KernelQuery.build(
             "gemm",
             device="nvidia:SM110",
-            dtype={"input": "fp32", "output": "fp32", "weight": "bf16"},
+            dtype={"input": input_dtype, "output": "fp32", "weight": "bf16"},
             quant=PhysicalSignature(format="bf16"),
             shape={"M": 50, "N": 37, "K": 64},
         )
@@ -128,46 +131,8 @@ def test_dense_row_accepts_fp32_router_but_flashinfer_does_not():
     facts = selector.facts_for(query, selector.catalog.op("gemm"))
     eligible, _ = selector.assess(selector.catalog.op("gemm"), facts, query.mode)
     kernel_ids = {item.kernel_id for item in eligible}
-    assert "torch.gemm.bf16" in kernel_ids
-    assert "flashinfer.gemm.bf16" not in kernel_ids
-
-
-def test_force_torch_policy_selects_fp32_router_backend():
-    from phyai.kernel.types import KernelQuery
-    from phyai.kernel.policy import policy_from_mapping
-    from phyai.kernel.registry import build_catalog
-    from phyai.kernel.selector import Selector
-
-    catalog = build_catalog()
-    policy = policy_from_mapping(
-        {
-            "schema": "phyai.kernel/v1",
-            "rules": [
-                {
-                    "id": "force-torch-gemm",
-                    "match": {"op": "gemm"},
-                    "restrict_to": "torch.gemm.*",
-                }
-            ],
-        },
-        catalog,
-    )
-    selector = Selector(catalog, policy, device="nvidia:SM110")
-    router = KernelQuery.build(
-        "gemm",
-        role="router",
-        dtype={"input": "fp32", "output": "fp32", "weight": "bf16"},
-        quant={"format": "bf16"},
-        shape={"M": 50, "N": 37, "K": 64},
-    )
-    ordinary = KernelQuery.build(
-        "gemm",
-        dtype={"input": "bf16", "output": "bf16", "weight": "bf16"},
-        quant={"format": "bf16"},
-        shape={"M": 50, "N": 37, "K": 64},
-    )
-    assert selector.explain(router).selected == "torch.gemm.bf16"
-    assert selector.explain(ordinary).selected == "torch.gemm.bf16"
+    for kernel_id in ("torch.gemm.bf16", "flashinfer.gemm.bf16"):
+        assert (kernel_id in kernel_ids) == (input_dtype == "bf16")
 
 
 def test_torch_fp8_needs_sm89():
@@ -241,7 +206,8 @@ def test_torch_bf16_matches_F_linear():
     torch.nn.init.normal_(layer.bias, std=0.02)
 
     x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda")
-    y = F.linear(x, layer.weight, layer.bias)
+    kernel = _torch_dense(Facts({"dtype.input": "bf16", "dtype.output": "bf16"}), {})
+    y = kernel(layer, x, layer.bias)
     ref = F.linear(x, layer.weight, layer.bias)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
 
@@ -251,7 +217,8 @@ def test_torch_bf16_preserves_batch_dims():
     layer = _build_layer(Bf16Spec(), N=N, K=K, device="cuda")
     torch.nn.init.normal_(layer.weight, std=0.02)
     x = torch.randn(2, 3, K, dtype=torch.bfloat16, device="cuda")
-    y = F.linear(x, layer.weight, None)
+    kernel = _torch_dense(Facts({"dtype.input": "bf16", "dtype.output": "bf16"}), {})
+    y = kernel(layer, x, None)
     assert y.shape == (2, 3, N)
 
 

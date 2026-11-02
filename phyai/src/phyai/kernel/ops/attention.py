@@ -47,7 +47,6 @@ ATTENTION_PAGED = OpSpec(
     optional_attributes=("layer_id", "runner"),
     signature="(runner) -> PagedAttentionBackend",
     returns=returns_instance(object, constructed_with=("runner",)),
-    requires_reference=False,
     doc="Paged-KV attention (LM prefix, action experts, AR decode).",
 )
 
@@ -153,6 +152,10 @@ ATTENTION_EAGER_CLS = (
 PAGED_FLASHINFER_CLS = (
     "phyai.layers.attention.paged.backends.flashinfer",
     "FlashInferPagedBackend",
+)
+PAGED_SDPA_CLS = (
+    "phyai.layers.attention.paged.backends.sdpa",
+    "SdpaPagedBackend",
 )
 GDN_FLASHINFER_CLS = (
     "phyai.layers.attention.gdn.backends.flashinfer",
@@ -338,6 +341,18 @@ def register(catalog: Catalog) -> None:
                 when=FLASHINFER_PAGED,
                 prepare=_backend_prepare(PAGED_FLASHINFER_CLS),
                 metadata={"package": "flashinfer"},
+            ),
+            Impl(
+                kernel_id="sdpa.attention_paged",
+                op="attention_paged",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    attrs.layout == "paged",
+                    dtype.input.in_({"bf16", "fp16", "fp32"}),
+                ),
+                prepare=_backend_prepare(PAGED_SDPA_CLS),
+                metadata={"package": "torch"},
             ),
             # Gated DeltaNet attention.
             Impl(

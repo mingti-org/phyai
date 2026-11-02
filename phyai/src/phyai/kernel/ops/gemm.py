@@ -16,9 +16,8 @@ def _bench_args(facts, device):
     catalog's priority order stands.
     """
 
-    from types import SimpleNamespace
-
     import torch
+    from types import SimpleNamespace
 
     from phyai.kernel.call import torch_dtype
     from phyai.kernel.facts import MISSING
@@ -30,13 +29,7 @@ def _bench_args(facts, device):
         raise NotImplementedError("benchmark needs the M, N and K dimensions")
     dt = torch_dtype(str(facts.lookup("dtype.input")))
     x = torch.randn(int(m), int(k), device=device, dtype=dt)
-    weight_dtype = facts.lookup("dtype.weight")
-    weight = torch.randn(
-        int(n),
-        int(k),
-        device=device,
-        dtype=dt if weight_dtype in (MISSING, None) else torch_dtype(str(weight_dtype)),
-    )
+    weight = torch.randn(int(n), int(k), device=device, dtype=dt)
     return (SimpleNamespace(weight=weight), x, None)
 
 
@@ -76,9 +69,16 @@ TORCH_FP8_BLOCK = all_of(
 
 
 def _flashinfer_bf16(facts, params):
+    from functools import partial
+
+    from phyai.kernel.call import torch_dtype
     from phyai.layers.linear.backends.flashinfer import gemm_bf16
 
-    return gemm_bf16
+    return partial(
+        gemm_bf16,
+        out_dtype=torch_dtype(str(facts.lookup("dtype.output"))),
+        **params,
+    )
 
 
 def _flashinfer_fp8_block(facts, params):
@@ -123,21 +123,24 @@ def _torch_dense(facts, params):
     import torch
     import torch.nn.functional as F
 
-    promote_weight = (
-        facts.lookup("dtype.input") == "fp32" and facts.lookup("dtype.weight") == "bf16"
-    )
+    from phyai.kernel.call import torch_dtype
+
+    out_dtype = torch_dtype(str(facts.lookup("dtype.output")))
 
     def dense(layer, x, bias):
-        if not promote_weight:
+        if x.dtype == out_dtype:
             return F.linear(x, layer.weight, bias)
-        # The catalog admits only FP32 activations with BF16 stored weights.
-        # AMP must not lower this explicitly requested computation precision.
         with torch.amp.autocast(x.device.type, enabled=False):
-            return F.linear(
-                x,
-                layer.weight.float(),
-                None if bias is None else bias.float(),
-            )
+            if x.is_cuda:
+                output = torch.mm(
+                    x.reshape(-1, x.shape[-1]),
+                    layer.weight.t(),
+                    out_dtype=out_dtype,
+                ).reshape(*x.shape[:-1], layer.weight.shape[0])
+            else:
+                # torch.mm's independent output dtype is CUDA-only.
+                output = F.linear(x.to(out_dtype), layer.weight.to(out_dtype))
+            return output if bias is None else output + bias
 
     return dense
 
@@ -237,6 +240,8 @@ def register(catalog: Catalog) -> None:
                 quant.format == "bf16",
                 device.arch.at_least("sm80"),
                 dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output.in_({"bf16", "fp32"}),
             ),
             prepare=_flashinfer_bf16,
             metadata={"package": "flashinfer", "note": "mm_bf16"},
@@ -278,15 +283,14 @@ def register(catalog: Catalog) -> None:
             reference=True,
             when=all_of(
                 quant.format.in_({"bf16", "fp16"}),
+                dtype.input == dtype.weight,
                 any_of(
-                    dtype.input == dtype.weight,
+                    dtype.output == dtype.input,
                     all_of(
-                        quant.format == "bf16",
-                        dtype.input == "fp32",
-                        dtype.weight == "bf16",
+                        dtype.input.in_({"bf16", "fp16"}),
+                        dtype.output == "fp32",
                     ),
                 ),
-                dtype.output == dtype.input,
             ),
             prepare=_torch_dense,
             metadata={"package": "torch", "note": "F.linear"},

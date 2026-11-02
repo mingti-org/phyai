@@ -1,0 +1,22 @@
+schema: phyai.kernel/v1
+defaults:
+  fallback: reference
+
+rules:
+  - id: dense-linear
+    match: {op: gemm}
+    restrict_to: torch.gemm.*
+  - id: joint-attention
+    match: {op: attention_paged}
+    restrict_to: sdpa.attention_paged
+
+overrides:
+  - id: router-fp32-output
+    match:
+      op: gemm
+      role: router
+      dtype.input: bf16
+      dtype.output: fp32
+    use: flashinfer.gemm.bf16
+    params:
+      backend: cublaslt

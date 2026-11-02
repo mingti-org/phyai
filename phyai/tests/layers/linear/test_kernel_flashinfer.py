@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from phyai.layers.linear.backends.flashinfer import gemm_nvfp4
+from phyai.layers.linear.backends.flashinfer import gemm_bf16, gemm_nvfp4
 from phyai.layers.quant import AllocationRequest, Nvfp4Spec
 from phyai.weights.shards import replicated
 
@@ -19,6 +19,18 @@ from phyai.weights.shards import replicated
 def _sm() -> int:
     maj, mnr = torch.cuda.get_device_capability()
     return maj * 10 + mnr
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_cublaslt_bias_with_independent_output_dtype(out_dtype):
+    torch.manual_seed(72)
+    layer = torch.nn.Linear(64, 32, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(3, 64, device="cuda", dtype=torch.bfloat16)
+    actual = gemm_bf16(layer, x, layer.bias, out_dtype=out_dtype, backend="cublaslt")
+    expected = F.linear(x.float(), layer.weight.float(), layer.bias.float())
+    assert actual.dtype == out_dtype
+    tolerance = 1e-2 if out_dtype == torch.bfloat16 else 2e-6
+    torch.testing.assert_close(actual.float(), expected, atol=tolerance, rtol=tolerance)
 
 
 def _gemm_eligible(signature: dict, *, device: str, K: int = 128):

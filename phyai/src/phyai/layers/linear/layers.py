@@ -15,20 +15,20 @@ top-level :func:`phyai.weights.load_pretrained` walks
 from __future__ import annotations
 
 from types import MappingProxyType
-from collections.abc import Mapping, Sequence
+from typing import Mapping, Sequence
 
 import torch
-from torch import nn
+import torch.nn as nn
 
 import phyai.parallel as P
-from phyai.kernel.call import CallSite
-from phyai.layers.quant import AllocationRequest
 from phyai.engine_config import get_engine_config
-from phyai.parallel.state import resolve_mesh
-from phyai.weights.shards import _Leg, fused, sharded, replicated, packed_sharded
+from phyai.kernel.call import CallSite
 from phyai.layers.linear.spec import Bf16Spec
+from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.active import get_active_plan
 from phyai.layers.quant.materialize import materialize
+from phyai.parallel.state import resolve_mesh
+from phyai.weights.shards import _Leg, fused, packed_sharded, replicated, sharded
 
 
 def _M_of(x: torch.Tensor) -> int:
@@ -40,7 +40,7 @@ def _M_of(x: torch.Tensor) -> int:
 
 
 def _resolve_linear_kernel(
-    layer: LinearBase,
+    layer: "LinearBase",
     x: torch.Tensor,
     *,
     M: int,
@@ -63,17 +63,14 @@ def _resolve_linear_kernel(
         site = CallSite("gemm", role=layer.kernel_role)
         layer.gemm_call = site
 
-    signature = layer.spec.physical_signature
     return site.select(
         device=x.device,
         dtype={
             "input": x.dtype,
-            "output": x.dtype
-            if signature.format in {"bf16", "fp16"}
-            else layer.params_dtype,
+            "output": getattr(layer, "out_dtype", layer.params_dtype),
             "weight": layer.weight.dtype,
         },
-        quant=signature,
+        quant=layer.spec.physical_signature,
         dims={"M": M, "N": N, "K": K},
     )
 
@@ -185,6 +182,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         spec: object | None = None,
         scheme: object | None = None,
         device: torch.device | str | None = None,
@@ -203,6 +201,14 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
             kernel_role=kernel_role,
         )
+        self.out_dtype = out_dtype or self.params_dtype
+        if (
+            self.out_dtype != self.params_dtype
+            and self.spec.physical_signature.format not in {"bf16", "fp16"}
+        ):
+            raise ValueError(
+                "out_dtype is only supported for unquantized linear layers"
+            )
         self.spec.allocate(
             self,
             AllocationRequest(

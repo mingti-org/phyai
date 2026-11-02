@@ -142,7 +142,8 @@ class Qwen3VLImagePackStep(ProcessorStep):
 
     The Qwen processor returns one concatenated patch matrix and one ``(t,h,w)``
     row per active image. This step splits the matrix back into fixed-stride
-    ``(B,N,P,D)`` storage required by ``LingBotV2Request``.
+    ``(B,N,P,D)`` storage required by ``LingBotV2Request``. Grid rows and image
+    masks stay on CPU for request packing.
     """
 
     image_processor: Any = field(repr=False, default=None)
@@ -183,15 +184,15 @@ class Qwen3VLImagePackStep(ProcessorStep):
                 batch_size,
                 self.num_images,
                 dtype=torch.bool,
+                device="cpu",
             )
         else:
-            masks = torch.as_tensor(image_masks, dtype=torch.bool)
+            masks = torch.as_tensor(image_masks, dtype=torch.bool, device="cpu")
             if masks.shape != (batch_size, self.num_images):
                 raise ValueError(
                     "image_masks must have shape "
                     f"({batch_size}, {self.num_images}), got {tuple(masks.shape)}."
                 )
-            masks = masks.cpu()
 
         active_images: list[torch.Tensor] = []
         active_indices: list[tuple[int, int]] = []
@@ -215,8 +216,7 @@ class Qwen3VLImagePackStep(ProcessorStep):
         )
         if PIXEL_VALUES not in processed or IMAGE_GRID_THW not in processed:
             raise ValueError(
-                "Qwen3-VL image processor must return pixel_values and "
-                "image_grid_thw."
+                "Qwen3-VL image processor must return pixel_values and image_grid_thw."
             )
         flat_pixels = torch.as_tensor(processed[PIXEL_VALUES])
         if flat_pixels.shape[-1] != self.patch_vector_dim:
@@ -228,6 +228,7 @@ class Qwen3VLImagePackStep(ProcessorStep):
         active_grids = torch.as_tensor(
             processed[IMAGE_GRID_THW],
             dtype=torch.int64,
+            device="cpu",
         ).reshape(-1, 3)
         if active_grids.shape[0] != len(active_indices):
             raise ValueError(
@@ -384,7 +385,7 @@ class LingBotV2PromptPrepareStep(ProcessorStep):
 @ProcessorStepRegistry.register("lingbot_v2_device_step")
 @dataclass
 class LingBotV2DeviceStep(ProcessorStep):
-    """Move all LingBot request fields to their runtime device and dtype."""
+    """Transfer compute tensors; keep discrete request metadata on CPU."""
 
     device: torch.device | str = "cpu"
     float_dtype: str | torch.dtype | None = None
@@ -400,17 +401,19 @@ class LingBotV2DeviceStep(ProcessorStep):
             value = out.get(name)
             if not isinstance(value, torch.Tensor):
                 continue
-            value = value.to(device=self.device)
-            if self.resolved_float_dtype is not None and value.is_floating_point():
-                value = value.to(dtype=self.resolved_float_dtype)
-            out[name] = value
+            dtype = (
+                self.resolved_float_dtype
+                if self.resolved_float_dtype is not None and value.is_floating_point()
+                else value.dtype
+            )
+            out[name] = value.to(device=self.device, dtype=dtype)
         for name in int_fields:
             value = out.get(name)
             if isinstance(value, torch.Tensor):
-                out[name] = value.to(device=self.device, dtype=torch.int64)
+                out[name] = value.to(device="cpu", dtype=torch.int64)
         masks = out.get(IMAGE_MASKS)
         if isinstance(masks, torch.Tensor):
-            out[IMAGE_MASKS] = masks.to(device=self.device, dtype=torch.bool)
+            out[IMAGE_MASKS] = masks.to(device="cpu", dtype=torch.bool)
         return out
 
     def get_config(self) -> dict[str, Any]:

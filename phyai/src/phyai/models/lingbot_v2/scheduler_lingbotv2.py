@@ -174,6 +174,7 @@ class LingBotV2Request:
 
     pixel_values has shape (B, N, P, patch_vector_dim). Only the leading
     product(image_grid_thw) patch rows of an active image are consumed.
+    Grid, image masks, token IDs, and language lengths stay on CPU for planning.
     """
 
     pixel_values: torch.Tensor
@@ -302,7 +303,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 packed,
                 fake_ids,
                 prefix_mask,
-                visual_mask,
+                visual_token_indices,
                 real_lens,
                 visible_lens,
             ) = self._pack_prefix(
@@ -316,7 +317,9 @@ class LingBotV2WS1Scheduler(Scheduler):
                 prefix_mask,
                 active_grids,
             )
-            ragged_position_ids = position_ids[:, prefix_mask].unsqueeze(1)
+            ragged_position_ids = (
+                position_ids[:, prefix_mask].unsqueeze(1).to(self.device)
+            )
 
         with event_scope("lingbot_v2.prefix_plan"):
             n_real_total = int(real_lens.sum())
@@ -325,9 +328,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 suffix_tokens=batch_size * self.suffix_len,
             )
             write_indices = cache_allocation.prefix_slots
-            prefix_indptr = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device=self.device
-            )
+            prefix_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
             prefix_indptr[1:] = torch.cumsum(real_lens, dim=0)
             prefix_metadata = PagedAttnMetadata(
                 mode=AttnMode.PREFILL,
@@ -338,7 +339,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 paged_kv_indptr=prefix_indptr,
                 paged_kv_indices=write_indices.to(torch.int32),
                 paged_kv_last_page_len=torch.ones(
-                    batch_size, dtype=torch.int32, device=self.device
+                    batch_size, dtype=torch.int32, device="cpu"
                 ),
                 write_indices=write_indices,
                 position_ids=ragged_position_ids,
@@ -351,7 +352,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                     hidden_states=packed,
                     position_ids=ragged_position_ids,
                     write_indices=write_indices,
-                    visual_pos_masks=visual_mask,
+                    visual_token_indices=visual_token_indices,
                     deepstack_visual_embeds=deepstack,
                 )
             )
@@ -386,11 +387,13 @@ class LingBotV2WS1Scheduler(Scheduler):
     ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, list[int]]:
         patch_parts: list[torch.Tensor] = []
         grid_parts: list[torch.Tensor] = []
+        grids = request.image_grid_thw
+        image_masks = request.image_masks
         for batch_index in range(request.pixel_values.shape[0]):
             for image_index in range(self.num_images):
-                if not bool(request.image_masks[batch_index, image_index]):
+                if not bool(image_masks[batch_index, image_index]):
                     continue
-                grid = request.image_grid_thw[batch_index, image_index]
+                grid = grids[batch_index, image_index]
                 patch_count = int(grid.prod())
                 patch_parts.append(
                     request.pixel_values[batch_index, image_index, :patch_count]
@@ -399,7 +402,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         if not patch_parts:
             raise ValueError("at least one active image is required.")
         pixel_values = torch.cat(patch_parts, dim=0)
-        active_grids = torch.stack(grid_parts).to(device=self.device, dtype=torch.int64)
+        active_grids = torch.stack(grid_parts)
         merged, deepstack = self.vision_runner.forward(
             LingBotV2VisionForwardBatch(
                 pixel_values=pixel_values,
@@ -444,13 +447,13 @@ class LingBotV2WS1Scheduler(Scheduler):
             (batch_size, self.n_per_sample),
             self.cfg.text.eos_token_id,
             dtype=torch.int64,
-            device=self.device,
+            device="cpu",
         )
         prefix_mask = torch.zeros(
             batch_size,
             self.n_per_sample,
             dtype=torch.bool,
-            device=self.device,
+            device="cpu",
         )
         visual_mask = torch.zeros_like(prefix_mask)
         embeddings = self.prefix_runner.prepare_prefix_embeddings(
@@ -464,7 +467,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         end_embedding = embeddings.vision_end
         merged_offset = 0
         image_counter = 0
-        real_lens = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+        real_lens = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
         for batch_index in range(batch_size):
             cursor = 0
             for image_index in range(self.num_images):
@@ -492,9 +495,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 batch_index, :language_length
             ]
             fake_ids[batch_index, cursor : cursor + language_length] = (
-                request.input_ids[
-                    batch_index, :language_length
-                ].to(device=self.device, dtype=torch.int64)
+                request.input_ids[batch_index, :language_length]
             )
             cursor += language_length
             packed[
@@ -522,10 +523,12 @@ class LingBotV2WS1Scheduler(Scheduler):
             ),
         )
         return (
-            packed[prefix_mask],
+            packed.flatten(0, 1).index_select(
+                0, prefix_mask.flatten().nonzero().flatten().to(self.device)
+            ),
             fake_ids,
             prefix_mask,
-            visual_mask[prefix_mask],
+            visual_mask[prefix_mask].nonzero().flatten().to(self.device),
             real_lens,
             visible_lens,
         )
@@ -548,9 +551,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         state_write = suffix_slots[:, 0]
         action_write = suffix_slots[:, 1:].flatten()
 
-        state_indptr = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device
-        )
+        state_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
         state_indptr[1:] = torch.cumsum(visible_lens + 1, dim=0)
         action_indptr = torch.zeros_like(state_indptr)
         action_indptr[1:] = torch.cumsum(visible_lens + self.suffix_len, dim=0)
@@ -562,7 +563,7 @@ class LingBotV2WS1Scheduler(Scheduler):
             cu_seqlens_q=torch.arange(
                 batch_size + 1,
                 dtype=torch.int32,
-                device=self.device,
+                device="cpu",
             ),
             paged_kv_indptr=state_indptr,
             paged_kv_indices=build_state_paged_kv_indices(
@@ -571,12 +572,12 @@ class LingBotV2WS1Scheduler(Scheduler):
                 suffix_len=self.suffix_len,
                 prefix_slot_base=self.prefix_runner.prefix_base,
                 suffix_slot_base=self.prefix_runner.suffix_base,
-            ),
+            ).to(self.device),
             paged_kv_last_page_len=torch.ones(
-                batch_size, dtype=torch.int32, device=self.device
+                batch_size, dtype=torch.int32, device="cpu"
             ),
             write_indices=state_write,
-            position_ids=state_position_ids,
+            position_ids=state_position_ids.to(self.device),
         )
         action_metadata = PagedAttnMetadata(
             mode=AttnMode.PREFILL,
@@ -588,7 +589,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 (batch_size + 1) * self.cfg.chunk_size,
                 self.cfg.chunk_size,
                 dtype=torch.int32,
-                device=self.device,
+                device="cpu",
             ),
             paged_kv_indptr=action_indptr,
             paged_kv_indices=build_action_paged_kv_indices(
@@ -597,16 +598,19 @@ class LingBotV2WS1Scheduler(Scheduler):
                 suffix_len=self.suffix_len,
                 prefix_slot_base=self.prefix_runner.prefix_base,
                 suffix_slot_base=self.prefix_runner.suffix_base,
-            ),
+            ).to(self.device),
             paged_kv_last_page_len=torch.ones(
-                batch_size, dtype=torch.int32, device=self.device
+                batch_size, dtype=torch.int32, device="cpu"
             ),
             write_indices=action_write,
-            position_ids=action_position_ids,
+            position_ids=action_position_ids.to(self.device),
         )
         self.expert_runner.plan_inference(state_metadata, action_metadata)
 
     def _validate(self, request: LingBotV2Request) -> None:
+        for name in ("input_ids", "lang_lens", "image_grid_thw", "image_masks"):
+            if getattr(request, name).device.type != "cpu":
+                raise ValueError(f"{name} must be CPU metadata")
         if request.pixel_values.dim() != 4:
             raise ValueError("pixel_values must be (B, N, P, patch_vector_dim).")
         batch_size, num_images, max_patches, patch_dim = request.pixel_values.shape

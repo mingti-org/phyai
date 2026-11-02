@@ -28,7 +28,7 @@ from phyai.kernel.predicate import all_of
 
 #: Operations that genuinely have no CPU implementation. Written down so a
 #: further operation cannot join the set unnoticed.
-NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn", "moe"})
+NO_CPU_PATH = frozenset({"attention_gdn", "moe"})
 
 
 @pytest.fixture(scope="module")
@@ -114,8 +114,7 @@ def test_registry_rejects_unknown_ops_duplicates_and_conflicting_schemas(catalog
 
 
 def test_every_operation_has_a_reference_row_or_declares_that_it_cannot(catalog):
-    """A CPU host cannot run the paged attention operations; that is a
-    property of FlashInfer, not an oversight, and the exception list is closed."""
+    """Operations without a reference implementation declare that exception."""
     assert catalog.coverage_gaps() == {}
     without_reference = {
         spec.name
@@ -206,6 +205,7 @@ ATTENTION_BACKENDS = {
     "sdpa.attention": attention_ops.ATTENTION_SDPA_CLS,
     "eager.attention": attention_ops.ATTENTION_EAGER_CLS,
     "flashinfer.attention_paged": attention_ops.PAGED_FLASHINFER_CLS,
+    "sdpa.attention_paged": attention_ops.PAGED_SDPA_CLS,
     "flashinfer.attention_gdn": attention_ops.GDN_FLASHINFER_CLS,
     "fla.attention_gdn": attention_ops.GDN_FLA_CLS,
     "flash_qla.attention_gdn": attention_ops.GDN_FLASH_QLA_CLS,

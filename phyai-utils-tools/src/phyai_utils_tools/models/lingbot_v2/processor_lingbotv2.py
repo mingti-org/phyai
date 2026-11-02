@@ -45,7 +45,12 @@ POST_CONFIG_FILENAME = "policy_postprocessor.json"
 
 @dataclass
 class LingBotV2ProcessedInputs:
-    """Model-ready fields matching ``LingBotV2Request`` one-to-one."""
+    """Model-ready fields matching ``LingBotV2Request`` one-to-one.
+
+    ``image_grid_thw``, ``image_masks``, ``input_ids``, and ``lang_lens`` are CPU
+    metadata. ``pixel_values``, ``state``, and optional ``noise`` use the
+    processor's target device and floating-point dtype.
+    """
 
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
@@ -149,7 +154,9 @@ class LingBotV2Processor(BaseModelProcessor):
     Robot-specific feature mapping and relative-pose conversion stay outside
     this model processor. ``state`` is expected to be an already ordered flat
     vector; optional canonical ``observation.state`` and ``action`` statistics
-    provide quantile normalization and inverse action normalization.
+    provide quantile normalization and inverse action normalization. Raw state
+    normalization runs on CPU before uploading compute tensors. Image grids,
+    masks, token IDs, and language lengths stay on CPU for scheduler packing.
     """
 
     def __init__(
@@ -284,7 +291,7 @@ class LingBotV2Processor(BaseModelProcessor):
                 features=features_for_stats(self.dataset_stats),
                 norm_map=self.norm_map(),
                 stats=self.dataset_stats,
-                device=self.device,
+                device="cpu",
                 eps=self.normalization_eps,
             ),
             LingBotV2PadStateStep(max_state_dim=self.max_state_dim),
@@ -392,7 +399,7 @@ class LingBotV2Processor(BaseModelProcessor):
                     "tokenizer": tokenizer,
                     "tokenizer_name": processor_name,
                 },
-                "normalizer_processor": {"device": device},
+                "normalizer_processor": {"device": "cpu"},
                 "lingbot_v2_device_step": {
                     "device": device,
                     "float_dtype": params_dtype,

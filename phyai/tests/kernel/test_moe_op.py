@@ -1,12 +1,4 @@
-"""MoE registration, capability gating, and the absence of a fallback.
-
-The MoE operation ships exactly one implementation and declares no
-reference path, so two properties carry the whole contract: the FlashInfer
-row is discovered and chosen when its capability holds, and every
-violation of that capability fails at selection time instead of degrading
-into something else. A silent Torch stand-in would return plausible
-numbers computed by a different kernel, which is worse than an error.
-"""
+"""MoE kernel registration and capability checks."""
 
 from __future__ import annotations
 
@@ -39,7 +31,7 @@ def moe_query(**overrides):
 
 
 def thor_selector(catalog):
-    """Thor is the deployment target: sm110 under CUDA 13."""
+    """Select kernels for an SM110 device."""
     return Selector(catalog, device="nvidia:sm110")
 
 
