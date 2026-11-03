@@ -1,0 +1,308 @@
+---
+title: "LingBot V2 Action Inference"
+description: "Run LingBot V2 action inference in PhyAI."
+icon: "rocket"
+---
+
+# LingBot V2 Action Inference
+
+## Overview
+
+LingBot V2 is a VLA model. It predicts the next sequence of actions by receiving camera images, task instructions, and robot states.
+
+You can first run the input example to confirm that the environment and model work properly, then connect your own images and robot states.
+
+| Item | Configuration |
+|---|---|
+| Model weights | LingBot V2 RoboTwin checkpoint |
+| Processor | Qwen3-VL-4B-Instruct |
+| Input | Three RGB image streams, task instructions, and robot states |
+| Output | An action tensor with shape (1, 50, 55) |
+| Output type | CPU float32 |
+| Execution mode | Single GPU, BF16 |
+| Example script | examples/lingbot_v2/run_lingbot_v2.py |
+
+## Architecture
+
+A single inference pass goes through the following process.
+```
+Images + Task instructions + Robot states
+                    ↓
+LingBotV2Processor.preprocess()
+                    ↓
+LingBotV2Request
+                    ↓
+Engine.step()
+                    ↓
+LingBotV2Processor.postprocess()
+                    ↓
+CPU float32 action tensor
+```
+LingBotV2Processor converts images, task text, and robot states into the input format required by the model.
+
+Engine loads the model through the lingbot_v2 plugin. The model first processes the visual and language inputs, then iteratively generates a sequence of actions using the Euler method.
+
+kernel_policy.yaml is used to select the operator implementations used by the model. The example uses the configuration provided in the repository.
+
+## Running
+
+### 1. Install PhyAI
+
+This guide uses Linux, Python 3.12 or later, uv, and an NVIDIA GPU that supports BF16.
+```bash
+git clone https://github.com/mingti-org/phyai.git
+cd phyai
+
+uv sync
+source .venv/bin/activate
+```
+Check whether PyTorch can access the GPU.
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+The expected output is as follows.
+```
+True
+```
+### 2. Download the Model Resources
+
+Download the LingBot V2 RoboTwin checkpoint.
+```bash
+hf download robbyant/lingbot-vla-v2-6b-robotwin \
+  --local-dir checkpoints/lingbot-vla-v2-6b-robotwin
+```
+Use the following directory as the model path in subsequent steps.
+```text
+checkpoints/lingbot-vla-v2-6b-robotwin/
+└── checkpoints/
+    └── global_step_50000/
+        └── hf_ckpt/
+```
+
+This directory should contain config.json, model.safetensors.index.json, and multiple .safetensors files.
+
+Download the Qwen3-VL Processor resources.
+```bash
+hf download Qwen/Qwen3-VL-4B-Instruct \
+  --include "*.json" "*.jinja" "*.txt" "*.model" \
+  --local-dir checkpoints/Qwen3-VL-4B-Instruct
+```
+This bash command downloads only the files required by the Processor and tokenizer; there is no need to download the Qwen model weights.
+
+### 3. Set the Paths
+
+Open examples/lingbot_v2/run_lingbot_v2.py and modify the two paths at the top of the file.
+```python
+CHECKPOINT_DIR = Path(
+    "checkpoints/lingbot-vla-v2-6b-robotwin/"
+    "checkpoints/global_step_50000/hf_ckpt"
+)
+PROCESSOR_DIR = "checkpoints/Qwen3-VL-4B-Instruct"
+```
+These paths are relative to the PhyAI repository root directory.
+
+### 4. Run the Example
+
+Check the GPU status.
+```bash
+nvidia-smi
+```
+Select a GPU to run the example.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/lingbot_v2/run_lingbot_v2.py
+```
+
+The example uses three synthetic images, the task instruction pick up the cup, and an all-zero state vector. It loads the model, runs inference once, prints the results, and then closes Engine.
+
+
+The default output shape is as follows.
+
+```text
+Action shape: (1, 50, 55)
+```
+
+The three dimensions represent the batch size, the number of action time steps, and the action dimension at each step, respectively. In this example, one observation corresponds to 50 action time steps, each containing 55 model action values.
+
+The example does not provide dataset statistics, so the output has not yet been converted into control values for a specific robot.
+
+## End-to-end Example
+
+The following code shows the complete Python calling process. Save it as run_lingbot_demo.py in the repository root directory, then run it.
+
+```bash
+python run_lingbot_demo.py
+```
+```python
+from pathlib import Path
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.kernel.config import KernelConfig
+from phyai.models.lingbot_v2 import (
+    LingBotV2Args,
+    LingBotV2Request,
+    LingBotVLA2Config,
+)
+from phyai.utils import load_config
+from phyai_utils_tools.models.lingbot_v2 import LingBotV2Processor
+
+
+checkpoint_dir = Path(
+    "checkpoints/lingbot-vla-v2-6b-robotwin/"
+    "checkpoints/global_step_50000/hf_ckpt"
+)
+processor_dir = "checkpoints/Qwen3-VL-4B-Instruct"
+
+config = load_config(checkpoint_dir, LingBotVLA2Config)
+
+processor = LingBotV2Processor(
+    processor_name=processor_dir,
+    num_channels=config.vision.in_channels,
+    patch_vector_dim=config.vision.patch_vector_dim,
+    tokenizer_max_length=config.tokenizer_max_length,
+    max_state_dim=config.max_state_dim,
+    action_dim=config.action_dim,
+    device="cuda",
+    params_dtype=torch.bfloat16,
+)
+
+observation = {
+    "images": [
+        torch.zeros(
+            1,
+            config.vision.in_channels,
+            224,
+            224,
+            dtype=torch.uint8,
+        )
+        for _ in range(3)
+    ],
+    "task": ["pick up the cup"],
+    "state": torch.zeros(1, config.max_state_dim),
+}
+
+processed = processor.preprocess(observation)
+request = LingBotV2Request(**vars(processed))
+
+max_vision_tokens = (
+    processed.pixel_values.shape[2] // config.vision.spatial_merge_unit
+)
+
+engine = Engine(
+    EngineArgs(
+        plugin="lingbot_v2",
+        plugin_args=LingBotV2Args(
+            checkpoint_dir=checkpoint_dir,
+            config=config,
+            max_vision_tokens_per_image=max_vision_tokens,
+        ),
+        config=EngineConfig(
+            kernel=KernelConfig(
+                config_path="examples/lingbot_v2/kernel_policy.yaml",
+            ),
+            device=DeviceConfig(
+                target="cuda",
+                params_dtype=torch.bfloat16,
+            ),
+            runtime=RuntimeConfig(
+                allow_tf32=True,
+                use_cuda_graph=True,
+            ),
+        ),
+    )
+)
+
+try:
+    with torch.inference_mode():
+        raw_actions = engine.step(request)
+        actions = processor.postprocess(raw_actions)
+
+    print("Action shape:", tuple(actions.shape))
+    print("Action dtype:", actions.dtype)
+    print("First action:", actions[0, 0].tolist())
+finally:
+    engine.close()
+```
+The core calls are as follows.
+
+```python
+processed = processor.preprocess(observation)
+request = LingBotV2Request(**vars(processed))
+raw_actions = engine.step(request)
+actions = processor.postprocess(raw_actions)
+```
+
+preprocess() converts the raw inputs into request tensors.
+
+engine.step() performs model inference.
+
+postprocess() retains the action dimensions specified in the configuration, performs optional denormalization, and returns a float32 tensor on the CPU.
+
+To save the results, you can add the following code.
+```python
+import numpy as np
+
+np.save("actions.npy", actions.numpy())
+```
+
+### Use Your Own Images
+
+images is a list containing images from three cameras.
+
+For a single observation, the image from each camera has shape (1, 3, H, W), using RGB channel order and the uint8 data type. Batched inputs have shape (B, 3, H, W).
+
+If the original image is a NumPy array with shape (H, W, 3), you can convert it as follows.
+```python
+image_tensor = (
+    torch.from_numpy(rgb_image)
+    .permute(2, 0, 1)
+    .unsqueeze(0)
+)
+```
+The camera order must match the training data. RoboTwin uses the following order.
+
+cam_high
+cam_left_wrist
+cam_right_wrist
+
+After changing the image resolution, you need to call processor.preprocess() again and calculate max_vision_tokens based on the new pixel_values.
+
+### Use Your Own Task Instructions
+
+Each observation corresponds to one task instruction.
+
+"task": ["pick up the cup"]
+
+The Processor handles the chat template and tokenization, so there is no need to construct token IDs manually.
+
+### Use Your Own Robot States
+
+Keep the state tensor on the CPU before preprocessing.
+```
+"state": torch.tensor(
+    [[0.0] * config.max_state_dim],
+    dtype=torch.float32,
+)
+```
+The Processor first handles state normalization and dimension padding, then moves the tensors required for computation to the GPU.
+
+The meaning and order of every value in the state must match the checkpoint. RoboTwin's raw state contains joint and gripper values for the left and right robot arms, while LingBot V2 uses a 55-dimensional model state layout.
+
+You cannot convert an arbitrary 14-dimensional state into a valid input merely by appending zeros, nor can you directly use the first 14 values of the model output as robot actions. When connecting a real robot, you need to define the state layout, normalization statistics, and action mapping.
+
+### Use Fixed Noise to Compare Results
+
+When comparing the results of two inference runs, you need to pass the same noise tensor to both requests, with the following shape.
+
+`(B, chunk_size, max_action_dim)`
+
+When noise is not provided, the model resamples the initial noise for each request, so two runs may generate different actions.
+
+## limitation
+- When connecting a real robot, you need to match the camera order, state layout, normalization statistics, and action mapping.
+- This guide does not cover multi-GPU execution.
