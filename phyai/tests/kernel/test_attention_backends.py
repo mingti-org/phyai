@@ -120,7 +120,7 @@ def test_fa3_is_eligible_on_hopper_only(op):
 def test_fa3_needs_a_supported_head_dim(op):
     """Mirrors flashinfer's is_fa3_prefill_head_dim_supported: an unsupported
     head dim *deselects* FA3 rather than reaching the backend. A ragged 96-dim
-    call falls through to the reference row; a paged one has no eligible row
+    call falls through to the reference row; a paged one falls back to SDPA
     (a 96-dim call used to select fine and die inside ``wrapper.plan``)."""
     unsupported = 96
     assert unsupported not in FA3_HEAD_DIMS
@@ -132,7 +132,7 @@ def test_fa3_needs_a_supported_head_dim(op):
             == "eager.attention"
         )
     else:
-        assert not eligible
+        assert eligible == {"sdpa.attention_paged"}
 
 
 def test_blackwell_rows_need_blackwell_and_fa2_is_the_universal_fallback():

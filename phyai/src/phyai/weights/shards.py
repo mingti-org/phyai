@@ -137,6 +137,13 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
 
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
         leg = legs[shard_id]
+        world = mesh.group_size(leg.group) // leg.replication_factor
+        expected_size = leg.size * world
+        if loaded.shape[leg.dim] != expected_size:
+            raise ValueError(
+                f"fused weight {shard_id!r} dimension {leg.dim} must be "
+                f"{expected_size}, got {loaded.shape[leg.dim]}."
+            )
         rank = mesh.group_rank(leg.group) // leg.replication_factor
         src = loaded.narrow(leg.dim, rank * leg.size, leg.size)
         _copy_exact(param.data.narrow(fuse_dim, leg.offset, leg.size), src)

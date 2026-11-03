@@ -9,28 +9,26 @@ from inside a layer's forward pass.
 
 from __future__ import annotations
 
+import sys
 import json
 import subprocess
-import sys
 
 import pytest
-
-from phyai.kernel.facts import FactKind, device, dtype
 from phyai.kernel.ops import OP_MODULES
 from phyai.kernel.ops import attention as attention_ops
+from phyai.kernel.facts import FactKind, dtype, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
-from phyai.kernel.predicate import all_of
 from phyai.kernel.registry import (
     Catalog,
     UnknownKernelError,
     UnknownOperationError,
     build_catalog,
 )
-
+from phyai.kernel.predicate import all_of
 
 #: Operations that genuinely have no CPU implementation. Written down so a
-#: fourth cannot join the set unnoticed.
-NO_CPU_PATH = frozenset({"attention_paged", "attention_gdn"})
+#: further operation cannot join the set unnoticed.
+NO_CPU_PATH = frozenset({"attention_gdn", "moe"})
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +59,7 @@ def _toy_impl(kernel_id: str, when=None, **kwargs) -> Impl:
 
 
 def test_every_declared_module_registers_something(catalog):
-    assert len(OP_MODULES) == 8
+    assert len(OP_MODULES) == 9
     assert len(catalog.ops()) >= len(OP_MODULES)
     for spec in catalog.ops():
         assert catalog.impls(spec.name), f"{spec.name} has no implementations"
@@ -116,8 +114,7 @@ def test_registry_rejects_unknown_ops_duplicates_and_conflicting_schemas(catalog
 
 
 def test_every_operation_has_a_reference_row_or_declares_that_it_cannot(catalog):
-    """A CPU host cannot run the paged attention operations; that is a
-    property of FlashInfer, not an oversight, and the exception list is closed."""
+    """Operations without a reference implementation declare that exception."""
     assert catalog.coverage_gaps() == {}
     without_reference = {
         spec.name
@@ -208,6 +205,7 @@ ATTENTION_BACKENDS = {
     "sdpa.attention": attention_ops.ATTENTION_SDPA_CLS,
     "eager.attention": attention_ops.ATTENTION_EAGER_CLS,
     "flashinfer.attention_paged": attention_ops.PAGED_FLASHINFER_CLS,
+    "sdpa.attention_paged": attention_ops.PAGED_SDPA_CLS,
     "flashinfer.attention_gdn": attention_ops.GDN_FLASHINFER_CLS,
     "fla.attention_gdn": attention_ops.GDN_FLA_CLS,
     "flash_qla.attention_gdn": attention_ops.GDN_FLASH_QLA_CLS,
@@ -262,7 +260,11 @@ def test_building_the_catalog_imports_neither_layers_nor_flashinfer():
         "print('flashinfer' in sys.modules)\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.split("\n")[:2] == ["[]", "False"], result.stdout

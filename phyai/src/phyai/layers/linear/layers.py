@@ -67,7 +67,7 @@ def _resolve_linear_kernel(
         device=x.device,
         dtype={
             "input": x.dtype,
-            "output": layer.params_dtype,
+            "output": getattr(layer, "out_dtype", layer.params_dtype),
             "weight": layer.weight.dtype,
         },
         quant=layer.spec.physical_signature,
@@ -182,6 +182,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         spec: object | None = None,
         scheme: object | None = None,
         device: torch.device | str | None = None,
@@ -200,6 +201,14 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
             kernel_role=kernel_role,
         )
+        self.out_dtype = out_dtype or self.params_dtype
+        if (
+            self.out_dtype != self.params_dtype
+            and self.spec.physical_signature.format not in {"bf16", "fp16"}
+        ):
+            raise ValueError(
+                "out_dtype is only supported for unquantized linear layers"
+            )
         self.spec.allocate(
             self,
             AllocationRequest(

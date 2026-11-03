@@ -103,18 +103,10 @@ def test_adarmsnorm_lands_on_triton_because_no_flashinfer_row_exists(
     }
 
 
-def test_the_paged_stacks_are_flashinfer_only(selector) -> None:
-    """Replaces ``_engine_to_paged_backend``, which raised for any other name.
-
-    The catalog carries the same fact, so an ineligible host now gets a
-    ``NoKernelError`` listing every rejection reason rather than a hand-written
-    sentence.
-    """
-
+def test_paged_attention_has_an_sdpa_fallback(selector) -> None:
     catalog = build_catalog()
-    for op in ("attention_paged",):
-        vendors = {row.kernel_id.split(".")[0] for row in catalog.impls(op)}
-        assert vendors == {"flashinfer"}, (op, vendors)
+    vendors = {row.kernel_id.split(".")[0] for row in catalog.impls("attention_paged")}
+    assert vendors == {"flashinfer", "sdpa"}
 
 
 def test_rope_falls_back_to_eager_on_its_own(selector) -> None:

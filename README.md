@@ -29,6 +29,7 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
+- [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
 - [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
 - [2026/10] Support [Xiaomi Robotics U0](https://phyai.mintlify.app/models/xiaomi-u0/text-to-image) text-to-image generation.
 - [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
@@ -60,7 +61,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
         <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>,
         <a href="https://phyai.mintlify.app/models/gr00t/ws1"><strong>GR00T N1.7</strong></a>,
         <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>,
-        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>
+        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>,
+        <a href="https://phyai.mintlify.app/models/lingbot_v2/inference"><strong>LingBot V2</strong></a>
       </td>
     </tr>
     <tr>

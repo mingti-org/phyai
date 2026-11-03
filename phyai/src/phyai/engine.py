@@ -54,6 +54,7 @@ _BUILTIN_PLUGIN_MODULES: dict[str, str] = {
     "gr00t_n17": "phyai.models.gr00t_n17.main_gr00t_n17",
     "qwen_image_21": "phyai.models.qwen_image_21.main_qwen_image_21",
     "minicpm_gr00t": "phyai.models.minicpm_gr00t.main_minicpm_gr00t",
+    "lingbot_v2": "phyai.models.lingbot_v2.main_lingbotv2",
     "dreamzero": "phyai.models.dreamzero.main_dreamzero",
 }
 

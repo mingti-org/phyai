@@ -84,7 +84,14 @@
                 "pages": [
                   "models/xiaomi-u0/text-to-image"
                 ]
+              },
+              {
+                "group": "LingBot V2",
+                "pages": [
+                  "models/lingbot_v2/inference"
+                ]
               }
+
             ]
           },
           {
@@ -186,6 +193,12 @@
                 "group": "Xiaomi U0",
                 "pages": [
                   "zh/models/xiaomi-u0/text-to-image"
+                ]
+              },
+              {
+                "group": "LingBot V2",
+                "pages": [
+                  "zh/models/lingbot_v2/inference"
                 ]
               }
             ]
