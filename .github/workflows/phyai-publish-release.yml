@@ -1,0 +1,166 @@
+# Publish a GitHub Release with a tag such as v0.1.0 or v0.2.0rc1.
+# This workflow builds the tagged commit and attaches all six packages.
+# Run workflow can fill in missing assets on an existing published release.
+# Releases must allow asset uploads after publication (immutable releases do not).
+name: phyai release publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing published release tag (for example, v0.1.0 or v0.2.0rc1)"
+        required: true
+        type: string
+
+# Each release can upload independently. Pages deployments are serialized by
+# the nightly workflow, which this workflow dispatches after uploading assets.
+concurrency:
+  group: phyai-release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: validate release and resolve its commit
+    if: github.repository == 'mingti-org/phyai'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      release-id: ${{ steps.release.outputs.release-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          tag = os.environ["RELEASE_TAG"]
+          number = r"(?:0|[1-9][0-9]*)"
+          match = re.fullmatch(
+              rf"v?({number}\.{number}\.{number}(?:(?:a|b|rc){number})?)", tag
+          )
+          if not match:
+              raise SystemExit("Use a version tag such as v0.1.0 or v0.2.0rc1.")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release = json.loads(subprocess.check_output(
+              ["gh", "api", f"repos/{repo}/releases/tags/{tag}"], text=True
+          ))
+          if release["draft"]:
+              raise SystemExit("Publish the draft release before running this workflow.")
+          if release.get("immutable", False):
+              raise SystemExit(
+                  "This release is immutable and cannot accept new assets. "
+                  "Immutable releases require uploading packages before publication."
+              )
+          # Resolve the tag explicitly; target_commitish can be a moving branch.
+          sha = subprocess.check_output(
+              ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
+              text=True,
+          ).strip()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"tag={tag}\nversion={match[1]}\nsha={sha}\n")
+              output.write(f"release-id={release['id']}\n")
+          print(f"Building {tag} from {sha}")
+          PY
+
+  build:
+    name: build release distributions
+    needs: setup
+    uses: ./.github/workflows/phyai-build-packages.yml
+    with:
+      version: ${{ needs.setup.outputs.version }}
+      source-ref: ${{ needs.setup.outputs.sha }}
+
+  publish:
+    name: attach packages and request index update
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.setup.outputs.tag }}
+      RELEASE_ID: ${{ needs.setup.outputs.release-id }}
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # Preserve existing files when retrying a partial upload. Native rebuilds
+      # may differ byte for byte, so retries must not replace published packages.
+      - name: Upload missing release assets
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo = os.environ["GH_REPO"]
+          tag = os.environ["RELEASE_TAG"]
+          release = json.loads(subprocess.check_output(
+              ["gh", "api", f"repos/{repo}/releases/tags/{tag}"], text=True
+          ))
+          if str(release["id"]) != os.environ["RELEASE_ID"] or release["draft"]:
+              raise SystemExit("The release changed while building; run the workflow again.")
+          pages = json.loads(subprocess.check_output(
+              ["gh", "api", "--paginate", "--slurp",
+               f"repos/{repo}/releases/{release['id']}/assets?per_page=100"],
+              text=True,
+          ))
+          existing = {asset["name"]: asset for page in pages for asset in page}
+          files = sorted(pathlib.Path("dist").iterdir())
+          if not files:
+              raise SystemExit("No distributions were downloaded.")
+          for path in files:
+              if path.name in existing:
+                  if existing[path.name]["state"] != "uploaded":
+                      raise SystemExit(f"Remove the incomplete asset {path.name} before retrying.")
+                  print(f"Keeping existing asset: {path.name}", flush=True)
+                  continue
+              subprocess.run(
+                  ["gh", "release", "upload", tag, str(path)], check=True
+              )
+          PY
+
+      # Refresh through the nightly publisher so the deployed site contains
+      # both the current nightly and every published release. workflow_dispatch
+      # can be triggered with GITHUB_TOKEN; no personal access token is needed.
+      - name: Refresh the Pages package index
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh workflow run phyai-publish-nightly.yml --ref "$DEFAULT_BRANCH"
+
+      - name: Summarize
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          {
+            echo "### phyai release ${VERSION}"
+            echo ""
+            echo "Packages: https://github.com/${GH_REPO}/releases/tag/${RELEASE_TAG}"
+            echo ""
+            echo "Pages refresh requested: https://github.com/${GH_REPO}/actions/workflows/phyai-publish-nightly.yml"
+            echo "The simple index updates after that workflow finishes successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
