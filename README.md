@@ -182,18 +182,21 @@ We thank the contributors below and welcome more developers to join us in buildi
 
 ## Sponsors & Adoption
 
-PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti and ModelBest.
+PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti, ModelBest and RLInf.
 
 We are actively seeking partnerships with compute providers, chip vendors, and robotics companies. If you are interested in working with us, please [contact us](#contact).
 
 <table align="center" width="80%">
   <tbody>
     <tr>
-      <td align="center" width="50%">
+      <td align="center" width="30%">
         <img src="assets/mingti-new.png" alt="Mingti" width="240">
       </td>
-      <td align="center" width="50%">
+      <td align="center" width="30%">
         <img src="assets/modelbest.svg" alt="ModelBest" width="240">
+      </td>
+      <td align="center" width="30%">
+        <img src="assets/logo_white.svg" alt="RLInf" width="240">
       </td>
     </tr>
   </tbody>
