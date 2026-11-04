@@ -305,7 +305,7 @@ class ThorG13TailEarlyPdlGemmUniversal {
     }
     implementable &= CollectiveMainloop::can_implement(args.problem_shape, args.mainloop);
     implementable &= CollectiveEpilogue::can_implement(args.problem_shape, args.epilogue);
-    implementable &= TileScheduler::can_implement(args.scheduler);
+    implementable &= TileScheduler::can_implement(args.scheduler, args.hw_info);
 
     if constexpr (IsDynamicCluster) {
       static constexpr int MaxClusterSize = 16;
@@ -681,7 +681,7 @@ class ThorG13TailEarlyPdlGemmUniversal {
     else if (is_participant.mma) {
       cutlass::arch::launch_dependent_grids();
       // Tmem allocation sequence
-      tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+      tmem_allocator.allocate(cute::TMEM::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
       __syncwarp();
       tmem_allocation_result_barrier.arrive();
       uint32_t tmem_base_ptr = shared_storage.tmem_base_ptr;
@@ -742,7 +742,7 @@ class ThorG13TailEarlyPdlGemmUniversal {
       }
 
       // Free entire tmem allocation
-      tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+      tmem_allocator.free(tmem_base_ptr, cute::TMEM::Sm100TmemCapacityColumns);
     }
 
     else if (is_participant.epi_load) {
