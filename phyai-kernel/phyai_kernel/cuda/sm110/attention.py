@@ -8,8 +8,8 @@ import torch
 
 @cache
 def load_attention(variant: str, device_index: int):
-    from flashinfer.jit.env import CUTLASS_INCLUDE_DIRS
     from phyai_kernel.jit_utils.compile import PHYAI_KERNEL_CUDA_CSRC_DIR, load_cuda_jit
+    from phyai_kernel.jit_utils.cutlass import CUTLASS_REVISION, cutlass_include_dirs
 
     if variant != "c27":
         raise ValueError(f"Unknown Expert attention variant {variant!r}")
@@ -17,6 +17,7 @@ def load_attention(variant: str, device_index: int):
     digest = hashlib.sha256(
         (PHYAI_KERNEL_CUDA_CSRC_DIR / source).read_bytes()
         + (PHYAI_KERNEL_CUDA_CSRC_DIR / "sm110/attention_ffi.cuh").read_bytes()
+        + CUTLASS_REVISION.encode()
     ).hexdigest()[:16]
     with torch.cuda.device(device_index):
         module = load_cuda_jit(
@@ -33,7 +34,7 @@ def load_attention(variant: str, device_index: int):
                 "-DCATTN_SPLITS=5",
                 "-DPHYAI_TILE_ROWS=64",
             ],
-            extra_include_paths=[str(path) for path in CUTLASS_INCLUDE_DIRS],
+            extra_include_paths=list(cutlass_include_dirs()),
         )
         module.prepare()
     return module

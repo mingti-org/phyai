@@ -41,9 +41,9 @@ def projection_config(name, rows):
 
 @cache
 def load_projection(name, rows, device_index):
-    from flashinfer.jit.env import CUTLASS_INCLUDE_DIRS
     import flashinfer
     from phyai_kernel.jit_utils.compile import PHYAI_KERNEL_CUDA_CSRC_DIR, load_cuda_jit
+    from phyai_kernel.jit_utils.cutlass import CUTLASS_REVISION, cutlass_include_dirs
 
     config = projection_config(name, rows)
     directory = PHYAI_KERNEL_CUDA_CSRC_DIR / "sm110"
@@ -51,16 +51,10 @@ def load_projection(name, rows, device_index):
         config["source"],
         "gemm_ffi.cuh",
         "bf16_exact_gelu_v1.cuh",
-        "third_party/cutlass_compat/include/cute/layout.hpp",
     ]
     digest = hashlib.sha256(
         b"".join((directory / path).read_bytes() for path in includes)
-        + b"".join(
-            path.read_bytes()
-            for path in sorted(
-                (directory / "third_party/cutlass_compat/include").rglob("*.hpp")
-            )
-        )
+        + CUTLASS_REVISION.encode()
         + json.dumps(config, sort_keys=True).encode()
     ).hexdigest()[:16]
     flags = [f"-D{key}={value}" for key, value in config["defines"].items()]
@@ -78,8 +72,7 @@ def load_projection(name, rows, device_index):
         ],
         extra_cuda_cxx_flags=flags,
         extra_include_paths=[
-            str(directory / "third_party/cutlass_compat/include"),
-            *[str(path) for path in CUTLASS_INCLUDE_DIRS],
+            *cutlass_include_dirs(),
             str(Path(flashinfer.__file__).parent / "data/include"),
         ],
     )

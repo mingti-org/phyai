@@ -38,8 +38,8 @@ def native_source_bytes(path: Path, seen: set[Path] | None = None) -> bytes:
 
 @cache
 def load_native(target: str, rows: int, device_index: int):
-    from flashinfer.jit.env import CUTLASS_INCLUDE_DIRS
     from phyai_kernel.jit_utils.compile import PHYAI_KERNEL_CUDA_CSRC_DIR, load_cuda_jit
+    from phyai_kernel.jit_utils.cutlass import CUTLASS_REVISION, cutlass_include_dirs
 
     config = next(
         row for row in configurations() if row["target"] == target and row["m"] == rows
@@ -49,15 +49,7 @@ def load_native(target: str, rows: int, device_index: int):
     )
     digest = hashlib.sha256(
         native_source_bytes(PHYAI_KERNEL_CUDA_CSRC_DIR / source)
-        + b"".join(
-            path.read_bytes()
-            for path in sorted(
-                (
-                    PHYAI_KERNEL_CUDA_CSRC_DIR
-                    / "sm110/third_party/cutlass_compat/include"
-                ).rglob("*.hpp")
-            )
-        )
+        + CUTLASS_REVISION.encode()
         + json.dumps(config, sort_keys=True).encode()
     ).hexdigest()[:16]
     flags = [f"-D{key}={value}" for key, value in config["defines"].items()]
@@ -78,12 +70,7 @@ def load_native(target: str, rows: int, device_index: int):
             ("destroy", "phyai_sm110::Destroy"),
         ],
         extra_cuda_cxx_flags=flags,
-        extra_include_paths=[
-            str(
-                PHYAI_KERNEL_CUDA_CSRC_DIR / "sm110/third_party/cutlass_compat/include"
-            ),
-            *[str(path) for path in CUTLASS_INCLUDE_DIRS],
-        ],
+        extra_include_paths=list(cutlass_include_dirs()),
     )
 
 

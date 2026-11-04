@@ -1,28 +1,6 @@
-# phyai nightly publish — builds all six workspace packages and publishes them as
-# a PEP 503 "simple" wheel index on GitHub Pages, so users can:
-#
-#   uv pip install phyai \
-#     --extra-index-url https://mingti-org.github.io/phyai/simple/ \
-#     --prerelease=allow
-#
-# Job graph:
-#   setup        compute the one nightly version (git tag + date), shared by all
-#   build-ext    compile phyai-ext inside a manylinux_2_28 container so its .so
-#                links glibc 2.28 (wide compatibility), then auditwheel-repair it
-#   build-index  build the 5 pure-Python packages on a plain runner, merge in the
-#                manylinux phyai-ext wheel, and generate the PEP 503 index
-#   deploy       publish the index to GitHub Pages
-#
-# Why phyai-ext is split out: it is the only compiled package. The other five are
-# py3-none-any (glibc-irrelevant) and need no C/C++ toolchain, so they stay on the
-# fast plain runner. phyai-ext's libphyai_ext_core.so is a tvm-ffi plugin loaded at
-# runtime (dlopen), NOT a CPython extension and NOT link-time bound to libtvm_ffi.so
-# — hence wheel.py-api="py3" (in pyproject) for a version-agnostic tag, and
-# `auditwheel repair --exclude libtvm_ffi.so` (that lib is provided by the
-# apache-tvm-ffi runtime dependency and must not be vendored).
-#
-# One-time manual prerequisite: GitHub repo Settings -> Pages -> Source =
-# "GitHub Actions" (the workflow cannot toggle this itself).
+# Publish the current nightly and all GitHub Release packages at /simple/.
+# Release files stay in GitHub Releases; Pages contains their download links.
+# Set repository Settings -> Pages -> Source to "GitHub Actions" before use.
 name: phyai nightly publish
 
 on:
@@ -98,105 +76,74 @@ jobs:
           echo "Publishing version: ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-  # Compile phyai-ext in a glibc-2.28 manylinux container. Building on ubuntu-latest
-  # (glibc 2.39) would bake GLIBC_2.34+ symbols into the .so and constrain the wheel
-  # to manylinux_2_39 — useless. The container's older glibc is the whole point.
-  #
-  # Image: pytorch/manylinux2_28-builder:cpu (Docker Hub).
-  build-ext:
-    name: build phyai-ext (manylinux_2_28)
+  build:
+    name: build nightly packages
     needs: setup
-    # When setup decides nothing changed, this skip cascades: build-index and
-    # deploy `needs` this job, and a skipped dependency skips them too.
     if: needs.setup.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Build and repair phyai-ext wheel in manylinux container
-        env:
-          VERSION: ${{ needs.setup.outputs.version }}
-        run: |
-          docker run --rm -v "$PWD:/io" -w /io \
-            -e SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" \
-            pytorch/manylinux2_28-builder:cpu bash -ceu '
-              export PATH=/opt/python/cp312-cp312/bin:$PATH
-              # SETUPTOOLS_SCM_PRETEND_VERSION short-circuits setuptools-scm before
-              # any git access, so the container needs neither git nor the .git dir.
-              python -m pip install -U uv auditwheel cmake ninja
-              rm -rf /io/ext-raw /io/dist-ext
-              # uv build isolation pulls scikit-build-core + apache-tvm-ffi (headers)
-              # from the index; cmake/ninja are preinstalled for a robust CMake build.
-              uv build --package phyai-ext -o /io/ext-raw
-              # Rewrite the .so wheel to a manylinux_2_28 platform tag. Exclude
-              # libtvm_ffi.so: it ships with the apache-tvm-ffi runtime dependency and
-              # must not be vendored (the .so loads it via dlopen at runtime, not via
-              # a link-time NEEDED entry).
-              auditwheel repair --exclude libtvm_ffi.so \
-                --plat manylinux_2_28_x86_64 \
-                /io/ext-raw/*.whl -w /io/dist-ext
-              # The sdist is platform-agnostic — copy it through untouched.
-              cp /io/ext-raw/*.tar.gz /io/dist-ext/
-            '
-          echo "Produced:"
-          ls -lh dist-ext
-
-      - name: Upload phyai-ext artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-ext
-          path: dist-ext/*
-          if-no-files-found: error
+    uses: ./.github/workflows/phyai-build-packages.yml
+    with:
+      version: ${{ needs.setup.outputs.version }}
+      source-ref: ${{ github.sha }}
 
   build-index:
-    name: build pure packages and wheel index
-    needs: [setup, build-ext]
+    name: build wheel index
+    needs: [setup, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-          enable-cache: true
-
-      # The five pure-Python packages: py3-none-any wheels, no compiler needed.
-      # `uv build --package` can't be repeated in one call, so loop. phyai-ext is
-      # NOT built here — it comes from the build-ext artifact below.
-      - name: Build pure-Python packages
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.setup.outputs.version }}
-        run: |
-          for pkg in phyai phyai-gateway phyai-kernel phyai-model-optimizer phyai-utils-tools; do
-            uv build --package "$pkg" --out-dir dist
-          done
-
-      - name: Download phyai-ext (manylinux) artifact
+      - name: Download distributions
         uses: actions/download-artifact@v4
         with:
-          name: dist-ext
+          name: dist
           path: dist
 
-      - name: Validate package metadata
-        run: uvx twine check dist/*
+      # Fetch every page of releases and assets before replacing the Pages site.
+      - name: Fetch release history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-pages.json
+          python - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
 
-      # Turn dist/ into a PEP 503 simple index under site/ (wheels copied into
-      # site/packages/, one index.html per project + a root index.html).
+          releases = [
+              release
+              for page in json.loads(Path("release-pages.json").read_text())
+              for release in page
+              if not release["draft"]
+          ]
+          for release in releases:
+              endpoint = (
+                  f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/"
+                  f"{release['id']}/assets?per_page=100"
+              )
+              pages = json.loads(
+                  subprocess.check_output(
+                      ["gh", "api", "--paginate", "--slurp", endpoint], text=True
+                  )
+              )
+              release["assets"] = [asset for page in pages for asset in page]
+          Path("releases.json").write_text(json.dumps(releases), encoding="utf-8")
+          PYTHON
+
       - name: Build wheel index
-        run: python scripts/build_wheel_index.py --dist-dir dist --out-dir site
+        run: >-
+          python scripts/build_wheel_index.py
+          --dist-dir dist --releases-json releases.json --out-dir site
 
       - name: Summarize
         if: always()
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
         run: |
           {
-            echo "### phyai nightly publish — ${{ needs.setup.outputs.version }}"
+            echo "### phyai nightly publish: $VERSION"
             echo ""
             echo '```'
             ls -lh dist 2>/dev/null || echo "no dist/ produced"
