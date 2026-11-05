@@ -69,7 +69,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
       <th align="center" width="22%">WAM</th>
       <td align="center">
         <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
-        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>
+        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>,
+        <a href="docs/models/goalwam/inference.mdx"><strong>Open-HumanScale (GoalWAM)</strong></a>
       </td>
     </tr>
     <tr>

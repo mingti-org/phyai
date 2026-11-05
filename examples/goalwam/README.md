@@ -1,8 +1,12 @@
-# GoalWAM
+# Open-HumanScale (GoalWAM)
 
 Model weights: <!-- Add the public download link here. -->
 
 Predict a 48-step action chunk from an instruction, goal image, camera views, and robot state.
+
+Open-HumanScale uses the `goalwam` plugin and the `examples/goalwam` entry point.
+See the inference guide in [English](../../docs/models/goalwam/inference.mdx)
+or [中文](../../docs/zh/models/goalwam/inference.mdx).
 
 Run from the repository root with this PhyAI checkout installed. The tested environment
 uses Hopper GPUs (SM90), Torch 2.11, CUDA 12.8, and GLIBC 2.34 or newer.

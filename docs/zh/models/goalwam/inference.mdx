@@ -1,0 +1,137 @@
+---
+title: "Open-HumanScale (GoalWAM)"
+description: "使用 PhyAI 在单 GPU 或张量并行模式下运行目标条件动作推理。"
+---
+
+Open-HumanScale (GoalWAM) 根据任务指令、当前相机图像、目标图像和机器人状态，
+预测一段动作。在 PhyAI 中使用 `goalwam` 插件和
+`examples/goalwam/run_goalwam.py` 示例入口。Python 导入路径为
+`phyai.models.goalwam` 和 `phyai_utils_tools.models.goalwam`。
+
+| 项目 | 配置 |
+| --- | --- |
+| PhyAI 插件 | `goalwam` |
+| 输入 | 指令、当前与目标 RGB 图像、归一化状态，可选视觉历史和 RTC 前缀 |
+| 输出 | CPU 上的 `float32` 归一化动作，默认形状为 `[1, 48, 49]` |
+| 推理 | BF16 模型参数、10 步去噪，默认启用 CUDA Graph |
+| 并行方式 | 同一台机器上的 TP=1、2 或 4 |
+
+## 准备环境
+
+使用 Linux、GLIBC 2.34 或更新版本、Python 3.12 或 3.13，以及 Hopper GPU（SM90）。
+该推理路径已在 Torch 2.11 和 CUDA 12.8 下验证。TP=2/4 需要通过 NVLink 连接的 GPU
+和 CUDA toolkit（`nvcc`）。
+
+按照[安装指南](/zh/index#安装)准备 PhyAI 仓库。在仓库根目录激活环境，
+安装 CUDA 12.8 对应的依赖和注意力算子：
+
+```bash
+source .venv/bin/activate
+uv pip install 'torch==2.11.0' 'torchvision==0.26.0' \
+  --index-url https://download.pytorch.org/whl/cu128
+uv pip install --no-deps \
+  --index-url https://nvidia-cosmos.github.io/cosmos-dependencies/v1.5.0 \
+  'flash-attn-3-nv==1.0.3+cu128.torch210'
+```
+
+## 准备权重
+
+模型权重：{/* Add the public download link here. */}
+
+将路径指向包含以下文件的推理 checkpoint：
+
+```text
+checkpoint/
+├── transformer/
+├── vae/
+├── text_tokenizer/
+├── sampling.json
+└── processor.json
+```
+
+配置文件应与权重配套使用。`sampling.json` 必须包含十步采样所需的
+`corrector_weights`。
+
+```bash
+export GOALWAM_CHECKPOINT=/path/to/checkpoint
+export GOALWAM_SAMPLE=/path/to/observation.json
+```
+
+## 准备观测
+
+将观测保存为 JSON。图像路径相对于该 JSON 文件，示例脚本会将图像读取为 RGB。
+请按实际 checkpoint 和机器人替换下面的图像路径、指令、状态值和 domain ID。
+全零状态仅用于说明输入形状。
+
+```json
+{
+  "instruction": "Move the object to the position shown in the goal image.",
+  "images": {"head": "head.png", "left": "left.png", "right": "right.png"},
+  "goal_images": {"head": "goal.png"},
+  "observation_timestamp": 0.0,
+  "history": [],
+  "normalized_state": [
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0
+  ],
+  "domain_id": 0,
+  "seed": 0
+}
+```
+
+`normalized_state` 必须使用 checkpoint 对应的归一化方式和模型坐标系。
+示例不会转换机器人的物理坐标。可通过 `state_valid_mask` 和 `action_valid_mask`
+指定有效的状态和动作通道；填充通道必须保持无效。
+
+需要视觉历史时，在 `history` 中按时间从早到晚添加
+`{"timestamp": ..., "images": {...}}`。历史时间戳必须早于 `observation_timestamp`，
+使用相同的时间基准，单位为秒。Processor 会按照 `processor.json` 中的历史配置选帧。
+
+需要实时分块（RTC）时，通过 `normalized_prefix` 提供之前动作组成的矩阵。
+这些动作必须使用相同的归一化方式和模型坐标系，行数不得超过 checkpoint 的前缀长度限制。
+没有前缀时可省略该字段。
+
+## 运行推理
+
+选择一张可用 GPU。下面的命令使用单卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/goalwam/run_goalwam.py \
+  --checkpoint "$GOALWAM_CHECKPOINT" \
+  --sample "$GOALWAM_SAMPLE" \
+  --output .cache/goalwam/actions.npy
+```
+
+使用两张 GPU 时，指定两个设备并设置 `--tp 2`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/goalwam/run_goalwam.py \
+  --checkpoint "$GOALWAM_CHECKPOINT" \
+  --sample "$GOALWAM_SAMPLE" \
+  --output .cache/goalwam/actions.npy \
+  --tp 2
+```
+
+使用四张 GPU 时，改为 `CUDA_VISIBLE_DEVICES=0,1,2,3` 和 `--tp 4`。
+Engine 会启动工作进程，只需运行一次命令。添加 `--no-cuda-graph` 可使用 eager 模式。
+首次请求包含模型预热和 CUDA Graph 捕获。
+
+## 读取输出
+
+脚本将归一化动作保存为 NumPy `.npy` 数组：
+
+```python
+import numpy as np
+
+actions = np.load(".cache/goalwam/actions.npy", allow_pickle=False)
+print(actions.shape, actions.dtype, np.isfinite(actions).all())
+```
+
+默认配置下，输出为 `(1, 48, 49) float32 True`，表示一段动作包含 48 个时间步，
+每步 49 个值。RTC 前缀行仍保留在输出中。执行新动作前，先将归一化结果转换为机器人坐标，
+并跳过已确定执行的前缀。
