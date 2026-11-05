@@ -200,6 +200,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         use_cuda_graph: bool = True,
         use_wavefront_pipeline: bool = False,
     ) -> None:
+        """Size request buffers and wire the vision, prefix, and expert runners."""
         self.cfg: LingBotVLA2Config = model.config
         self.max_batch_size = int(max_batch_size)
         self.num_images = int(num_images)

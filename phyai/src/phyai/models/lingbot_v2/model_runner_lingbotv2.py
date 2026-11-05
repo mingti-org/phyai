@@ -457,6 +457,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         use_cuda_graph: bool = True,
         use_wavefront_pipeline: bool = False,
     ) -> None:
+        """Select attention backends and check Wavefront execution requirements."""
         self.expert_stack = expert_stack
         self.heads = heads
         self.mrope = mrope
@@ -515,11 +516,22 @@ class LingBotV2ExpertRunner(ModelRunner):
         self.reset()
 
     def setup(self) -> None:
-        """Prepare the fixed time schedule and its learned affine parameters."""
+        """Validate Wavefront kernels and prepare the fixed Euler conditions."""
         self._euler_graphs.clear()
         self._failed_graph_keys.clear()
         self._step_conditions = ()
         self.reset()
+        if self.use_wavefront_pipeline:
+            with torch.no_grad():
+                state = torch.zeros(
+                    1,
+                    self.heads.flow_config.max_state_dim,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
+                self._validate_wavefront_kernels(
+                    self.heads.embed_state(state).reshape(1, -1)
+                )
         common = {
             "max_batch_size": self.max_batch_size,
             "max_paged_kv_indices": self.max_paged_kv_indices,
@@ -658,6 +670,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         wavefront: _LingBotV2WavefrontState | None = None,
         step: int = 0,
     ) -> torch.Tensor:
+        """Run State/Action layers with ordered KV reads and a final stream join."""
         batch_size = state_hidden.shape[0]
         cond = condition.cond[:batch_size]
         action_hidden = self.heads.embed_action(x_t, cond)
@@ -745,6 +758,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         action_write_indices: torch.Tensor,
         wavefront: _LingBotV2WavefrontState | None = None,
     ) -> torch.Tensor:
+        """Advance action noise through the cached Euler conditions."""
         if not self._step_conditions or self._dt is None:
             raise RuntimeError("setup must run before the LingBot V2 Euler loop.")
         state_context, action_context = self._contexts(
@@ -769,8 +783,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         return x_t
 
     def _validate_wavefront_kernels(self, state_hidden: torch.Tensor) -> None:
-        """Reject collectives and GEMMs whose scratch may be shared across streams."""
-        batch_size = state_hidden.shape[0]
+        """Reject collectives and unsafe GEMMs for every supported batch size."""
         for layer in self.expert_stack.layers:
             if (
                 isinstance(layer.mlp, LingBotV2TokenMoE)
@@ -788,29 +801,32 @@ class LingBotV2ExpertRunner(ModelRunner):
                             raise ValueError(
                                 f"LingBot wavefront pipeline requires {group}=1."
                             )
-                    for capture in (False, True):
-                        with graph_capture() if capture else nullcontext():
-                            for tokens in (batch_size, batch_size * self.chunk_size):
-                                selection = resolve_linear_kernel(
-                                    linear,
-                                    state_hidden,
-                                    M=tokens,
-                                    N=linear.output_size_per_partition,
-                                    K=linear.input_size_per_partition,
-                                )
-                                if selection.kernel_id != "torch.gemm.bf16":
-                                    raise ValueError(
-                                        "LingBot wavefront pipeline requires "
-                                        "torch.gemm.bf16 for concurrent linear layers; "
-                                        f"{linear.prefix} selects {selection.kernel_id} "
-                                        f"with M={tokens}, capture={capture}."
+                    for batch_size in range(1, self.max_batch_size + 1):
+                        for capture in (False, True):
+                            with graph_capture() if capture else nullcontext():
+                                for tokens in (
+                                    batch_size,
+                                    batch_size * self.chunk_size,
+                                ):
+                                    selection = resolve_linear_kernel(
+                                        linear,
+                                        state_hidden,
+                                        M=tokens,
+                                        N=linear.output_size_per_partition,
+                                        K=linear.input_size_per_partition,
                                     )
+                                    if selection.kernel_id != "torch.gemm.bf16":
+                                        raise ValueError(
+                                            "LingBot wavefront pipeline requires "
+                                            "torch.gemm.bf16 for concurrent linear layers; "
+                                            f"{linear.prefix} selects {selection.kernel_id} "
+                                            f"with M={tokens}, capture={capture}."
+                                        )
 
     def _capture_euler_graph(
         self, inputs: dict[str, torch.Tensor]
     ) -> _LingBotV2EulerGraphState:
-        if self.use_wavefront_pipeline:
-            self._validate_wavefront_kernels(inputs["state_hidden"])
+        """Capture Euler steps and retain their plans, stream, and events."""
         assert self._state_metadata is not None and self._action_metadata is not None
         state_plan = self.state_backend.init_capture_metadata(self._state_metadata)
         action_plan = self.action_backend.init_capture_metadata(self._action_metadata)
