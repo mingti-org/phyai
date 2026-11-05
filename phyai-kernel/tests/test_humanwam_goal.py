@@ -1,8 +1,8 @@
-"""GoalWAM fusion contracts across the supported local head counts."""
+"""HumanWAM-Goal fusion contracts across the supported local head counts."""
 
 import torch
 import pytest
-from phyai_kernel.triton.goalwam import _prepare_qkv, _add_rms_norm
+from phyai_kernel.triton.humanwam_goal import _prepare_qkv, _add_rms_norm
 
 
 @pytest.mark.parametrize("rows", [1, 37, 318])

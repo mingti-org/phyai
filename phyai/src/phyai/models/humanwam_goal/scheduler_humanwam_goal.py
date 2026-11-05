@@ -1,48 +1,57 @@
-"""Text conditioning, visual encoding, and ten-step GoalWAM sampling."""
+"""Text conditioning, visual encoding, and ten-step HumanWAM-Goal sampling."""
 
 import math
 from dataclasses import fields, replace
 
 import numpy as np
 import torch
-from phyai_utils_tools.models.goalwam.positions_goalwam import goalwam_position_ids
+from phyai_utils_tools.models.humanwam_goal.positions_humanwam_goal import (
+    humanwam_goal_position_ids,
+)
 
 from phyai.runtime.schedule import Scheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
-from phyai.models.goalwam.sampler_goalwam import build_goalwam_schedule
-from phyai.models.goalwam.modeling_goalwam import GoalWAMLayout, GoalWAMTransformer
-from phyai.models.goalwam.requests_goalwam import (
-    GoalWAMTextRequest,
-    GoalWAMStageRequest,
-    GoalWAMEncodeRequest,
-    GoalWAMDenoiseRequest,
-    GoalWAMObservationRequest,
+from phyai.models.humanwam_goal.sampler_humanwam_goal import (
+    build_humanwam_goal_schedule,
 )
-from phyai.models.goalwam.model_runner_goalwam import (
-    GoalWAMRunner,
-    GoalWAMVAERunner,
-    GoalWAMTextRunner,
+from phyai.models.humanwam_goal.modeling_humanwam_goal import (
+    HumanWAMGoalLayout,
+    HumanWAMGoalTransformer,
 )
-from phyai.models.goalwam.configuration_goalwam import GoalWAMSamplingConfig
+from phyai.models.humanwam_goal.requests_humanwam_goal import (
+    HumanWAMGoalTextRequest,
+    HumanWAMGoalStageRequest,
+    HumanWAMGoalEncodeRequest,
+    HumanWAMGoalDenoiseRequest,
+    HumanWAMGoalObservationRequest,
+)
+from phyai.models.humanwam_goal.model_runner_humanwam_goal import (
+    HumanWAMGoalRunner,
+    HumanWAMGoalVAERunner,
+    HumanWAMGoalTextRunner,
+)
+from phyai.models.humanwam_goal.configuration_humanwam_goal import (
+    HumanWAMGoalSamplingConfig,
+)
 from phyai.models.cosmos3.model_runner_rollout_cosmos3 import (
     Cosmos3UniPCState,
 )
 
 
-class GoalWAMScheduler(Scheduler):
+class HumanWAMGoalScheduler(Scheduler):
     def __init__(
         self,
-        transformer: GoalWAMTransformer,
+        transformer: HumanWAMGoalTransformer,
         *,
         device: torch.device | str,
-        sampling: GoalWAMSamplingConfig,
+        sampling: HumanWAMGoalSamplingConfig,
         vae: Cosmos3WanVAE | None = None,
         use_cuda_graph: bool = True,
     ) -> None:
         self.device = torch.device(device)
         self.sampling = sampling
-        self.vlm = GoalWAMTextRunner(transformer, device=device)
-        self.dit = GoalWAMRunner(
+        self.vlm = HumanWAMGoalTextRunner(transformer, device=device)
+        self.dit = HumanWAMGoalRunner(
             transformer,
             device=device,
             use_cuda_graph=use_cuda_graph,
@@ -50,7 +59,7 @@ class GoalWAMScheduler(Scheduler):
         self.vae = (
             None
             if vae is None
-            else GoalWAMVAERunner(
+            else HumanWAMGoalVAERunner(
                 vae,
                 device=device,
                 dtype=transformer.proj_in.weight.dtype,
@@ -66,27 +75,27 @@ class GoalWAMScheduler(Scheduler):
         if self.vae is not None:
             self.vae.setup()
             self.vae.stage_encoder(self.device)
-        self.schedule = build_goalwam_schedule(self.sampling, self.device)
+        self.schedule = build_humanwam_goal_schedule(self.sampling, self.device)
 
     @torch.inference_mode()
-    def step(self, request: GoalWAMStageRequest):
-        if isinstance(request, GoalWAMTextRequest):
+    def step(self, request: HumanWAMGoalStageRequest):
+        if isinstance(request, HumanWAMGoalTextRequest):
             self.vlm.stage(self.device)
             result = self.vlm.forward(request.text_ids, request.text_mask)
             if request.offload_after:
                 self.vlm.offload()
             return {"text_tokens": result[0][0].shape[1]}
-        if isinstance(request, GoalWAMEncodeRequest):
+        if isinstance(request, HumanWAMGoalEncodeRequest):
             if self.vae is None:
                 raise RuntimeError("Load the VAE before encoding observations")
             return tuple(self.vae.encode(pixels) for pixels in request.pixels)
-        if isinstance(request, GoalWAMDenoiseRequest):
+        if isinstance(request, HumanWAMGoalDenoiseRequest):
             return self.denoise(request)
-        if isinstance(request, GoalWAMObservationRequest):
+        if isinstance(request, HumanWAMGoalObservationRequest):
             return self.observation(request)
-        raise TypeError(f"Unsupported GoalWAM request: {type(request).__name__}")
+        raise TypeError(f"Unsupported HumanWAM-Goal request: {type(request).__name__}")
 
-    def observation(self, request: GoalWAMObservationRequest) -> dict[str, object]:
+    def observation(self, request: HumanWAMGoalObservationRequest) -> dict[str, object]:
         if self.vae is None or not self.vlm.cached_kv:
             raise RuntimeError("Load the VAE and prefill text before observations")
         if len(request.pixels) != len(request.history_ages_seconds) + 2:
@@ -130,7 +139,7 @@ class GoalWAMScheduler(Scheduler):
             )
             for value in vision
         )
-        positions = goalwam_position_ids(
+        positions = humanwam_goal_position_ids(
             text_tokens=self.vlm.cached_kv[0][0].shape[1],
             grids=grids,
             history_ages_seconds=request.history_ages_seconds,
@@ -142,7 +151,7 @@ class GoalWAMScheduler(Scheduler):
             temporal_modality_margin=config.temporal_modality_margin,
         )
         return self.denoise(
-            GoalWAMDenoiseRequest(
+            HumanWAMGoalDenoiseRequest(
                 vision=vision,
                 video_noisy_masks=masks,
                 video_roles=(1,) + (0,) * (len(vision) - 1),
@@ -155,7 +164,7 @@ class GoalWAMScheduler(Scheduler):
             )
         )
 
-    def denoise(self, request: GoalWAMDenoiseRequest) -> dict[str, object]:
+    def denoise(self, request: HumanWAMGoalDenoiseRequest) -> dict[str, object]:
         if not self.vlm.cached_kv or self.schedule is None:
             raise RuntimeError("Set up the scheduler and prefill text before denoising")
         plan = self.dit.plan(request)
@@ -218,8 +227,11 @@ class GoalWAMScheduler(Scheduler):
                 ],
                 freqs_gen=(buffers["cos"], buffers["sin"]),
             )
-            layout = GoalWAMLayout(
-                **{field.name: buffers[field.name] for field in fields(GoalWAMLayout)}
+            layout = HumanWAMGoalLayout(
+                **{
+                    field.name: buffers[field.name]
+                    for field in fields(HumanWAMGoalLayout)
+                }
             )
             state = Cosmos3UniPCState(schedule)
             current = buffers["initial"]

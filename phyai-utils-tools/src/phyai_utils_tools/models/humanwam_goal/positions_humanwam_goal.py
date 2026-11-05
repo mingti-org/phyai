@@ -1,4 +1,4 @@
-"""Goal, history, rollout, and action positions for GoalWAM."""
+"""Goal, history, rollout, and action positions for HumanWAM-Goal."""
 
 import math
 
@@ -9,7 +9,7 @@ from phyai_utils_tools.models.cosmos3.positions_cosmos3 import (
 )
 
 
-def goalwam_position_ids(
+def humanwam_goal_position_ids(
     *,
     text_tokens: int,
     grids: tuple[tuple[int, int, int], ...],

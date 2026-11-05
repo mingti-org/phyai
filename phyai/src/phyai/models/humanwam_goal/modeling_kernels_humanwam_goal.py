@@ -1,4 +1,4 @@
-"""GoalWAM fusions; projections and attention retain PhyAI's public layers."""
+"""HumanWAM-Goal fusions; projections and attention retain PhyAI's public layers."""
 
 import torch
 
@@ -9,7 +9,7 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
 )
 
 
-def add_goalwam_norm(
+def add_humanwam_goal_norm(
     residual: torch.Tensor, projected: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Round the residual sum before computing its variance and affine."""
@@ -22,7 +22,7 @@ def add_goalwam_norm(
         and projected.is_contiguous()
         and norm.cast_before_affine
     ):
-        from phyai_kernel.triton.goalwam import _add_rms_norm
+        from phyai_kernel.triton.humanwam_goal import _add_rms_norm
 
         hidden, normalized = torch.empty_like(residual), torch.empty_like(residual)
         _add_rms_norm[(residual.numel() // 4096,)](
@@ -40,7 +40,7 @@ def add_goalwam_norm(
     return hidden, norm(hidden)
 
 
-def prepare_goalwam_attention(
+def prepare_humanwam_goal_attention(
     attention: Cosmos3CrossAttention,
     hidden: torch.Tensor,
     text_key: torch.Tensor,
@@ -74,7 +74,7 @@ def prepare_goalwam_attention(
             for t in tensors
         )
     ):
-        from phyai_kernel.triton.goalwam import _prepare_qkv
+        from phyai_kernel.triton.humanwam_goal import _prepare_qkv
 
         query, key, value = (t.squeeze(0) for t in (query, key, value))
         text_key, text_value = text_key.squeeze(0), text_value.squeeze(0)

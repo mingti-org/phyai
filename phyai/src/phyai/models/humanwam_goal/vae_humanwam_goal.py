@@ -1,4 +1,4 @@
-"""Independent-frame observation encoding with GoalWAM latent normalization."""
+"""Independent-frame observation encoding with HumanWAM-Goal latent normalization."""
 
 import torch
 
@@ -6,7 +6,7 @@ from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, patchify
 from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3WanVAEConfig
 
 
-class GoalWAMVAE(Cosmos3WanVAE):
+class HumanWAMGoalVAE(Cosmos3WanVAE):
     def __init__(
         self, config: Cosmos3WanVAEConfig, *, params_dtype: torch.dtype
     ) -> None:
@@ -23,9 +23,11 @@ class GoalWAMVAE(Cosmos3WanVAE):
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         if sample or generator is not None:
-            raise ValueError("GoalWAM conditions use the VAE posterior mean")
+            raise ValueError("HumanWAM-Goal conditions use the VAE posterior mean")
         if pixels.ndim != 5 or pixels.shape[0:3] != (1, 3, 1):
-            raise ValueError("Encode each GoalWAM observation as one [1,3,1,H,W] frame")
+            raise ValueError(
+                "Encode each HumanWAM-Goal observation as one [1,3,1,H,W] frame"
+            )
         # Capture and eager encoding use the same deterministic convolution
         # choices, without changing the caller's cuDNN settings permanently.
         with torch.backends.cudnn.flags(

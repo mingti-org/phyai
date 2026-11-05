@@ -1,4 +1,4 @@
-"""GoalWAM runtime state and graph ownership."""
+"""HumanWAM-Goal runtime state and graph ownership."""
 
 import hashlib
 from collections import OrderedDict
@@ -11,8 +11,11 @@ from phyai.parallel import default_mesh
 from phyai.kernel.types import KernelMode
 from phyai.layers.attention.enums import AttnLayout
 from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Condition
-from phyai.models.goalwam.modeling_goalwam import GoalWAMLayout, GoalWAMTransformer
-from phyai.models.goalwam.requests_goalwam import GoalWAMDenoiseRequest
+from phyai.models.humanwam_goal.modeling_humanwam_goal import (
+    HumanWAMGoalLayout,
+    HumanWAMGoalTransformer,
+)
+from phyai.models.humanwam_goal.requests_humanwam_goal import HumanWAMGoalDenoiseRequest
 from phyai.models.cosmos3.model_runner_staged_cosmos3 import (
     Cosmos3DiTRunner,
     Cosmos3VLMRunner,
@@ -23,14 +26,14 @@ from phyai.models.cosmos3.model_runner_vae_optimized_cosmos3 import (
 
 
 @dataclass(frozen=True)
-class GoalWAMPlan:
+class HumanWAMGoalPlan:
     shapes: tuple[tuple[int, ...], ...]
     sizes: tuple[int, ...]
     patch_counts: tuple[int, ...]
-    layout: GoalWAMLayout
+    layout: HumanWAMGoalLayout
 
 
-class GoalWAMVAERunner(Cosmos3OptimizedVAERunner):
+class HumanWAMGoalVAERunner(Cosmos3OptimizedVAERunner):
     """Cache independent CPU-supplied frames by their complete pixel contents."""
 
     def __init__(self, *args, max_cached_frames: int = 8, **kwargs):
@@ -79,7 +82,7 @@ class GoalWAMVAERunner(Cosmos3OptimizedVAERunner):
             self.vae.latents_inv_std = self.vae.latents_inv_std.to(device)
 
 
-class GoalWAMTextRunner(Cosmos3VLMRunner):
+class HumanWAMGoalTextRunner(Cosmos3VLMRunner):
     """Prefill the full text tower, retaining only this Generator rank's KV."""
 
     @torch.no_grad()
@@ -87,7 +90,7 @@ class GoalWAMTextRunner(Cosmos3VLMRunner):
         self, text_ids: torch.Tensor, text_mask: torch.Tensor
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         if text_ids.ndim != 2 or text_ids.shape[0] != 1:
-            raise ValueError("GoalWAM text prefill requires a single prompt")
+            raise ValueError("HumanWAM-Goal text prefill requires a single prompt")
         cached = super().forward(text_ids, text_mask)
         mesh = default_mesh()
         size, rank = mesh.group_size("attention_tp"), mesh.group_rank("attention_tp")
@@ -102,12 +105,12 @@ class GoalWAMTextRunner(Cosmos3VLMRunner):
         return self.cached_kv
 
 
-class GoalWAMRunner(Cosmos3DiTRunner):
+class HumanWAMGoalRunner(Cosmos3DiTRunner):
     """Reuse Cosmos3 stage residency, attention plans, and graph lifecycle."""
 
     def __init__(
         self,
-        transformer: GoalWAMTransformer,
+        transformer: HumanWAMGoalTransformer,
         *,
         device: torch.device | str,
         use_cuda_graph: bool = True,
@@ -120,7 +123,7 @@ class GoalWAMRunner(Cosmos3DiTRunner):
         self.selected_context = None
         self.selected_context_signature = None
 
-    def condition_for_plan(self, plan: GoalWAMPlan) -> Cosmos3Condition:
+    def condition_for_plan(self, plan: HumanWAMGoalPlan) -> Cosmos3Condition:
         condition = self.rollout_condition() if self.use_cuda_graph else self.condition
         if condition is None:
             raise RuntimeError("Prepare Generator conditioning before denoising")
@@ -162,7 +165,7 @@ class GoalWAMRunner(Cosmos3DiTRunner):
             attention_preparation=None,
         )
 
-    def plan(self, request: GoalWAMDenoiseRequest) -> GoalWAMPlan:
+    def plan(self, request: HumanWAMGoalDenoiseRequest) -> HumanWAMGoalPlan:
         config = self.transformer.config
         if not request.vision or not (
             len(request.vision)
@@ -230,7 +233,7 @@ class GoalWAMRunner(Cosmos3DiTRunner):
                 "GEN positions must match the packed visual and action rows"
             )
         action_rows = action_noisy.nonzero().flatten()
-        layout = GoalWAMLayout(
+        layout = HumanWAMGoalLayout(
             goal_rows=torch.cat(goals),
             video_noisy_rows=torch.cat(noisy).nonzero().flatten(),
             action_noisy_rows=action_rows,
@@ -242,21 +245,21 @@ class GoalWAMRunner(Cosmos3DiTRunner):
         shapes = tuple(
             tuple(value.shape) for value in (*request.vision, request.action)
         )
-        return GoalWAMPlan(
+        return HumanWAMGoalPlan(
             shapes=shapes,
             sizes=tuple(value.numel() for value in (*request.vision, request.action)),
             patch_counts=tuple(counts),
             layout=layout,
         )
 
-    def layout_inputs(self, plan: GoalWAMPlan) -> dict[str, torch.Tensor]:
+    def layout_inputs(self, plan: HumanWAMGoalPlan) -> dict[str, torch.Tensor]:
         return {
             field.name: getattr(plan.layout, field.name).to(self.device)
-            for field in fields(GoalWAMLayout)
+            for field in fields(HumanWAMGoalLayout)
         }
 
     def time_embeddings(
-        self, timesteps: torch.Tensor, plan: GoalWAMPlan
+        self, timesteps: torch.Tensor, plan: HumanWAMGoalPlan
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         counts = (
             plan.layout.video_noisy_rows.numel(),
@@ -284,8 +287,8 @@ class GoalWAMRunner(Cosmos3DiTRunner):
         latent: torch.Tensor,
         timestep: torch.Tensor,
         condition: Cosmos3Condition,
-        plan: GoalWAMPlan,
-        layout: GoalWAMLayout,
+        plan: HumanWAMGoalPlan,
+        layout: HumanWAMGoalLayout,
         *,
         time_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:

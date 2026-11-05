@@ -4,15 +4,17 @@ from dataclasses import replace
 
 import torch
 
-from phyai.models.goalwam.configuration_goalwam import GoalWAMSamplingConfig
+from phyai.models.humanwam_goal.configuration_humanwam_goal import (
+    HumanWAMGoalSamplingConfig,
+)
 from phyai.models.cosmos3.model_runner_rollout_cosmos3 import (
     Cosmos3UniPCSchedule,
     build_native_unipc_schedule,
 )
 
 
-def build_goalwam_schedule(
-    config: GoalWAMSamplingConfig, device: torch.device
+def build_humanwam_goal_schedule(
+    config: HumanWAMGoalSamplingConfig, device: torch.device
 ) -> Cosmos3UniPCSchedule:
     if config.corrector_weights is None:
         raise ValueError(

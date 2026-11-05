@@ -1,4 +1,4 @@
-"""Replicated GoalWAM text projections with reference rounding boundaries."""
+"""Replicated HumanWAM-Goal text projections with reference rounding boundaries."""
 
 import torch
 from torch.nn import functional as F
@@ -8,7 +8,7 @@ from phyai.layers.linear import QKVParallelLinear
 from phyai.layers.layer_norm import RMSNorm
 
 
-class GoalWAMRMSNorm(RMSNorm):
+class HumanWAMGoalRMSNorm(RMSNorm):
     """Keep the FP32 mean and activation-dtype rounding before the affine."""
 
     def forward(
@@ -22,12 +22,14 @@ class GoalWAMRMSNorm(RMSNorm):
         return self.weight * normalized.to(value.dtype)
 
 
-class GoalWAMTextProjection(QKVParallelLinear):
+class HumanWAMGoalTextProjection(QKVParallelLinear):
     """Share PhyAI's fused weight loader, preserving three separate GEMMs."""
 
     def forward(self, value: torch.Tensor) -> tuple[torch.Tensor, None]:
         if self.tp_size != 1 or self.bias is not None:
-            raise ValueError("GoalWAM text prefill uses replicated, bias-free Q/K/V")
+            raise ValueError(
+                "HumanWAM-Goal text prefill uses replicated, bias-free Q/K/V"
+            )
         outputs = (
             F.linear(value, weight)
             for weight in self.weight.split(self.output_partition_sizes, dim=0)
@@ -35,7 +37,7 @@ class GoalWAMTextProjection(QKVParallelLinear):
         return torch.cat(tuple(outputs), dim=-1), None
 
 
-def register_goalwam_text_mesh() -> str:
+def register_humanwam_goal_text_mesh() -> str:
     """Use singleton layer groups for prefill; the runner shards the result."""
     model = default_mesh()
     size = model.replica_world_size
@@ -43,6 +45,6 @@ def register_goalwam_text_mesh() -> str:
         name: tuple((rank,) for rank in range(size)) for name in model.group_names
     }
     groups["world"] = (tuple(range(size)),)
-    mesh = Mesh(RankLayout(size, groups), rank=model.rank, name="goalwam_text")
+    mesh = Mesh(RankLayout(size, groups), rank=model.rank, name="humanwam_goal_text")
     register_mesh(mesh)
     return mesh.name

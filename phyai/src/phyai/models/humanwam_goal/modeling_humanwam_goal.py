@@ -1,4 +1,4 @@
-"""Stateless GoalWAM forward using PhyAI's Cosmos3 towers and TP layers."""
+"""Stateless HumanWAM-Goal forward using PhyAI's Cosmos3 towers and TP layers."""
 
 from dataclasses import fields, dataclass
 
@@ -11,10 +11,10 @@ from phyai.layers.linear import ReplicatedLinear
 from phyai.weights.shards import replicated
 from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.mlp.dense_mlp import DenseMLP
-from phyai.models.goalwam.text_goalwam import (
-    GoalWAMRMSNorm,
-    GoalWAMTextProjection,
-    register_goalwam_text_mesh,
+from phyai.models.humanwam_goal.text_humanwam_goal import (
+    HumanWAMGoalRMSNorm,
+    HumanWAMGoalTextProjection,
+    register_humanwam_goal_text_mesh,
 )
 from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Condition,
@@ -23,10 +23,10 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3LanguageModel,
 )
 from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3Config
-from phyai.models.goalwam.configuration_goalwam import GoalWAMConfig
-from phyai.models.goalwam.modeling_kernels_goalwam import (
-    add_goalwam_norm,
-    prepare_goalwam_attention,
+from phyai.models.humanwam_goal.configuration_humanwam_goal import HumanWAMGoalConfig
+from phyai.models.humanwam_goal.modeling_kernels_humanwam_goal import (
+    add_humanwam_goal_norm,
+    prepare_humanwam_goal_attention,
 )
 
 
@@ -35,7 +35,7 @@ class SharedEEFLinear(nn.Module):
 
     def __init__(
         self,
-        config: GoalWAMConfig,
+        config: HumanWAMGoalConfig,
         *,
         output: bool,
         params_dtype: torch.dtype,
@@ -103,7 +103,7 @@ class SharedEEFLinear(nn.Module):
 
 
 @dataclass(frozen=True)
-class GoalWAMLayout:
+class HumanWAMGoalLayout:
     """Immutable row metadata supplied by the runner, independent of values."""
 
     goal_rows: torch.Tensor
@@ -115,10 +115,10 @@ class GoalWAMLayout:
     output_joint_rows: torch.Tensor
 
 
-class GoalWAMTransformer(Cosmos3Transformer):
+class HumanWAMGoalTransformer(Cosmos3Transformer):
     def __init__(
         self,
-        config: GoalWAMConfig,
+        config: HumanWAMGoalConfig,
         *,
         params_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str | None = None,
@@ -140,7 +140,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
         # A separate logical mesh keeps common UND layers unsharded even when
         # the Generator uses TP. It creates no extra process groups.
         del self.language_model
-        with use_mesh(register_goalwam_text_mesh()):
+        with use_mesh(register_humanwam_goal_text_mesh()):
             self.language_model = Cosmos3LanguageModel(
                 config,
                 attn_backend=attn_backend,
@@ -149,7 +149,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
                 device=device,
             )
             for index, layer in enumerate(self.language_model.layers):
-                layer.self_attn.qkv_proj = GoalWAMTextProjection(
+                layer.self_attn.qkv_proj = HumanWAMGoalTextProjection(
                     config.hidden_size,
                     config.head_dim,
                     config.num_attention_heads,
@@ -197,7 +197,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
                 replacements.append(
                     (
                         name,
-                        GoalWAMRMSNorm(
+                        HumanWAMGoalRMSNorm(
                             module.hidden_size,
                             eps=module.variance_epsilon,
                             backend=module.backend,
@@ -218,7 +218,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
         actions: torch.Tensor,
         timestep: torch.Tensor,
         condition: Cosmos3Condition,
-        layout: GoalWAMLayout,
+        layout: HumanWAMGoalLayout,
         *,
         time_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -285,7 +285,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
             zip(self.gen_layers, condition.cached_kv, strict=True)
         ):
             attention = layer.cross_attention
-            query, key, value = prepare_goalwam_attention(
+            query, key, value = prepare_humanwam_goal_attention(
                 attention, normalized, key, value, cos, sin
             )
             if index == last:
@@ -298,7 +298,7 @@ class GoalWAMTransformer(Cosmos3Transformer):
             )
             attended = attention.attn(query, key, value, context).flatten(-2)
             projected, _ = attention.to_out(attended)
-            hidden, normalized = add_goalwam_norm(
+            hidden, normalized = add_humanwam_goal_norm(
                 hidden, projected, layer.post_attention_layernorm
             )
             projected = layer.mlp(normalized)
@@ -307,5 +307,5 @@ class GoalWAMTransformer(Cosmos3Transformer):
                 if index == last
                 else self.gen_layers[index + 1].input_layernorm
             )
-            hidden, normalized = add_goalwam_norm(hidden, projected, next_norm)
+            hidden, normalized = add_humanwam_goal_norm(hidden, projected, next_norm)
         return normalized

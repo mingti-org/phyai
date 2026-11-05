@@ -12,9 +12,9 @@ from pathlib import Path
 import torch
 
 
-def goalwam_sum_library():
+def humanwam_goal_sum_library():
     """Compile the small C ABI once; never modify the serving environment."""
-    source = Path(__file__).parent.parent / "csrc" / "goalwam_sum"
+    source = Path(__file__).parent.parent / "csrc" / "humanwam_goal_sum"
     nvcc = shutil.which("nvcc") or str(
         Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "bin/nvcc"
     )
@@ -69,8 +69,8 @@ def goalwam_sum_library():
                 )
             temporary.replace(target)
     library = C.CDLL(str(target))
-    library._goalwam_build_hash = digest.hexdigest()
-    library._goalwam_binary_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    library._humanwam_goal_build_hash = digest.hexdigest()
+    library._humanwam_goal_binary_hash = hashlib.sha256(target.read_bytes()).hexdigest()
     pointer, integer, size = C.c_void_p, C.c_int, C.c_size_t
     declarations = {
         "error_message": ([], C.c_char_p),

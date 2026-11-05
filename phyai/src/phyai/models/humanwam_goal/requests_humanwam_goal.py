@@ -1,4 +1,4 @@
-"""Single-request inputs for the GoalWAM inference stages."""
+"""Single-request inputs for the HumanWAM-Goal inference stages."""
 
 from dataclasses import dataclass
 
@@ -6,21 +6,21 @@ import torch
 
 
 @dataclass
-class GoalWAMTextRequest:
+class HumanWAMGoalTextRequest:
     text_ids: torch.Tensor
     text_mask: torch.Tensor
     offload_after: bool = True
 
 
 @dataclass
-class GoalWAMEncodeRequest:
+class HumanWAMGoalEncodeRequest:
     """Independent RGB frames [1,3,1,H,W], normalized to [-1,1]."""
 
     pixels: tuple[torch.Tensor, ...]
 
 
 @dataclass
-class GoalWAMDenoiseRequest:
+class HumanWAMGoalDenoiseRequest:
     """Normalized visual/action conditions with explicit packed positions.
 
     Visual streams are [1,C,T,H,W], ordered goal, histories, rollout. Action
@@ -41,8 +41,8 @@ class GoalWAMDenoiseRequest:
 
 
 @dataclass
-class GoalWAMObservationRequest:
-    """Prepared camera frames and normalized actions from GoalWAMProcessor.
+class HumanWAMGoalObservationRequest:
+    """Prepared camera frames and normalized actions from HumanWAMGoalProcessor.
 
     Pixels are independent [1,3,1,H,W] goal/history/current frames. Action
     values already use the checkpoint's normalization and coordinate system.
@@ -59,9 +59,9 @@ class GoalWAMObservationRequest:
     action_fps: float = 30.0
 
 
-GoalWAMStageRequest = (
-    GoalWAMTextRequest
-    | GoalWAMEncodeRequest
-    | GoalWAMDenoiseRequest
-    | GoalWAMObservationRequest
+HumanWAMGoalStageRequest = (
+    HumanWAMGoalTextRequest
+    | HumanWAMGoalEncodeRequest
+    | HumanWAMGoalDenoiseRequest
+    | HumanWAMGoalObservationRequest
 )

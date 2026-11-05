@@ -4,7 +4,7 @@ Model weights: [HumanWAM-Goal on Hugging Face](https://huggingface.co/collection
 
 Predict a 48-step action chunk from an instruction, goal image, camera views, and robot state.
 
-HumanWAM-Goal uses the `goalwam` plugin and the `examples/HumanWAM-Goal` entry point.
+HumanWAM-Goal uses the `humanwam_goal` plugin and the `examples/HumanWAM-Goal` entry point.
 See the inference guide in [English](../../docs/models/humanwam-goal/inference.mdx)
 or [中文](../../docs/zh/models/humanwam-goal/inference.mdx).
 

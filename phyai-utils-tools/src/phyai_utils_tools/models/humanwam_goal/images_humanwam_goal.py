@@ -10,7 +10,7 @@ import torch
 from torch.nn import functional as F
 
 
-def select_goalwam_history(
+def select_humanwam_goal_history(
     captures: Sequence[Mapping],
     current_time: float,
     offsets: tuple[float, ...],
@@ -34,7 +34,7 @@ def select_goalwam_history(
     return tuple(selected)
 
 
-def goalwam_canvas(
+def humanwam_goal_canvas(
     images: Mapping[str, np.ndarray],
     *,
     cell_size: tuple[int, int],

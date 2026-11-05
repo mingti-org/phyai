@@ -4,13 +4,13 @@ description: "使用 PhyAI 在单 GPU 或张量并行模式下运行目标条件
 ---
 
 HumanWAM-Goal 根据任务指令、当前相机图像、目标图像和机器人状态，
-预测一段动作。在 PhyAI 中使用 `goalwam` 插件和
+预测一段动作。在 PhyAI 中使用 `humanwam_goal` 插件和
 `examples/HumanWAM-Goal/run_humanwam_goal.py` 示例入口。Python 导入路径为
-`phyai.models.goalwam` 和 `phyai_utils_tools.models.goalwam`。
+`phyai.models.humanwam_goal` 和 `phyai_utils_tools.models.humanwam_goal`。
 
 | 项目 | 配置 |
 | --- | --- |
-| PhyAI 插件 | `goalwam` |
+| PhyAI 插件 | `humanwam_goal` |
 | 输入 | 指令、当前与目标 RGB 图像、归一化状态，可选视觉历史和 RTC 前缀 |
 | 输出 | CPU 上的 `float32` 归一化动作，默认形状为 `[1, 48, 49]` |
 | 推理 | BF16 模型参数、10 步去噪，默认启用 CUDA Graph |

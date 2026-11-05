@@ -1,4 +1,4 @@
-"""GoalWAM pointwise fusions with explicit BF16 rounding boundaries."""
+"""HumanWAM-Goal pointwise fusions with explicit BF16 rounding boundaries."""
 
 import triton
 import triton.language as tl

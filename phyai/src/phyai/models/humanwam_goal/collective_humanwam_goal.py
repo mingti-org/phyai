@@ -1,4 +1,4 @@
-"""GoalWAM's fixed-workspace SUM registered with PhyAI parallel dispatch."""
+"""HumanWAM-Goal's fixed-workspace SUM registered with PhyAI parallel dispatch."""
 
 import os
 import ctypes as C
@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from phyai_kernel.cuda.jit.goalwam_sum import goalwam_sum_library
+from phyai_kernel.cuda.jit.humanwam_goal_sum import humanwam_goal_sum_library
 
 from phyai import parallel as P
 from phyai.utils import get_logger
@@ -56,7 +56,7 @@ class FixedWorkspaceSum:
         try:
             if int(os.environ.get("LOCAL_WORLD_SIZE", self.size)) != self.size:
                 raise ValueError("CUDA IPC SUM requires all TP ranks on one node")
-            self.library = goalwam_sum_library()
+            self.library = humanwam_goal_sum_library()
             pointer, handle = C.c_void_p(), C.create_string_buffer(64)
             self._check(
                 self.library.alloc_shared(
@@ -82,7 +82,7 @@ class FixedWorkspaceSum:
             )
             handles.append((handle.raw, offset.value))
         except Exception as exc:
-            logger.exception("GoalWAM SUM initialization failed")
+            logger.exception("HumanWAM-Goal SUM initialization failed")
             error = repr(exc)
         peers = self._gather(
             (
@@ -125,7 +125,7 @@ class FixedWorkspaceSum:
                 )
             )
         except Exception as exc:
-            logger.exception("GoalWAM SUM initialization failed")
+            logger.exception("HumanWAM-Goal SUM initialization failed")
             error = repr(exc)
         errors = self._gather(error)
         if any(errors):
@@ -190,8 +190,8 @@ class FixedWorkspaceSum:
         dist.destroy_process_group(self.cpu)
 
 
-class GoalWAMSumBackend:
-    name = "goalwam-sum"
+class HumanWAMGoalSumBackend:
+    name = "humanwam_goal-sum"
 
     def __init__(self):
         self.owner = FixedWorkspaceSum(dtype=torch.bfloat16)
@@ -226,7 +226,7 @@ class GoalWAMSumBackend:
 
     def execute(self, *, input, output, reduce_op, **kwargs):
         if reduce_op != dist.ReduceOp.SUM:
-            raise ValueError("GoalWAM supports SUM collectives only")
+            raise ValueError("HumanWAM-Goal supports SUM collectives only")
         self.executions += 1
         return self.owner.sum(input, output)
 
@@ -234,7 +234,7 @@ class GoalWAMSumBackend:
         self.owner.close()
 
 
-def install_goalwam_collective():
+def install_humanwam_goal_collective():
     mesh = P.default_mesh()
     if mesh.group_size("dense_tp") == 1:
         return None
@@ -242,9 +242,9 @@ def install_goalwam_collective():
         topology = mesh.topology(group)
         if not topology.is_single_node or not topology.is_full_nvlink:
             raise ValueError(
-                "GoalWAM TP requires a fully connected NVLink group on one node"
+                "HumanWAM-Goal TP requires a fully connected NVLink group on one node"
             )
-    backend = GoalWAMSumBackend()
+    backend = HumanWAMGoalSumBackend()
     previous = P.get_dispatcher()
     previous.registry.register(backend)
     P.set_dispatcher(

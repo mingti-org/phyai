@@ -5,12 +5,12 @@ description: "Run goal-conditioned action inference with PhyAI on one GPU or wit
 
 HumanWAM-Goal predicts an action chunk from a task instruction,
 current camera images, a goal image, and robot state. In PhyAI, use the
-`goalwam` plugin and the `examples/HumanWAM-Goal/run_humanwam_goal.py` entry point.
-Python imports use `phyai.models.goalwam` and `phyai_utils_tools.models.goalwam`.
+`humanwam_goal` plugin and the `examples/HumanWAM-Goal/run_humanwam_goal.py` entry point.
+Python imports use `phyai.models.humanwam_goal` and `phyai_utils_tools.models.humanwam_goal`.
 
 | Item | Configuration |
 | --- | --- |
-| PhyAI plugin | `goalwam` |
+| PhyAI plugin | `humanwam_goal` |
 | Input | Instruction, current and goal RGB images, normalized state, optional visual history and RTC prefix |
 | Output | CPU `float32` normalized actions, shaped `[1, 48, 49]` with the default configuration |
 | Inference | BF16 model parameters, 10 denoising steps, CUDA Graph enabled by default |

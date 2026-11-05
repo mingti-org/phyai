@@ -1,4 +1,4 @@
-"""GoalWAM camera preprocessing and normalized model-coordinate action inputs."""
+"""HumanWAM-Goal camera preprocessing and normalized model-coordinate action inputs."""
 
 import math
 from dataclasses import dataclass
@@ -8,15 +8,15 @@ import torch
 
 from phyai_utils_tools.processing.pipeline import ProcessorStep, ProcessorPipeline
 from phyai_utils_tools.processing.base_processor import BaseModelProcessor
-from phyai_utils_tools.models.goalwam.images_goalwam import (
-    goalwam_canvas,
-    select_goalwam_history,
+from phyai_utils_tools.models.humanwam_goal.images_humanwam_goal import (
+    humanwam_goal_canvas,
+    select_humanwam_goal_history,
 )
 from phyai_utils_tools.models.cosmos3.processor_cosmos3 import Cosmos3Processor
 
 
 @dataclass(frozen=True)
-class GoalWAMProcessorConfig:
+class HumanWAMGoalProcessorConfig:
     camera_sizes: tuple[tuple[int, int], ...] = ((192, 320), (224, 288))
     cameras: tuple[str, ...] = ("head", "left", "right")
     goal_head_only: bool = True
@@ -72,8 +72,8 @@ class GoalWAMProcessorConfig:
             raise ValueError("Invalid action dimensions or RTC prefix length")
 
 
-class GoalWAMInputStep(ProcessorStep):
-    def __init__(self, config: GoalWAMProcessorConfig):
+class HumanWAMGoalInputStep(ProcessorStep):
+    def __init__(self, config: HumanWAMGoalProcessorConfig):
         self.config = config
 
     def __call__(self, transition):
@@ -93,7 +93,7 @@ class GoalWAMInputStep(ProcessorStep):
             return 1 - (h * scale) * (w * scale) / (th * tw)
 
         size = min(c.camera_sizes, key=padding)
-        history = select_goalwam_history(
+        history = select_humanwam_goal_history(
             transition.get("history", ()),
             float(transition["observation_timestamp"]),
             c.history_offsets_seconds,
@@ -105,7 +105,7 @@ class GoalWAMInputStep(ProcessorStep):
             + [(transition["images"], False)]
         )
         canvases = tuple(
-            goalwam_canvas(
+            humanwam_goal_canvas(
                 images, cell_size=size, cameras=c.cameras, head_only=head_only
             )
             for images, head_only in frames
@@ -175,7 +175,7 @@ class GoalWAMInputStep(ProcessorStep):
         }
 
 
-class GoalWAMOutputStep(ProcessorStep):
+class HumanWAMGoalOutputStep(ProcessorStep):
     def __init__(self, width: int):
         self.width = width
 
@@ -188,13 +188,13 @@ class GoalWAMOutputStep(ProcessorStep):
         }
 
 
-class GoalWAMProcessor(BaseModelProcessor):
+class HumanWAMGoalProcessor(BaseModelProcessor):
     """CPU preprocessing; robot wire-coordinate conversion stays with the caller."""
 
     def __init__(
-        self, tokenizer_path: str, config: GoalWAMProcessorConfig | None = None
+        self, tokenizer_path: str, config: HumanWAMGoalProcessorConfig | None = None
     ):
-        self.config = config or GoalWAMProcessorConfig()
+        self.config = config or HumanWAMGoalProcessorConfig()
         self.text = Cosmos3Processor(tokenizer_path, append_metadata=False)
         super().__init__()
 
@@ -202,9 +202,9 @@ class GoalWAMProcessor(BaseModelProcessor):
         return self.text.tokenize(instruction, augment=False)
 
     def build_preprocessor(self):
-        return ProcessorPipeline(steps=[GoalWAMInputStep(self.config)])
+        return ProcessorPipeline(steps=[HumanWAMGoalInputStep(self.config)])
 
     def build_postprocessor(self):
         return ProcessorPipeline(
-            steps=[GoalWAMOutputStep(self.config.output_action_dim)]
+            steps=[HumanWAMGoalOutputStep(self.config.output_action_dim)]
         )

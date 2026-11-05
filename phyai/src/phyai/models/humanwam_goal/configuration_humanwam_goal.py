@@ -1,4 +1,4 @@
-"""Inference architecture and sampling configuration for GoalWAM."""
+"""Inference architecture and sampling configuration for HumanWAM-Goal."""
 
 import math
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3Config
 
 
 @dataclass(frozen=True)
-class GoalWAMConfig(Cosmos3Config):
+class HumanWAMGoalConfig(Cosmos3Config):
     action_gen: bool = True
     action_dim: int = 64
     joint_dim: int = 23
@@ -19,18 +19,20 @@ class GoalWAMConfig(Cosmos3Config):
         super().__post_init__()
         if not self.action_gen or self.sound_gen:
             raise ValueError(
-                "GoalWAM requires visual and action generation without sound"
+                "HumanWAM-Goal requires visual and action generation without sound"
             )
         if min(self.joint_dim, self.shared_dim, self.horizon) < 1:
             raise ValueError("Action dimensions and horizon must be positive")
         if self.joint_dim + self.shared_dim > self.action_dim:
             raise ValueError("Shared and joint channels exceed the action width")
         if not self.qk_norm_for_text or not self.qk_norm_for_diffusion:
-            raise ValueError("GoalWAM requires text and generator Q/K normalization")
+            raise ValueError(
+                "HumanWAM-Goal requires text and generator Q/K normalization"
+            )
 
 
 @dataclass(frozen=True)
-class GoalWAMSamplingConfig(PretrainedConfig):
+class HumanWAMGoalSamplingConfig(PretrainedConfig):
     num_steps: int = 10
     flow_shift: float = 2.0
     prefix_length: int = 7
@@ -38,7 +40,7 @@ class GoalWAMSamplingConfig(PretrainedConfig):
 
     def __post_init__(self) -> None:
         if self.num_steps != 10:
-            raise ValueError("GoalWAM inference uses ten denoising steps")
+            raise ValueError("HumanWAM-Goal inference uses ten denoising steps")
         if not math.isfinite(self.flow_shift) or self.flow_shift <= 0:
             raise ValueError("flow_shift must be positive")
         if self.prefix_length < 0:

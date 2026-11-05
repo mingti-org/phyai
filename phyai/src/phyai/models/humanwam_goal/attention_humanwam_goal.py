@@ -1,4 +1,4 @@
-"""GoalWAM's FlashAttention 3 backend through the public attention contract."""
+"""HumanWAM-Goal's FlashAttention 3 backend through the public attention contract."""
 
 from importlib.metadata import version
 
@@ -17,10 +17,10 @@ from phyai.layers.attention.nocache.base import (
 )
 
 
-class GoalWAMAttentionBackend(AttentionBackend):
+class HumanWAMGoalAttentionBackend(AttentionBackend):
     """Preserve the checkpoint reference's attention arithmetic on Hopper."""
 
-    name = "goalwam_fa3"
+    name = "humanwam_goal_fa3"
 
     def __init__(self, runner=None) -> None:
         del runner
@@ -37,7 +37,7 @@ class GoalWAMAttentionBackend(AttentionBackend):
             or meta.mask is not None
             or meta.attn_bias is not None
         ):
-            raise ValueError("GoalWAM attention requires unmasked padded tensors")
+            raise ValueError("HumanWAM-Goal attention requires unmasked padded tensors")
         return AttnPlanHandle()
 
     def forward(
@@ -54,30 +54,32 @@ class GoalWAMAttentionBackend(AttentionBackend):
         return output[0] if isinstance(output, tuple) else output
 
 
-def prepare_goalwam_attention_backend(facts, params):
+def prepare_humanwam_goal_attention_backend(facts, params):
     del facts
     if params:
-        raise ValueError("GoalWAM attention accepts no kernel parameters")
-    return GoalWAMAttentionBackend
+        raise ValueError("HumanWAM-Goal attention accepts no kernel parameters")
+    return HumanWAMGoalAttentionBackend
 
 
-def configure_goalwam_kernels() -> None:
+def configure_humanwam_goal_kernels() -> None:
     """Configure this engine's selector without changing other model defaults."""
     if torch.cuda.get_device_capability() != (9, 0):
-        raise ValueError("GoalWAM's validated precision path requires a Hopper GPU")
+        raise ValueError(
+            "HumanWAM-Goal's validated precision path requires a Hopper GPU"
+        )
     try:
         import flash_attn_3_nv.flash_attn_interface  # noqa: F401
 
         if version("flash-attn-3-nv").split("+")[0] != "1.0.3":
             raise ImportError(
-                "GoalWAM attention requires FlashAttention 3 version 1.0.3"
+                "HumanWAM-Goal attention requires FlashAttention 3 version 1.0.3"
             )
     except (ImportError, OSError) as error:
         raise ImportError(
-            "GoalWAM requires flash-attn-3-nv==1.0.3 and its compatible CUDA runtime"
+            "HumanWAM-Goal requires flash-attn-3-nv==1.0.3 and its compatible CUDA runtime"
         ) from error
     selector = get_kernel_selector()
-    kernel_id = "goalwam_fa3.attention"
+    kernel_id = "humanwam_goal_fa3.attention"
     if selector.catalog.maybe_get(kernel_id) is None:
         selector.catalog.register(
             Impl(
@@ -93,22 +95,22 @@ def configure_goalwam_kernels() -> None:
                     & attrs.mask_kind.is_none()
                     & (attrs.has_attn_bias != True)
                 ),
-                prepare=prepare_goalwam_attention_backend,
+                prepare=prepare_humanwam_goal_attention_backend,
             )
         )
     # Pin the arithmetic whose end-to-end behavior defines this model's
-    # inference contract. The selector belongs to this GoalWAM engine.
+    # inference contract. The selector belongs to this HumanWAM-Goal engine.
     selector.policy = policy_from_mapping(
         {
             "schema": "phyai.kernel/v1",
             "overrides": [
                 {
-                    "id": "goalwam-gemm",
+                    "id": "humanwam_goal-gemm",
                     "match": {"op": "gemm"},
                     "restrict_to": "torch.gemm.*",
                 },
                 {
-                    "id": "goalwam-attention",
+                    "id": "humanwam_goal-attention",
                     "match": {"op": "attention"},
                     "restrict_to": kernel_id,
                 },

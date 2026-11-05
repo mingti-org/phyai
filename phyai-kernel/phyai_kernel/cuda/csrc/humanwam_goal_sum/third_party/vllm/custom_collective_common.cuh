@@ -32,7 +32,7 @@ constexpr int kMaxCustomCollectiveRanks = 16;
   } while (0)
 
 // Maximal number of blocks in allreduce kernel.
-// GoalWAM SM90 launch tuning; arithmetic and synchronization are unchanged.
+// HumanWAM-Goal SM90 launch tuning; arithmetic and synchronization are unchanged.
 constexpr int kMaxBlocks = 128;
 
 // Default number of blocks in allreduce kernel.

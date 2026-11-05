@@ -18,9 +18,15 @@ from phyai.engine_config import (
     DenseParallelConfig,
     AttentionParallelConfig,
 )
-from phyai.models.goalwam import GoalWAMTextRequest, GoalWAMObservationRequest
-from phyai_utils_tools.models.goalwam import GoalWAMProcessor, GoalWAMProcessorConfig
-from phyai.models.goalwam.main_goalwam import GoalWAMArgs
+from phyai.models.humanwam_goal import (
+    HumanWAMGoalTextRequest,
+    HumanWAMGoalObservationRequest,
+)
+from phyai_utils_tools.models.humanwam_goal import (
+    HumanWAMGoalProcessor,
+    HumanWAMGoalProcessorConfig,
+)
+from phyai.models.humanwam_goal.main_humanwam_goal import HumanWAMGoalArgs
 
 from phyai import Engine, EngineArgs
 
@@ -53,15 +59,17 @@ def main() -> None:
     parser.add_argument("--no-cuda-graph", action="store_true")
     args = parser.parse_args()
     config_path = args.checkpoint / "processor.json"
-    processor_config = GoalWAMProcessorConfig(**json.loads(config_path.read_text()))
-    processor = GoalWAMProcessor(
+    processor_config = HumanWAMGoalProcessorConfig(
+        **json.loads(config_path.read_text())
+    )
+    processor = HumanWAMGoalProcessor(
         str(args.checkpoint / "text_tokenizer"), processor_config
     )
     sample = read_sample(args.sample)
     engine = Engine(
         EngineArgs(
-            plugin="goalwam",
-            plugin_args=GoalWAMArgs(checkpoint_dir=args.checkpoint),
+            plugin="humanwam_goal",
+            plugin_args=HumanWAMGoalArgs(checkpoint_dir=args.checkpoint),
             config=EngineConfig(
                 parallel=ParallelConfig(
                     dense=DenseParallelConfig(tp_size=args.tp),
@@ -74,8 +82,10 @@ def main() -> None:
     result = None
     try:
         tokens = processor.tokenize(sample["instruction"])
-        engine.step(GoalWAMTextRequest(tokens.text_ids, tokens.text_mask))
-        result = engine.step(GoalWAMObservationRequest(**processor.preprocess(sample)))
+        engine.step(HumanWAMGoalTextRequest(tokens.text_ids, tokens.text_mask))
+        result = engine.step(
+            HumanWAMGoalObservationRequest(**processor.preprocess(sample))
+        )
         actions = processor.postprocess(result)["normalized_actions"]
         args.output.parent.mkdir(parents=True, exist_ok=True)
         np.save(args.output, actions.numpy())

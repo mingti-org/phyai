@@ -1,7 +1,7 @@
-"""Map GoalWAM inference checkpoint names to PhyAI parameter names."""
+"""Map HumanWAM-Goal inference checkpoint names to PhyAI parameter names."""
 
 
-def goalwam_weight_remap(key: str) -> str | None:
+def humanwam_goal_weight_remap(key: str) -> str | None:
     """Keep unknown names visible to the strict checkpoint loader."""
     if key == "language_model.lm_head.weight":
         return None
