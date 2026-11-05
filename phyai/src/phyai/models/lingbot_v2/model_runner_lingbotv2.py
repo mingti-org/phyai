@@ -823,6 +823,39 @@ class LingBotV2ExpertRunner(ModelRunner):
                                             f"with M={tokens}, capture={capture}."
                                         )
 
+    def _validate_wavefront_stream(self) -> None:
+        """Reject Wavefront on streams owned by a CUDA green context."""
+        try:
+            from cuda.bindings import driver as cu
+        except ImportError as error:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                "cuda.bindings.driver is unavailable."
+            ) from error
+
+        try:
+            with torch.cuda.device(self.device):
+                stream_handle = int(torch.cuda.current_stream(self.device).cuda_stream)
+                status, green_context = cu.cuStreamGetGreenCtx(stream_handle)
+            success = cu.CUresult.CUDA_SUCCESS
+            green_context_handle = int(green_context)
+        except Exception as error:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                "cuStreamGetGreenCtx failed."
+            ) from error
+
+        if status != success:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                f"cuStreamGetGreenCtx returned {status}."
+            )
+        if green_context_handle:
+            raise ValueError(
+                "LingBot wavefront pipeline does not support vGPU green-context "
+                "streams; disable use_wavefront_pipeline for vGPU execution."
+            )
+
     def _capture_euler_graph(
         self, inputs: dict[str, torch.Tensor]
     ) -> _LingBotV2EulerGraphState:
@@ -842,7 +875,16 @@ class LingBotV2ExpertRunner(ModelRunner):
             else None
         )
 
+        stream_rejection: ValueError | None = None
+
         def captured_loop(**inputs: torch.Tensor) -> torch.Tensor:
+            nonlocal stream_rejection
+            if self.use_wavefront_pipeline:
+                try:
+                    self._validate_wavefront_stream()
+                except ValueError as error:
+                    stream_rejection = error
+                    raise
             return self._euler_loop(
                 state_plan=state_plan,
                 action_plan=action_plan,
@@ -854,12 +896,18 @@ class LingBotV2ExpertRunner(ModelRunner):
         try:
             graph.capture(captured_loop, inputs)
         except BaseException:
-            graph.reset()
+            try:
+                graph.reset()
+            finally:
+                if stream_rejection is not None:
+                    raise stream_rejection
             raise
         return _LingBotV2EulerGraphState(graph, state_plan, action_plan, wavefront)
 
     def forward_euler(self, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Embed the state once, then run or replay the full Euler loop."""
+        if self.use_wavefront_pipeline:
+            self._validate_wavefront_stream()
         if self._state_plan is None or self._action_plan is None:
             raise RuntimeError("plan_inference must run before the Euler loop.")
         inputs = {

@@ -1,0 +1,11 @@
+schema: phyai.kernel/v1
+defaults:
+  fallback: reference
+
+rules:
+  - id: dense-linear
+    match: {op: gemm}
+    restrict_to: torch.gemm.*
+  - id: joint-attention
+    match: {op: attention_paged}
+    restrict_to: sdpa.attention_paged
