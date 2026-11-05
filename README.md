@@ -29,6 +29,7 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
+- [2026/11] Support [HumanWAM-Goal](https://arxiv.org/pdf/2611.06817).
 - [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
 - [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
 - [2026/10] Support [Xiaomi Robotics U0](https://phyai.mintlify.app/models/xiaomi-u0/text-to-image) text-to-image generation.
@@ -69,7 +70,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
       <th align="center" width="22%">WAM</th>
       <td align="center">
         <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
-        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>
+        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>,
+        <a href="docs/models/humanwam-goal/inference.mdx"><strong>HumanWAM-Goal</strong></a>
       </td>
     </tr>
     <tr>
@@ -204,14 +206,17 @@ We are actively seeking partnerships with compute providers, chip vendors, and r
 
 ## Citation
 
-If you use PhyAI in research or production work, please cite the project:
+If you use PhyAI in research or production work, please cite the paper:
 
 ```bibtex
-@software{phyai2026,
-  title = {PhyAI: Latency-First Serving Engine for Physical AI},
-  author = {{PhyAI Team}},
-  year = {2026},
-  url = {https://github.com/mingti-org/phyai}
+@misc{wang2026phyairealtimephysicalai,
+  title={PhyAI: Real-Time Physical AI at the Edge, Scalable Rollouts in the Cloud},
+  author={Chenghua Wang and Daliang Xu and Dongqi Cai and Duojin Sun and Hao Zhang and Haoze Qian and Huaiyuan Zhang and Jinshuo Cui and Junbo Cui and Kezhao Zhao and Longxi Gao and Mengwei Xu and Rongjie Yi and Ruixin Liu and Shangguang Wang and Tam Sikyuen and Tianyue Zhang and Weikai Xie and Xuanzhe Liu and Yingying Qin and Yiwen Lu and Yuan Yao and Yuezhi Zu and Yunhan Guo and Yuxin Zheng and Ziqi Guo},
+  year={2026},
+  eprint={2608.03682},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2608.03682},
 }
 ```
 

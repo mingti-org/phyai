@@ -54,6 +54,12 @@
                 ]
               },
               {
+                "group": "HumanWAM-Goal",
+                "pages": [
+                  "models/humanwam-goal/inference"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "models/molmoact2/inference"
@@ -161,6 +167,12 @@
                 "group": "DreamZero",
                 "pages": [
                   "zh/models/dreamzero/ws1"
+                ]
+              },
+              {
+                "group": "HumanWAM-Goal",
+                "pages": [
+                  "zh/models/humanwam-goal/inference"
                 ]
               },
               {

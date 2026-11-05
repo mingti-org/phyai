@@ -1,0 +1,141 @@
+---
+title: "HumanWAM-Goal"
+description: "Run goal-conditioned action inference with PhyAI on one GPU or with tensor parallelism."
+---
+
+HumanWAM-Goal predicts an action chunk from a task instruction,
+current camera images, a goal image, and robot state. In PhyAI, use the
+`humanwam_goal` plugin and the `examples/HumanWAM-Goal/run_humanwam_goal.py` entry point.
+Python imports use `phyai.models.humanwam_goal` and `phyai_utils_tools.models.humanwam_goal`.
+
+| Item | Configuration |
+| --- | --- |
+| PhyAI plugin | `humanwam_goal` |
+| Input | Instruction, current and goal RGB images, normalized state, optional visual history and RTC prefix |
+| Output | CPU `float32` normalized actions, shaped `[1, 48, 49]` with the default configuration |
+| Inference | BF16 model parameters, 10 denoising steps, CUDA Graph enabled by default |
+| Parallelism | TP=1, 2, or 4 on one host |
+
+## Prepare the environment
+
+Use Linux with GLIBC 2.34 or newer, Python 3.12 or 3.13, and a Hopper GPU (SM90).
+This inference path is tested with Torch 2.11 and CUDA 12.8. TP=2/4 requires
+NVLink-connected GPUs and the CUDA toolkit (`nvcc`).
+
+Follow [installation](/index#setup) to prepare a PhyAI checkout. From its root,
+activate the environment and install the CUDA 12.8 builds and attention dependency:
+
+```bash
+source .venv/bin/activate
+uv pip install 'torch==2.11.0' 'torchvision==0.26.0' \
+  --index-url https://download.pytorch.org/whl/cu128
+uv pip install --no-deps \
+  --index-url https://nvidia-cosmos.github.io/cosmos-dependencies/v1.5.0 \
+  'flash-attn-3-nv==1.0.3+cu128.torch210'
+```
+
+## Prepare the checkpoint
+
+Model weights: [HumanWAM-Goal on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
+
+Set the path to an inference checkpoint with these assets:
+
+```text
+checkpoint/
+├── transformer/
+├── vae/
+├── text_tokenizer/
+├── sampling.json
+└── processor.json
+```
+
+Keep the supplied configuration files with their matching weights.
+`sampling.json` must include `corrector_weights` for the ten-step sampling schedule.
+
+```bash
+export HUMANWAM_GOAL_CHECKPOINT=/path/to/checkpoint
+export HUMANWAM_GOAL_SAMPLE=/path/to/observation.json
+```
+
+## Prepare an observation
+
+Save your observation in JSON. Image paths are relative to that JSON file;
+the example script loads them as RGB images. Replace the image paths, instruction,
+state values, and domain ID below with values for your checkpoint and robot.
+The zero state shows the input shape only.
+
+```json
+{
+  "instruction": "Move the object to the position shown in the goal image.",
+  "images": {"head": "head.png", "left": "left.png", "right": "right.png"},
+  "goal_images": {"head": "goal.png"},
+  "observation_timestamp": 0.0,
+  "history": [],
+  "normalized_state": [
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0
+  ],
+  "domain_id": 0,
+  "seed": 0
+}
+```
+
+`normalized_state` uses the checkpoint's normalization and model coordinates.
+The example does not convert physical robot coordinates. You can also supply
+`state_valid_mask` and `action_valid_mask` to specify valid state and action
+channels; padded channels must remain disabled.
+
+For visual history, add captures to `history` in timestamp order, oldest first:
+`{"timestamp": ..., "images": {...}}`. Their timestamps must precede
+`observation_timestamp` and use the same time base in seconds. The processor
+selects frames using the history settings in `processor.json`.
+
+For real-time chunking (RTC), add `normalized_prefix` as a matrix of previous
+actions in the same normalized model coordinates. Its row count must fit the
+checkpoint's prefix-length limit. Omit it when you have no prefix to condition on.
+
+## Run inference
+
+Select an available GPU. This command uses one GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/HumanWAM-Goal/run_humanwam_goal.py \
+  --checkpoint "$HUMANWAM_GOAL_CHECKPOINT" \
+  --sample "$HUMANWAM_GOAL_SAMPLE" \
+  --output .cache/humanwam-goal/actions.npy
+```
+
+To use two GPUs, expose both devices and set `--tp 2`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/HumanWAM-Goal/run_humanwam_goal.py \
+  --checkpoint "$HUMANWAM_GOAL_CHECKPOINT" \
+  --sample "$HUMANWAM_GOAL_SAMPLE" \
+  --output .cache/humanwam-goal/actions.npy \
+  --tp 2
+```
+
+For four GPUs, use `CUDA_VISIBLE_DEVICES=0,1,2,3` and `--tp 4`. The Engine starts
+the workers; run the command once. Add `--no-cuda-graph` for eager execution.
+The first request includes model warmup and graph capture.
+
+## Read the output
+
+The script saves a NumPy `.npy` array of normalized actions:
+
+```python
+import numpy as np
+
+actions = np.load(".cache/humanwam-goal/actions.npy", allow_pickle=False)
+print(actions.shape, actions.dtype, np.isfinite(actions).all())
+```
+
+With the default configuration, the result is `(1, 48, 49) float32 True`:
+one action chunk, 48 steps, and 49 values per step. RTC prefix rows remain in the
+chunk. Convert the normalized output to your robot's coordinates and skip the
+already committed prefix before executing new actions.
