@@ -1,6 +1,6 @@
 # Open-HumanScale (GoalWAM)
 
-Model weights: <!-- Add the public download link here. -->
+Model weights: [Open-HumanScale on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
 
 Predict a 48-step action chunk from an instruction, goal image, camera views, and robot state.
 
