@@ -6,8 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from phyai.parallel import use_mesh
-from phyai.layers.linear import ReplicatedLinear
+from phyai.parallel import use_mesh, default_mesh
+from phyai.layers.linear import ReplicatedLinear, ColumnParallelLinear
 from phyai.weights.shards import replicated
 from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.mlp.dense_mlp import DenseMLP
@@ -21,13 +21,17 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     DomainAwareLinear,
     Cosmos3Transformer,
     Cosmos3LanguageModel,
+    Cosmos3GenDecoderLayer,
 )
 from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3Config
 from phyai.models.humanwam_goal.configuration_humanwam_goal import HumanWAMGoalConfig
 from phyai.models.humanwam_goal.modeling_kernels_humanwam_goal import (
     add_humanwam_goal_norm,
     prepare_humanwam_goal_attention,
+    humanwam_goal_silu_mul,
 )
+from phyai.models.humanwam_goal.collective_humanwam_goal import HumanWAMGoalGather
+from phyai.models.humanwam_goal.modeling_parallel_humanwam_goal import forward_parallel
 
 
 class SharedEEFLinear(nn.Module):
@@ -161,6 +165,50 @@ class HumanWAMGoalTransformer(Cosmos3Transformer):
                     prefix=f"language_model.layers.{index}.self_attn.qkv_proj",
                 )
         self.config = config
+        self.tp_size = default_mesh().group_size("dense_tp")
+        if self.tp_size > 1:
+            if (
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+            ) != (4096, 32, 8, 128):
+                raise ValueError(
+                    "HumanWAM-Goal TP requires hidden size 4096, 32 query heads and 8 KV heads of width 128"
+                )
+            # Partition tokens without splitting a GEMM's reduction dimension.
+            final_layer = self.gen_layers[-1]
+            del self.gen_layers
+            with use_mesh(register_humanwam_goal_text_mesh()):
+                self.gen_layers = nn.ModuleList(
+                    Cosmos3GenDecoderLayer(
+                        config=config,
+                        attn_backend=attn_backend,
+                        norm_backend=norm_backend,
+                        params_dtype=params_dtype,
+                        prefix=f"gen_layers.{index}",
+                    )
+                    for index in range(config.num_hidden_layers - 1)
+                )
+            self.gen_layers.append(final_layer)
+            prefix = f"gen_layers.{len(self.gen_layers) - 1}"
+            final_layer.cross_attention.to_out = ColumnParallelLinear(
+                config.hidden_size,
+                config.hidden_size,
+                group="attention_tp",
+                bias=False,
+                params_dtype=params_dtype,
+                device=device,
+                prefix=f"{prefix}.cross_attention.to_out",
+            )
+            final_layer.mlp.down_proj = ColumnParallelLinear(
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+                params_dtype=params_dtype,
+                device=device,
+                prefix=f"{prefix}.mlp.down_proj",
+            )
         self.action_gen = True
         target = self.proj_in.weight.device
         self.action_proj_in = SharedEEFLinear(
@@ -221,6 +269,7 @@ class HumanWAMGoalTransformer(Cosmos3Transformer):
         layout: HumanWAMGoalLayout,
         *,
         time_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
+        collective: HumanWAMGoalGather | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict velocities for noisy visual patches and action rows only."""
         dtype = self.proj_in.weight.dtype
@@ -257,7 +306,9 @@ class HumanWAMGoalTransformer(Cosmos3Transformer):
         rows = torch.cat(
             (layout.video_noisy_rows, layout.action_noisy_rows + visual.shape[0])
         )
-        selected = self.forward_selected(hidden, condition, rows).squeeze(0)
+        selected = self.forward_selected(
+            hidden, condition, rows, collective=collective
+        ).squeeze(0)
         video_hidden, action_hidden = selected.split(
             (layout.video_noisy_rows.numel(), layout.action_noisy_rows.numel())
         )
@@ -276,8 +327,23 @@ class HumanWAMGoalTransformer(Cosmos3Transformer):
         hidden: torch.Tensor,
         condition: Cosmos3Condition,
         output_rows: torch.Tensor,
+        *,
+        collective: HumanWAMGoalGather | None = None,
     ) -> torch.Tensor:
         """Keep full K/V; only the final block narrows queries and output work."""
+        if self.tp_size > 1:
+            if collective is None:
+                raise RuntimeError(
+                    "Prepare the HumanWAM-Goal TP workspace before inference"
+                )
+            return forward_parallel(
+                self.gen_layers,
+                self.norm_moe_gen,
+                hidden,
+                condition,
+                output_rows,
+                collective,
+            )
         normalized = self.gen_layers[0].input_layernorm(hidden)
         cos, sin = condition.freqs_gen
         last = len(self.gen_layers) - 1
@@ -301,7 +367,8 @@ class HumanWAMGoalTransformer(Cosmos3Transformer):
             hidden, normalized = add_humanwam_goal_norm(
                 hidden, projected, layer.post_attention_layernorm
             )
-            projected = layer.mlp(normalized)
+            fused, _ = layer.mlp.gate_up_proj(normalized)
+            projected, _ = layer.mlp.down_proj(humanwam_goal_silu_mul(fused))
             next_norm = (
                 self.norm_moe_gen
                 if index == last

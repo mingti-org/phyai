@@ -11,8 +11,10 @@ from phyai.engine import Entry, Engine, EntryArgs
 from phyai.weights import load_pretrained
 from phyai.engine_config import ParallelConfig, get_engine_config, set_engine_config
 from phyai.layers.quant.active import resolve_quant_plan
-from phyai.models.cosmos3.vae_wan import cosmos3_vae_weight_remap
-from phyai.models.humanwam_goal.vae_humanwam_goal import HumanWAMGoalVAE
+from phyai.models.humanwam_goal.vae_humanwam_goal import (
+    HumanWAMGoalVAE,
+    humanwam_goal_vae_weight_remap,
+)
 from phyai.models.humanwam_goal.weights_humanwam_goal import humanwam_goal_weight_remap
 from phyai.models.cosmos3.modeling_cosmos3 import TimestepEmbedder
 from phyai.models.cosmos3.parallel_cosmos3 import validate_cosmos3_parallel
@@ -22,9 +24,6 @@ from phyai.models.humanwam_goal.attention_humanwam_goal import (
     configure_humanwam_goal_kernels,
 )
 from phyai.models.humanwam_goal.scheduler_humanwam_goal import HumanWAMGoalScheduler
-from phyai.models.humanwam_goal.collective_humanwam_goal import (
-    install_humanwam_goal_collective,
-)
 from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3WanVAEConfig
 from phyai.models.humanwam_goal.configuration_humanwam_goal import (
     HumanWAMGoalConfig,
@@ -52,7 +51,6 @@ class HumanWAMGoalEntry(Entry):
         self.transformer: HumanWAMGoalTransformer | None = None
         self.vae: HumanWAMGoalVAE | None = None
         self.scheduler: HumanWAMGoalScheduler | None = None
-        self.collective = None
 
     @classmethod
     def validate_parallel(
@@ -128,7 +126,7 @@ class HumanWAMGoalEntry(Entry):
                 report = load_pretrained(
                     self.vae,
                     checkpoint / "vae",
-                    remap=cosmos3_vae_weight_remap,
+                    remap=humanwam_goal_vae_weight_remap,
                     strict=True,
                 )
                 logger.info_rank0("HumanWAM-Goal VAE: %s", report.summary())
@@ -141,7 +139,6 @@ class HumanWAMGoalEntry(Entry):
             vae=self.vae,
             use_cuda_graph=engine.runtime.use_cuda_graph,
         )
-        self.collective = install_humanwam_goal_collective()
         self.scheduler.setup()
 
     def step(self, request: HumanWAMGoalStageRequest):
@@ -153,9 +150,6 @@ class HumanWAMGoalEntry(Entry):
         if self.scheduler is not None:
             self.scheduler.close()
         self.scheduler = None
-        if self.collective is not None:
-            self.collective.close()
-            self.collective = None
         self.transformer = None
         self.vae = None
 

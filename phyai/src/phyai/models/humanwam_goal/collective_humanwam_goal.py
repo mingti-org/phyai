@@ -1,4 +1,4 @@
-"""HumanWAM-Goal's fixed-workspace SUM registered with PhyAI parallel dispatch."""
+"""Runner-owned CUDA IPC gathers for serialized HumanWAM-Goal inference."""
 
 import os
 import ctypes as C
@@ -7,30 +7,27 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from phyai_kernel.cuda.jit.humanwam_goal_sum import humanwam_goal_sum_library
+from phyai_kernel.cuda.jit.humanwam_goal_gather import humanwam_goal_gather_library
 
-from phyai import parallel as P
 from phyai.utils import get_logger
 
 logger = get_logger(__name__)
 
 
-class FixedWorkspaceSum:
+class HumanWAMGoalGather:
     """One same-node, fully connected 2/4-GPU inference replica."""
 
-    def __init__(self, *, dtype, max_bytes=64 << 20, blocks=96):
-        if dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError("The fixed SUM supports native FP32/BF16 tensors only")
+    def __init__(self, *, max_bytes=64 << 20, blocks=96):
         if type(max_bytes) is not int or not 0 < max_bytes <= 1 << 30 or max_bytes % 16:
             raise ValueError(
-                "SUM workspace bytes must be a positive 16-byte multiple, at most 1 GiB"
+                "gather workspace bytes must be a positive 16-byte multiple, at most 1 GiB"
             )
         if type(blocks) is not int or not 1 <= blocks <= 128:
-            raise ValueError("SUM block count must be in [1,128]")
+            raise ValueError("gather block count must be in [1,128]")
         self.rank, self.size = dist.get_rank(), dist.get_world_size()
         if self.size not in (2, 4):
-            raise ValueError("The fixed SUM requires a dedicated 2/4-rank group")
-        self.device, self.dtype = torch.cuda.current_device(), dtype
+            raise ValueError("The fixed gather requires a dedicated 2/4-rank group")
+        self.device, self.dtype = torch.cuda.current_device(), torch.bfloat16
         self.max_bytes, self.blocks = max_bytes, blocks
         self.local, self.opened = [], []
         self.input = None
@@ -55,19 +52,19 @@ class FixedWorkspaceSum:
         error, handles = None, []
         try:
             if int(os.environ.get("LOCAL_WORLD_SIZE", self.size)) != self.size:
-                raise ValueError("CUDA IPC SUM requires all TP ranks on one node")
-            self.library = humanwam_goal_sum_library()
+                raise ValueError("CUDA IPC gather requires all TP ranks on one node")
+            self.library = humanwam_goal_gather_library()
             pointer, handle = C.c_void_p(), C.create_string_buffer(64)
             self._check(
                 self.library.alloc_shared(
-                    self.library.signal_size() + self.max_bytes,
+                    self.library.signal_size(),
                     C.byref(pointer),
                     handle,
                 )
             )
             self.local.append(pointer.value)
             handles.append((handle.raw, 0))
-            # Torch owns this allocation. Row GEMMs can write directly into it;
+            # Torch owns this allocation. Fused Q/K preparation writes directly into it;
             # export its allocator base and retain the suballocation offset.
             self.input = torch.empty(
                 self.max_bytes // torch.empty((), dtype=self.dtype).element_size(),
@@ -82,7 +79,7 @@ class FixedWorkspaceSum:
             )
             handles.append((handle.raw, offset.value))
         except Exception as exc:
-            logger.exception("HumanWAM-Goal SUM initialization failed")
+            logger.exception("HumanWAM-Goal gather initialization failed")
             error = repr(exc)
         peers = self._gather(
             (
@@ -94,10 +91,10 @@ class FixedWorkspaceSum:
         )
         if any(p[2] for p in peers):
             raise RuntimeError(
-                f"Fixed SUM initialization failed: {[p[2] for p in peers]}"
+                f"Fixed gather initialization failed: {[p[2] for p in peers]}"
             )
         if len({p[0] for p in peers}) != 1 or len({p[1] for p in peers}) != self.size:
-            raise ValueError("Fixed SUM requires distinct GPUs on the same host")
+            raise ValueError("Fixed gather requires distinct GPUs on the same host")
 
         error = None
         signals, inputs = [], []
@@ -115,7 +112,7 @@ class FixedWorkspaceSum:
                         pointer = value.value + offset
                     destination.append(pointer)
             self._check(
-                self.library.create_sum(
+                self.library.create_gather(
                     (C.c_void_p * self.size)(*signals),
                     (C.c_void_p * self.size)(*inputs),
                     self.max_bytes,
@@ -125,15 +122,15 @@ class FixedWorkspaceSum:
                 )
             )
         except Exception as exc:
-            logger.exception("HumanWAM-Goal SUM initialization failed")
+            logger.exception("HumanWAM-Goal gather initialization failed")
             error = repr(exc)
         errors = self._gather(error)
         if any(errors):
-            raise RuntimeError(f"Fixed SUM peer setup failed: {errors}")
+            raise RuntimeError(f"Fixed gather peer setup failed: {errors}")
 
-    def sum(self, value, output):
+    def _validate(self, value: torch.Tensor) -> None:
         if self.closed:
-            raise RuntimeError("Fixed SUM workspace is closed")
+            raise RuntimeError("HumanWAM-Goal gather workspace is closed")
         if (
             not value.is_cuda
             or value.device.index != self.device
@@ -142,41 +139,87 @@ class FixedWorkspaceSum:
             or not value.is_contiguous()
             or value.numel() == 0
             or value.data_ptr() % 16
-            or value.numel() * value.element_size() % 16
-            or value.numel() * value.element_size() > self.max_bytes
+            or value.nbytes % 16
+            or value.nbytes > self.max_bytes
         ):
             raise ValueError(
-                "Fixed SUM requires aligned contiguous native-dtype tensors within its workspace bound"
+                "Gather requires aligned contiguous BF16 tensors within the workspace bound"
             )
-        if (
-            output.shape != value.shape
-            or output.dtype != value.dtype
-            or output.device != value.device
-            or not output.is_contiguous()
-        ):
-            raise ValueError("SUM output must match its input")
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        self._validate(value)
+        columns = value.shape[-1]
+        if columns % 8:
+            raise ValueError("Gather columns must be a multiple of eight")
+        output = value.new_empty((*value.shape[:-1], columns * self.size))
         self._check(
-            self.library.reduce_sum(
+            self.library.gather_last_dimension(
                 self.pointer,
                 value.data_ptr(),
                 output.data_ptr(),
-                value.numel(),
+                value.numel() // columns,
+                columns,
                 torch.cuda.current_stream().cuda_stream,
                 self.blocks,
-                int(self.dtype == torch.bfloat16),
             )
         )
         return output
 
+    def gather_rows(self, value: torch.Tensor) -> torch.Tensor:
+        if value.ndim < 3 or value.shape[0] != 1:
+            raise ValueError("Token gather requires a single batch")
+        output = self.gather(value.contiguous().reshape(1, -1))
+        return output.reshape(1, value.shape[1] * self.size, *value.shape[2:])
+
+    def kv_workspace(self, part: int) -> torch.Tensor:
+        if self.closed:
+            raise RuntimeError("HumanWAM-Goal gather workspace is closed")
+        if part <= 0 or part * 2048 * 2 > self.max_bytes:
+            raise ValueError("Local KV exceeds the workspace bound")
+        return self.input[: part * 2048].view(part, 2, 8, 128)
+
+    def gather_kv(
+        self,
+        text_key: torch.Tensor,
+        text_value: torch.Tensor,
+        *,
+        part: int,
+        tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.kv_workspace(part)
+        for value in (text_key, text_value):
+            self._validate(value)
+            if value.ndim != 4 or value.shape[0] != 1 or value.shape[2:] != (8, 128):
+                raise ValueError("Text KV must have shape [1,text,8,128]")
+        if text_key.shape != text_value.shape or not 0 < tokens <= part * self.size:
+            raise ValueError("Incompatible text KV or token partition")
+        key = text_key.new_empty((1, text_key.shape[1] + tokens, 8, 128))
+        value = torch.empty_like(key)
+        self._check(
+            self.library.gather_sp_kv(
+                self.pointer,
+                text_key.data_ptr(),
+                text_value.data_ptr(),
+                key.data_ptr(),
+                value.data_ptr(),
+                part,
+                tokens,
+                text_key.shape[1],
+                torch.cuda.current_stream().cuda_stream,
+                self.blocks,
+            )
+        )
+        return key, value
+
     def close(self):
         if self.closed:
             return
-        # A peer may still read this rank's input/scratch after its own launch.
+        # A peer may still read this rank's input after its own launch.
         # Finish all ranks before destroying the shared buffers or communicator.
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.cpu)
         if self.pointer.value:
-            self._check(self.library.destroy_sum(self.pointer))
+            self._check(self.library.destroy_gather(self.pointer))
             self.pointer = C.c_void_p()
         for pointer in self.opened:
             self._check(self.library.close_shared(pointer))
@@ -188,66 +231,3 @@ class FixedWorkspaceSum:
         self.opened.clear()
         self.closed = True
         dist.destroy_process_group(self.cpu)
-
-
-class HumanWAMGoalSumBackend:
-    name = "humanwam_goal-sum"
-
-    def __init__(self):
-        self.owner = FixedWorkspaceSum(dtype=torch.bfloat16)
-        self.executions = 0
-
-    def supports_capture(self):
-        return True
-
-    def can_handle(
-        self,
-        *,
-        op,
-        nbytes,
-        dtype,
-        world_size,
-        topology,
-        group=None,
-        mesh_name=None,
-        **kwargs,
-    ):
-        return (
-            op == P.Op.ALL_REDUCE
-            and mesh_name == "model"
-            and group in {"dense_tp", "attention_tp"}
-            and dtype == torch.bfloat16
-            and world_size == self.owner.size
-            and 0 < nbytes <= self.owner.max_bytes
-            and nbytes % 16 == 0
-            and topology.is_single_node
-            and topology.is_full_nvlink
-        )
-
-    def execute(self, *, input, output, reduce_op, **kwargs):
-        if reduce_op != dist.ReduceOp.SUM:
-            raise ValueError("HumanWAM-Goal supports SUM collectives only")
-        self.executions += 1
-        return self.owner.sum(input, output)
-
-    def close(self):
-        self.owner.close()
-
-
-def install_humanwam_goal_collective():
-    mesh = P.default_mesh()
-    if mesh.group_size("dense_tp") == 1:
-        return None
-    for group in ("dense_tp", "attention_tp"):
-        topology = mesh.topology(group)
-        if not topology.is_single_node or not topology.is_full_nvlink:
-            raise ValueError(
-                "HumanWAM-Goal TP requires a fully connected NVLink group on one node"
-            )
-    backend = HumanWAMGoalSumBackend()
-    previous = P.get_dispatcher()
-    previous.registry.register(backend)
-    P.set_dispatcher(
-        P.Dispatcher(previous.registry, P.ForcedPolicy(backend.name, previous.policy))
-    )
-    return backend

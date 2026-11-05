@@ -11,8 +11,8 @@ dependencies = [
     "pillow",
     "qwen-vl-utils",
     "tiktoken>=0.7,<1",
-    "torch==2.11.0",
-    "torchvision==0.26.0",
+    "torch>=2.10.0,<2.12",
+    "torchvision>=0.25.0,<0.27",
     "transformers==5.8.1",
 ]
 

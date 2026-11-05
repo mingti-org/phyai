@@ -19,8 +19,11 @@ Python imports use `phyai.models.humanwam_goal` and `phyai_utils_tools.models.hu
 ## Prepare the environment
 
 Use Linux with GLIBC 2.34 or newer, Python 3.12 or 3.13, and a Hopper GPU (SM90).
-This inference path is tested with Torch 2.11 and CUDA 12.8. TP=2/4 requires
+This inference path supports Torch 2.10 and 2.11 with CUDA 12.8. The PhyAI
+development environment stays on Torch 2.11. TP=2/4 requires
 NVLink-connected GPUs and the CUDA toolkit (`nvcc`).
+Each GPU retains full projection weights for the token-partitioned Generator
+blocks, so budget roughly the single-GPU weight memory per GPU.
 
 Follow [installation](/index#setup) to prepare a PhyAI checkout. From its root,
 activate the environment and install the CUDA 12.8 builds and attention dependency:
@@ -50,7 +53,10 @@ checkpoint/
 ```
 
 Keep the supplied configuration files with their matching weights.
-`sampling.json` must include `corrector_weights` for the ten-step sampling schedule.
+The ten-step sampling coefficients are computed at setup. If `sampling.json`
+includes `corrector_weights`, those exported values take precedence.
+For parity with the released HumanNet native backend, use its Torch 2.10 and
+cuBLASLt 12.8.3.14 [reproduction environment](https://github.com/DAGroup-PKU/HumanNet/tree/open-humanscale/humanwam_goal#reproducing-published-results).
 
 ```bash
 export HUMANWAM_GOAL_CHECKPOINT=/path/to/checkpoint
