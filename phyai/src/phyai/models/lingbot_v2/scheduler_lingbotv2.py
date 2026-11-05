@@ -198,6 +198,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         max_vision_tokens_per_image: int | None = None,
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
+        use_wavefront_pipeline: bool = False,
     ) -> None:
         self.cfg: LingBotVLA2Config = model.config
         self.max_batch_size = int(max_batch_size)
@@ -254,6 +255,7 @@ class LingBotV2WS1Scheduler(Scheduler):
             params_dtype=self.params_dtype,
             device=self.device,
             use_cuda_graph=use_cuda_graph,
+            use_wavefront_pipeline=use_wavefront_pipeline,
         )
 
     def setup(self) -> None:

@@ -78,6 +78,7 @@ class LingBotV2Args(EntryArgs):
     weight_strict: bool = True
     vision_params_dtype: torch.dtype | None = None
     vision_patch_embed_backend: str = "conv3d"
+    use_wavefront_pipeline: bool = False
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:
@@ -163,6 +164,7 @@ class LingBotV2Entry(Entry):
             max_vision_tokens_per_image=args.max_vision_tokens_per_image,
             device=engine_config.device.target,
             use_cuda_graph=engine_config.runtime.use_cuda_graph,
+            use_wavefront_pipeline=args.use_wavefront_pipeline,
         )
         self.model = model
         self.scheduler = scheduler
