@@ -1,11 +1,11 @@
 ---
-title: "Open-HumanScale (GoalWAM)"
+title: "HumanWAM-Goal"
 description: "Run goal-conditioned action inference with PhyAI on one GPU or with tensor parallelism."
 ---
 
-Open-HumanScale (GoalWAM) predicts an action chunk from a task instruction,
+HumanWAM-Goal predicts an action chunk from a task instruction,
 current camera images, a goal image, and robot state. In PhyAI, use the
-`goalwam` plugin and the `examples/goalwam/run_goalwam.py` entry point.
+`goalwam` plugin and the `examples/HumanWAM-Goal/run_humanwam_goal.py` entry point.
 Python imports use `phyai.models.goalwam` and `phyai_utils_tools.models.goalwam`.
 
 | Item | Configuration |
@@ -36,7 +36,7 @@ uv pip install --no-deps \
 
 ## Prepare the checkpoint
 
-Model weights: [Open-HumanScale on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
+Model weights: [HumanWAM-Goal on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
 
 Set the path to an inference checkpoint with these assets:
 
@@ -53,8 +53,8 @@ Keep the supplied configuration files with their matching weights.
 `sampling.json` must include `corrector_weights` for the ten-step sampling schedule.
 
 ```bash
-export GOALWAM_CHECKPOINT=/path/to/checkpoint
-export GOALWAM_SAMPLE=/path/to/observation.json
+export HUMANWAM_GOAL_CHECKPOINT=/path/to/checkpoint
+export HUMANWAM_GOAL_SAMPLE=/path/to/observation.json
 ```
 
 ## Prepare an observation
@@ -104,19 +104,19 @@ checkpoint's prefix-length limit. Omit it when you have no prefix to condition o
 Select an available GPU. This command uses one GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/goalwam/run_goalwam.py \
-  --checkpoint "$GOALWAM_CHECKPOINT" \
-  --sample "$GOALWAM_SAMPLE" \
-  --output .cache/goalwam/actions.npy
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/HumanWAM-Goal/run_humanwam_goal.py \
+  --checkpoint "$HUMANWAM_GOAL_CHECKPOINT" \
+  --sample "$HUMANWAM_GOAL_SAMPLE" \
+  --output .cache/humanwam-goal/actions.npy
 ```
 
 To use two GPUs, expose both devices and set `--tp 2`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/goalwam/run_goalwam.py \
-  --checkpoint "$GOALWAM_CHECKPOINT" \
-  --sample "$GOALWAM_SAMPLE" \
-  --output .cache/goalwam/actions.npy \
+CUDA_VISIBLE_DEVICES=0,1 uv run --no-sync python examples/HumanWAM-Goal/run_humanwam_goal.py \
+  --checkpoint "$HUMANWAM_GOAL_CHECKPOINT" \
+  --sample "$HUMANWAM_GOAL_SAMPLE" \
+  --output .cache/humanwam-goal/actions.npy \
   --tp 2
 ```
 
@@ -131,7 +131,7 @@ The script saves a NumPy `.npy` array of normalized actions:
 ```python
 import numpy as np
 
-actions = np.load(".cache/goalwam/actions.npy", allow_pickle=False)
+actions = np.load(".cache/humanwam-goal/actions.npy", allow_pickle=False)
 print(actions.shape, actions.dtype, np.isfinite(actions).all())
 ```
 

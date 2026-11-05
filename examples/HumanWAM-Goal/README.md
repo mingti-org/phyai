@@ -1,12 +1,12 @@
-# Open-HumanScale (GoalWAM)
+# HumanWAM-Goal
 
-Model weights: [Open-HumanScale on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
+Model weights: [HumanWAM-Goal on Hugging Face](https://huggingface.co/collections/DAGroup-PKU/open-humanscale).
 
 Predict a 48-step action chunk from an instruction, goal image, camera views, and robot state.
 
-Open-HumanScale uses the `goalwam` plugin and the `examples/goalwam` entry point.
-See the inference guide in [English](../../docs/models/goalwam/inference.mdx)
-or [中文](../../docs/zh/models/goalwam/inference.mdx).
+HumanWAM-Goal uses the `goalwam` plugin and the `examples/HumanWAM-Goal` entry point.
+See the inference guide in [English](../../docs/models/humanwam-goal/inference.mdx)
+or [中文](../../docs/zh/models/humanwam-goal/inference.mdx).
 
 Run from the repository root with this PhyAI checkout installed. The tested environment
 uses Hopper GPUs (SM90), Torch 2.11, CUDA 12.8, and GLIBC 2.34 or newer.
@@ -19,8 +19,8 @@ uv pip install --no-deps \
   --index-url https://nvidia-cosmos.github.io/cosmos-dependencies/v1.5.0 \
   'flash-attn-3-nv==1.0.3+cu128.torch210'
 
-export GOALWAM_CHECKPOINT=/path/to/goalwam
-export GOALWAM_SAMPLE=/path/to/observation.json
+export HUMANWAM_GOAL_CHECKPOINT=/path/to/humanwam-goal
+export HUMANWAM_GOAL_SAMPLE=/path/to/observation.json
 ```
 
 The inference checkpoint must contain `transformer/`, `vae/`, `text_tokenizer/`,
@@ -29,10 +29,10 @@ The inference checkpoint must contain `transformer/`, `vae/`, `text_tokenizer/`,
 Run on one GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/goalwam/run_goalwam.py \
-  --checkpoint "$GOALWAM_CHECKPOINT" \
-  --sample "$GOALWAM_SAMPLE" \
-  --output .cache/goalwam/actions.npy
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python examples/HumanWAM-Goal/run_humanwam_goal.py \
+  --checkpoint "$HUMANWAM_GOAL_CHECKPOINT" \
+  --sample "$HUMANWAM_GOAL_SAMPLE" \
+  --output .cache/humanwam-goal/actions.npy
 ```
 
 For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and add `--tp 2`; for four, use

@@ -1,4 +1,4 @@
-"""Run GoalWAM from RGB observations and normalized model-coordinate actions.
+"""Run HumanWAM-Goal from RGB observations and normalized model-coordinate actions.
 
 The JSON sample contains instruction, images, goal_images, observation_timestamp,
 history, normalized_state and domain_id. Image paths are relative to the sample.

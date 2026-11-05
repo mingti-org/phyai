@@ -54,9 +54,9 @@
                 ]
               },
               {
-                "group": "Open-HumanScale (GoalWAM)",
+                "group": "HumanWAM-Goal",
                 "pages": [
-                  "models/goalwam/inference"
+                  "models/humanwam-goal/inference"
                 ]
               },
               {
@@ -170,9 +170,9 @@
                 ]
               },
               {
-                "group": "Open-HumanScale (GoalWAM)",
+                "group": "HumanWAM-Goal",
                 "pages": [
-                  "zh/models/goalwam/inference"
+                  "zh/models/humanwam-goal/inference"
                 ]
               },
               {
