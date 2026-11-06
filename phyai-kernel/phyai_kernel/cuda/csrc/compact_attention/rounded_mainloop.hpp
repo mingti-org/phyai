@@ -37,9 +37,9 @@
 #include "cutlass/arch/memory_sm80.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "fmha_common.hpp"
+#include "third_party/flashinfer/fmha_common.hpp"
 #include "fmha_fusion.hpp"
-#include "sm100_fmha_load_tma_warpspecialized.hpp"
+#include "third_party/flashinfer/sm100_fmha_load_tma_warpspecialized.hpp"
 
 namespace cutlass::fmha::collective {
 

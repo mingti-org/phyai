@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import math
 import threading
 from collections import OrderedDict, Counter
@@ -72,22 +73,36 @@ def extension():
     import phyai_kernel
     import tvm_ffi.cpp
     from flashinfer.jit import env
+    from phyai_kernel.jit_utils.cutlass import CUTLASS_REVISION, cutlass_include_dirs
 
     root = Path(phyai_kernel.__file__).resolve().parent / "cuda/csrc"
+    sources = [
+        root / "compact_attention.cu",
+        *sorted((root / "compact_attention").rglob("*.cuh")),
+        *sorted((root / "compact_attention").rglob("*.hpp")),
+    ]
+    digest = hashlib.sha256(
+        b"".join(path.read_bytes() for path in sources)
+        + CUTLASS_REVISION.encode()
+        + version("flashinfer-python").encode()
+        + str(torch.version.cuda).encode()
+    ).hexdigest()[:16]
     includes = [
         root,
         *env.CCCL_INCLUDE_DIRS,
+        *cutlass_include_dirs(),
         env.FLASHINFER_INCLUDE_DIR,
         env.FLASHINFER_CSRC_DIR,
-        *env.CUTLASS_INCLUDE_DIRS,
         env.FLASHINFER_INCLUDE_DIR / "flashinfer/attention/blackwell",
         env.FLASHINFER_INCLUDE_DIR / "flashinfer/attention/blackwell/collective",
     ]
     from phyai_kernel.jit_utils.compile import PHYAI_KERNEL_CACHE_ROOT
 
     return tvm_ffi.cpp.load(
-        name="phyai_thor_compact_attention",
-        build_directory=str(PHYAI_KERNEL_CACHE_ROOT / "thor_compact_attention"),
+        name=f"phyai_thor_compact_attention_{digest}",
+        build_directory=str(
+            PHYAI_KERNEL_CACHE_ROOT / "thor_compact_attention" / digest
+        ),
         sources=[str(root / "compact_attention.cu")],
         extra_include_paths=[str(p) for p in includes],
         extra_cuda_cflags=[

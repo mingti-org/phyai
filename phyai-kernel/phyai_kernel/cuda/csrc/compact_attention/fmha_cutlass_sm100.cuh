@@ -17,7 +17,7 @@
 
 #include <flashinfer/allocator.h>
 #include "collective/fmha_fusion.hpp"
-#include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
+#include "third_party/flashinfer/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "rounded_mainloop.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -28,7 +28,7 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "device/fmha.hpp"
 #include "kernel/fmha_tile_scheduler.hpp"
-#include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+#include "third_party/flashinfer/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
 namespace flashinfer {
 
