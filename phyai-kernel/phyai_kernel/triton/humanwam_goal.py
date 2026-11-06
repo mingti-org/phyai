@@ -2,6 +2,7 @@
 
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -36,6 +37,7 @@ def _prepare_qkv(
     Q_EPS: tl.constexpr,
     K_EPS: tl.constexpr,
     KV_HEADS: tl.constexpr,
+    INTERLEAVED_KV: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     group = tl.program_id(1)
@@ -103,7 +105,8 @@ def _prepare_qkv(
             ]
             tl.store(out_q_ptr + dest, result)
         else:
-            dest = (token * KV_HEADS + heads[:, None]) * 128 + cols[None, :]
+            stride = KV_HEADS * (2 if INTERLEAVED_KV else 1)
+            dest = (token * stride + heads[:, None]) * 128 + cols[None, :]
             tl.store(out_k_ptr + dest, result)
             gen_value = tl.load(
                 v_ptr + gen_token * V_TOKEN + heads[:, None] * V_HEAD + cols[None, :]
@@ -114,6 +117,29 @@ def _prepare_qkv(
 @triton.jit
 def _add_rms_norm(residual, projected, weight, hidden, normalized, EPS: tl.constexpr):
     row = tl.program_id(0)
+    lane = tl.arange(0, 32)
+    component = tl.arange(0, 4)
+    offsets = row * 4096 + lane[:, None] * 4 + component[None, :]
+    acc = tl.full((32, 4), 0, tl.float32)
+    # Torch 2.10/2.11 Reduce.cuh uses four serial accumulators per lane for
+    # contiguous FP32 means with width 4096 and >=16 rows. Preserve their
+    # addition order: a flat tree reduction can change the final BF16 value.
+    for step in tl.static_range(32):
+        value = (
+            (
+                tl.load(residual + offsets + step * 128).to(tl.float32)
+                + tl.load(projected + offsets + step * 128).to(tl.float32)
+            )
+            .to(hidden.dtype.element_ty)
+            .to(tl.float32)
+        )
+        acc = acc + value * value
+    even, odd = tl.split(tl.reshape(acc, (32, 2, 2)))
+    acc0, acc2 = tl.split(even)
+    acc1, acc3 = tl.split(odd)
+    partial = ((acc0 + acc1) + acc2) + acc3
+    variance = tl.sum(partial, axis=0) * (1.0 / 4096)
+
     col = tl.arange(0, 4096)
     offset = row * 4096 + col
     # Native eager addition first returns a BF16 residual. Its rounded values
@@ -123,8 +149,22 @@ def _add_rms_norm(residual, projected, weight, hidden, normalized, EPS: tl.const
         + tl.load(projected + offset).to(tl.float32)
     ).to(hidden.dtype.element_ty)
     value = summed.to(tl.float32)
-    variance = tl.sum(value * value, axis=0) * (1.0 / 4096)
     before_affine = (value * tl.rsqrt(variance + EPS)).to(normalized.dtype.element_ty)
     result = before_affine * tl.load(weight + col)
     tl.store(hidden + offset, summed)
     tl.store(normalized + offset, result)
+
+
+@triton.jit
+def _silu_mul(
+    fused, output, COUNT: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, col = index // WIDTH, index % WIDTH
+    gate = tl.load(fused + row * (2 * WIDTH) + col, index < COUNT, 0).to(tl.float32)
+    up = tl.load(fused + row * (2 * WIDTH) + col + WIDTH, index < COUNT, 0).to(
+        tl.float32
+    )
+    # Native SiLU returns BF16 before the separate multiplication by up.
+    activated = tl.div_rn(gate, 1.0 + libdevice.exp(-gate)).to(output.dtype.element_ty)
+    tl.store(output + index, activated.to(tl.float32) * up, index < COUNT)

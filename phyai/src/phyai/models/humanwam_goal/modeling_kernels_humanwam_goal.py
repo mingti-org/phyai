@@ -1,6 +1,7 @@
 """HumanWAM-Goal fusions; projections and attention retain PhyAI's public layers."""
 
 import torch
+from torch.nn import functional as F
 
 from phyai.layers.layer_norm import RMSNorm
 from phyai.models.cosmos3.modeling_cosmos3 import (
@@ -8,18 +9,29 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     prepare_cosmos3_attention,
 )
 
+_TORCH_MEAN_ORDER_SUPPORTED = tuple(torch.__version__.split(".")[:2]) in (
+    ("2", "10"),
+    ("2", "11"),
+)
+
 
 def add_humanwam_goal_norm(
     residual: torch.Tensor, projected: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Round the residual sum before computing its variance and affine."""
+    """Fuse residual RMSNorm with the native mean order and BF16 rounding."""
     if (
-        residual.is_cuda
+        _TORCH_MEAN_ORDER_SUPPORTED
+        and residual.is_cuda
+        and residual.device == projected.device == norm.weight.device
         and residual.dtype == projected.dtype == norm.weight.dtype == torch.bfloat16
         and residual.shape == projected.shape
+        and residual.ndim > 0
         and residual.shape[-1] == 4096
+        and residual.numel() // 4096 >= 16
         and residual.is_contiguous()
         and projected.is_contiguous()
+        and norm.weight.shape == (4096,)
+        and norm.weight.is_contiguous()
         and norm.cast_before_affine
     ):
         from phyai_kernel.triton.humanwam_goal import _add_rms_norm
@@ -32,7 +44,7 @@ def add_humanwam_goal_norm(
             hidden,
             normalized,
             norm.variance_epsilon,
-            num_warps=4,
+            num_warps=1,
             enable_fp_fusion=False,
         )
         return hidden, normalized
@@ -47,6 +59,8 @@ def prepare_humanwam_goal_attention(
     text_value: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    *,
+    local_kv: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse Q/K normalization, RoPE and text concatenation for B1 GQA4 D128."""
     batch, tokens, _ = hidden.shape
@@ -81,8 +95,21 @@ def prepare_humanwam_goal_attention(
         cos, sin = cos[0, :, 0], sin[0, :, 0]
         heads, text = key.shape[1], text_key.shape[0]
         out_query = torch.empty_like(query, memory_format=torch.contiguous_format)
-        out_key = key.new_empty((text + tokens, heads, 128))
-        out_value = torch.empty_like(out_key)
+        if local_kv is None:
+            out_key = key.new_empty((text + tokens, heads, 128))
+            out_value = torch.empty_like(out_key)
+        else:
+            if (
+                local_kv.shape != (tokens, 2, heads, 128)
+                or local_kv.device != key.device
+                or local_kv.dtype != key.dtype
+                or not local_kv.is_contiguous()
+            ):
+                raise ValueError(
+                    "Local KV workspace must be contiguous BF16 [tokens,2,heads,128]"
+                )
+            text = 0
+            out_key, out_value = local_kv[:, 0], local_kv[:, 1]
         _prepare_qkv[(text + tokens, 5)](
             query,
             key,
@@ -110,10 +137,13 @@ def prepare_humanwam_goal_attention(
             attention.norm_q.variance_epsilon,
             attention.norm_k.variance_epsilon,
             heads,
+            INTERLEAVED_KV=local_kv is not None,
             num_warps=heads,
             enable_fp_fusion=False,
         )
         return out_query.unsqueeze(0), out_key.unsqueeze(0), out_value.unsqueeze(0)
+    if local_kv is not None:
+        raise ValueError("HumanWAM-Goal TP requires the BF16 GQA4 D128 fused KV path")
     query = attention.norm_q(
         query.reshape(-1, attention.num_local_heads, attention.head_dim),
         preserve_3d_layout=True,
@@ -123,3 +153,29 @@ def prepare_humanwam_goal_attention(
         preserve_3d_layout=True,
     ).view_as(key)
     return prepare_cosmos3_attention(query, key, value, cos, sin, text_key, text_value)
+
+
+def humanwam_goal_silu_mul(fused: torch.Tensor) -> torch.Tensor:
+    """Preserve native SiLU rounding while fusing the following multiplication."""
+    width = fused.shape[-1] // 2
+    if (
+        fused.is_cuda
+        and fused.dtype == torch.bfloat16
+        and fused.is_contiguous()
+        and width > 0
+    ):
+        from phyai_kernel.triton.humanwam_goal import _silu_mul
+
+        output = fused.new_empty((*fused.shape[:-1], width))
+        _silu_mul[((output.numel() + 511) // 512,)](
+            fused,
+            output,
+            output.numel(),
+            width,
+            512,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return output
+    gate, up = fused.chunk(2, dim=-1)
+    return F.silu(gate) * up

@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 from phyai.engine_config import (
     EngineConfig,
@@ -75,7 +76,11 @@ def main() -> None:
                     dense=DenseParallelConfig(tp_size=args.tp),
                     attention=AttentionParallelConfig(tp_size=args.tp),
                 ),
-                runtime=RuntimeConfig(use_cuda_graph=not args.no_cuda_graph),
+                runtime=RuntimeConfig(
+                    use_cuda_graph=not args.no_cuda_graph,
+                    # Preserve the caller's CPU image-resizing behavior.
+                    num_threads=torch.get_num_threads(),
+                ),
             ),
         )
     )

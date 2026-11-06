@@ -11,6 +11,7 @@ from phyai.parallel import default_mesh
 from phyai.kernel.types import KernelMode
 from phyai.layers.attention.enums import AttnLayout
 from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Condition
+from phyai.models.humanwam_goal.collective_humanwam_goal import HumanWAMGoalGather
 from phyai.models.humanwam_goal.modeling_humanwam_goal import (
     HumanWAMGoalLayout,
     HumanWAMGoalTransformer,
@@ -83,7 +84,7 @@ class HumanWAMGoalVAERunner(Cosmos3OptimizedVAERunner):
 
 
 class HumanWAMGoalTextRunner(Cosmos3VLMRunner):
-    """Prefill the full text tower, retaining only this Generator rank's KV."""
+    """Prefill full text KV; only the final Generator layer partitions heads."""
 
     @torch.no_grad()
     def forward(
@@ -95,12 +96,13 @@ class HumanWAMGoalTextRunner(Cosmos3VLMRunner):
         mesh = default_mesh()
         size, rank = mesh.group_size("attention_tp"), mesh.group_rank("attention_tp")
         if size > 1:
+            key, value = cached[-1]
             self.cached_kv = [
+                *((key.contiguous(), value.contiguous()) for key, value in cached[:-1]),
                 (
                     key.chunk(size, dim=2)[rank].contiguous(),
                     value.chunk(size, dim=2)[rank].contiguous(),
-                )
-                for key, value in cached
+                ),
             ]
         return self.cached_kv
 
@@ -122,6 +124,19 @@ class HumanWAMGoalRunner(Cosmos3DiTRunner):
         self.prepared_times: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
         self.selected_context = None
         self.selected_context_signature = None
+        self.collective: HumanWAMGoalGather | None = None
+
+    def setup(self) -> None:
+        super().setup()
+        if self.transformer.tp_size > 1:
+            mesh = default_mesh()
+            for group in ("dense_tp", "attention_tp"):
+                topology = mesh.topology(group)
+                if not topology.is_single_node or not topology.is_full_nvlink:
+                    raise ValueError(
+                        "HumanWAM-Goal TP requires fully connected NVLink GPUs on one host"
+                    )
+            self.collective = HumanWAMGoalGather()
 
     def condition_for_plan(self, plan: HumanWAMGoalPlan) -> Cosmos3Condition:
         condition = self.rollout_condition() if self.use_cuda_graph else self.condition
@@ -312,6 +327,7 @@ class HumanWAMGoalRunner(Cosmos3DiTRunner):
             condition,
             layout,
             time_embedding=time_embedding,
+            collective=self.collective,
         )
         packed_video = video_velocity.new_zeros(patches.shape).index_copy(
             0, layout.video_noisy_rows, video_velocity
@@ -341,6 +357,9 @@ class HumanWAMGoalRunner(Cosmos3DiTRunner):
 
     def close(self) -> None:
         super().close()
+        if self.collective is not None:
+            self.collective.close()
+            self.collective = None
         self.time_signature = None
         self.prepared_times = ()
         self.selected_context = None

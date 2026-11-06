@@ -21,6 +21,8 @@ HumanWAM-Goal 根据任务指令、当前相机图像、目标图像和机器人
 使用 Linux、GLIBC 2.34 或更新版本、Python 3.12 或 3.13，以及 Hopper GPU（SM90）。
 该推理路径已在 Torch 2.11 和 CUDA 12.8 下验证。TP=2/4 需要通过 NVLink 连接的 GPU
 和 CUDA toolkit（`nvcc`）。
+各 GPU 保留按 token 分工的 Generator 层的完整投影权重，
+因此每张卡需要预留接近单卡模式的权重显存。
 
 按照[安装指南](/zh/index#安装)准备 PhyAI 仓库。在仓库根目录激活环境，
 安装 CUDA 12.8 对应的依赖和注意力算子：
@@ -49,8 +51,8 @@ checkpoint/
 └── processor.json
 ```
 
-配置文件应与权重配套使用。`sampling.json` 必须包含十步采样所需的
-`corrector_weights`。
+配置文件应与权重配套使用。十步采样系数在初始化时计算；如果 `sampling.json`
+提供了 `corrector_weights`，则优先使用这些导出的系数。
 
 ```bash
 export HUMANWAM_GOAL_CHECKPOINT=/path/to/checkpoint

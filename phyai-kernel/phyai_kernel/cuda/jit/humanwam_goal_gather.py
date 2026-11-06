@@ -1,4 +1,4 @@
-"""Compile the fixed CUDA IPC SUM operator and expose its small C ABI."""
+"""Compile the fixed CUDA IPC gather operators and expose its small C ABI."""
 
 import os
 import fcntl
@@ -12,9 +12,9 @@ from pathlib import Path
 import torch
 
 
-def humanwam_goal_sum_library():
+def humanwam_goal_gather_library():
     """Compile the small C ABI once; never modify the serving environment."""
-    source = Path(__file__).parent.parent / "csrc" / "humanwam_goal_sum"
+    source = Path(__file__).parent.parent / "csrc" / "humanwam_goal_gather"
     nvcc = shutil.which("nvcc") or str(
         Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "bin/nvcc"
     )
@@ -30,9 +30,9 @@ def humanwam_goal_sum_library():
     cache = Path(
         os.environ.get("TORCH_EXTENSIONS_DIR", Path.home() / ".cache" / "phyai")
     )
-    cache = cache / "tp_sum" / digest.hexdigest()[:24]
+    cache = cache / "tp_gather" / digest.hexdigest()[:24]
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / "tp_sum.so"
+    target = cache / "tp_gather.so"
     with (cache / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not target.exists():
@@ -48,7 +48,7 @@ def humanwam_goal_sum_library():
                 f"-arch={architecture}",
                 f"-L{cuda / 'lib64' / 'stubs'}",
                 "-lcuda",
-                str(source / "tp_sum.cu"),
+                str(source / "tp_gather.cu"),
                 "-o",
                 str(temporary),
             ]
@@ -75,21 +75,35 @@ def humanwam_goal_sum_library():
     declarations = {
         "error_message": ([], C.c_char_p),
         "signal_size": ([], size),
-        "table_size": ([], size),
         "alloc_shared": ([size, C.POINTER(pointer), pointer], integer),
         "open_shared": ([pointer, C.POINTER(pointer)], integer),
         "export_shared": ([pointer, pointer, C.POINTER(size)], integer),
         "close_shared": ([pointer], integer),
         "free_shared": ([pointer], integer),
-        "create_sum": (
+        "create_gather": (
             [pointer, pointer, size, integer, integer, C.POINTER(pointer)],
             integer,
         ),
-        "reduce_sum": (
-            [pointer, pointer, pointer, integer, pointer, integer, integer],
+        "gather_last_dimension": (
+            [pointer, pointer, pointer, integer, integer, pointer, integer],
             integer,
         ),
-        "destroy_sum": ([pointer], integer),
+        "gather_sp_kv": (
+            [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                integer,
+                integer,
+                integer,
+                pointer,
+                integer,
+            ],
+            integer,
+        ),
+        "destroy_gather": ([pointer], integer),
     }
     for name, (arguments, returns) in declarations.items():
         function = getattr(library, name)
