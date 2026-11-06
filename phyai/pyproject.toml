@@ -9,13 +9,14 @@ dependencies = [
     "phyai-kernel",
     "phyai-utils-tools",
     "numpy",
-    "torch>=2.10.0,<2.12",
+    "torch==2.11.0",
     "safetensors",
-    "torchvision>=0.25.0,<0.27",
+    "torchvision==0.26.0",
     "flashinfer-python[cu13]==v0.6.17",
     "flash-linear-attention>=0.5.1",
     "transformers==5.8.1",
     "huggingface-hub",
+    "gradio>=6.30.0,<7",
     "tqdm",
     "pyyaml",
     "setproctitle",
@@ -29,7 +30,6 @@ phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
 fastokenizer = ["fastokens>=0.2.0"]
-demo = ["gradio>=6.30.0,<7"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

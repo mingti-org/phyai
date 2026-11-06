@@ -9,7 +9,7 @@ See the inference guide in [English](../../docs/models/humanwam-goal/inference.m
 or [中文](../../docs/zh/models/humanwam-goal/inference.mdx).
 
 Run from the repository root with this PhyAI checkout installed. The tested environment
-uses Hopper GPUs (SM90), Torch 2.10 or 2.11, CUDA 12.8, and GLIBC 2.34 or newer.
+uses Hopper GPUs (SM90), Torch 2.11, CUDA 12.8, and GLIBC 2.34 or newer.
 TP=2/4 requires GPUs connected by NVLink on one host and `nvcc`.
 Each GPU retains full projection weights for the token-partitioned Generator
 blocks. Budget roughly the single-GPU weight memory per GPU when using TP.
@@ -28,8 +28,6 @@ export HUMANWAM_GOAL_SAMPLE=/path/to/observation.json
 The inference checkpoint must contain `transformer/`, `vae/`, `text_tokenizer/`,
 `sampling.json`, and `processor.json`.
 Sampling coefficients are computed at setup; `corrector_weights` is optional.
-For parity with the released HumanNet native backend, use its Torch 2.10 and
-cuBLASLt 12.8.3.14 [reproduction environment](https://github.com/DAGroup-PKU/HumanNet/tree/open-humanscale/humanwam_goal#reproducing-published-results).
 
 Run on one GPU:
 

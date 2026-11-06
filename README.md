@@ -118,9 +118,6 @@ uv pip install phyai phyai-ext \
   --prerelease=allow
 ```
 
-For Gradio demos, install `phyai[demo]` in place of `phyai`. Source installations
-with `uv sync` already include the demo dependency.
-
 ## Quantization
 
 PhyAI supports post-training quantization (PTQ) when loading an unquantized
