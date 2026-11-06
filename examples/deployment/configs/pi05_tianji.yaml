@@ -1,0 +1,52 @@
+# ==============================================================================
+# Model Server Configuration for Tianji (Marvin Pro) Pi0.5 Checkpoints
+# ==============================================================================
+# Configures serve_pi05.py for Tianji native pipeline exports.
+# Camera order and action dimension are declared below. Checkpoint pipelines own
+# normalization and delta decoding.
+#
+# Environment requirement on NVIDIA Thor (sm_110a architecture):
+#   export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+#
+# Usage:
+#   python -m examples.deployment.serve_pi05 \
+#     --config examples/deployment/configs/pi05_tianji.yaml \
+#     policy.checkpoint=/path/to/checkpoint
+# ==============================================================================
+
+# Default manipulation task instruction for Tianji.
+task: Plug in the Ethernet cable
+
+# ZMQ socket binding endpoint for policy RPC.
+endpoint: tcp://127.0.0.1:5555
+
+# Inactive client lease timeout in seconds.
+lease_timeout_s: 60.0
+
+policy:
+  # Path to the converted Tianji Pi0.5 checkpoint directory.
+  checkpoint: ???
+
+  # Kernel selection policy ensuring exact GELU activations.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+
+  # CPU noise generator seed.
+  seed: 42
+
+  # Denoising Euler steps: null preserves the checkpoint default (5 steps for Tianji RLinf).
+  num_inference_steps: null
+
+  # Use CUDA graph for minimized execution jitter.
+  use_cuda_graph: true
+
+  # Engine runtime thread count.
+  num_threads: 16
+
+processor:
+  # null uses native checkpoint pipelines; external factories remain optional.
+  factory: null
+  options: {}
+  camera_names: [head_left, left_wrist, right_wrist]
+  action_dim: 16
+  action_dtype: float64
+  image_resize_backend: pil

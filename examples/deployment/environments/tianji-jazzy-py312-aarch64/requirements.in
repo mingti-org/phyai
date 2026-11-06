@@ -1,0 +1,8 @@
+# Robot/client only. ROS Jazzy and custom messages are host-provided.
+numpy==2.5.3
+Pillow==12.3.0
+av==18.1.0
+pyzmq==27.2.0
+omegaconf==2.3.1
+PyYAML==6.0.3
+opencv-python-headless==5.0.0.93

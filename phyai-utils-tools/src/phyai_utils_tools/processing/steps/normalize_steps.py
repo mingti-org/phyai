@@ -103,7 +103,7 @@ class _NormalizeBase(ProcessorStep):
     norm_map: dict[Any, Any] = field(default_factory=dict)
     stats: dict[str, dict[str, Any]] | None = None
     device: torch.device | str | None = None
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype | str = torch.float32
     eps: float = 1e-8
 
     _features: dict[str, PolicyFeature] = field(
@@ -118,6 +118,18 @@ class _NormalizeBase(ProcessorStep):
     _stats_explicit: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.dtype, str):
+            name = self.dtype.removeprefix("torch.")
+            if name not in ("float16", "bfloat16", "float32", "float64"):
+                raise ValueError(f"Unsupported normalization dtype: {self.dtype!r}")
+            self.dtype = getattr(torch, name)
+        if self.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError("Normalization dtype must be a floating torch dtype")
         # features: {name: PolicyFeature | {"type","shape"}} -> {name: PolicyFeature}
         self._features = {}
         for name, feat in (self.features or {}).items():
@@ -154,7 +166,7 @@ class _NormalizeBase(ProcessorStep):
 
         Stats are intentionally absent — they live in the sidecar state dict.
         """
-        return {
+        config = {
             "eps": self.eps,
             "features": {
                 name: {"type": feat.type.value, "shape": list(feat.shape)}
@@ -162,6 +174,12 @@ class _NormalizeBase(ProcessorStep):
             },
             "norm_map": {k.value: v.value for k, v in self._norm_map.items()},
         }
+
+        # Omit the default to keep existing LeRobot configs unchanged. A
+        # float64 sidecar alone is insufficient: loading casts to this dtype.
+        if self.dtype != torch.float32:
+            config["dtype"] = str(self.dtype).removeprefix("torch.")
+        return config
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Flatten stats to ``{"{feature}.{stat}": tensor}`` (CPU) for the sidecar."""

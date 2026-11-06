@@ -1,0 +1,64 @@
+# ==============================================================================
+# Generic PhyAI Pi0.5 Model Server Base Configuration
+# ==============================================================================
+# This configuration specifies default parameters for serve_pi05.py.
+# The server is 100% embodiment-agnostic: it loads a Pi0.5 checkpoint into GPU
+# memory, handles tokenization, normalization, flow-matching Euler denoising,
+# and relative-action restoration. Specific models extend or override these values
+# (e.g. pi05_tianji.yaml or pi05_agilex.yaml).
+#
+# Inspect merged settings:
+#   python -m examples.deployment.serve_pi05 --config examples/deployment/configs/pi05.yaml --print-config
+# ==============================================================================
+
+# Natural language task instruction describing the robot's manipulation goal.
+# Encoded by the tokenizer and passed to the vision-language backbone.
+task: ""
+
+# Network endpoint where the ZMQ REP socket binds to receive requests.
+# Default binds to loopback interface for secure local inter-process communication.
+endpoint: tcp://127.0.0.1:5555
+
+# Inactive client lease timeout in seconds.
+# If a connected robot client crashes or disconnects without calling "end",
+# the server automatically releases the active run reservation after this period.
+lease_timeout_s: 60.0
+
+# ------------------------------------------------------------------------------
+# PhyAI Model & Inference Engine Parameters
+# ------------------------------------------------------------------------------
+policy:
+  # Path to the exported Pi0.5 model checkpoint directory.
+  # Must contain config.json, weights, tokenizer files, and the two processing pipelines.
+  # Required parameter; marked as MISSING (???) in base template.
+  checkpoint: ???
+
+  # Path to the kernel selection configuration YAML file.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+
+  # Seed for the CPU diffusion initial noise generator.
+  # Reset on each new client run to ensure reproducible trajectory generation.
+  seed: 42
+
+  # Number of Euler flow-matching integration steps during inference.
+  # Set to an integer to override the checkpoint's default step count;
+  # set to null to use the step count specified in config.json.
+  num_inference_steps: null
+
+  # Enable CUDA Graph capture and replay for deterministic latency and minimal CPU overhead.
+  use_cuda_graph: true
+
+  # Number of CPU runtime worker threads allocated for the PhyAI inference engine.
+  num_threads: 16
+
+# ------------------------------------------------------------------------------
+# Observation Preprocessor Configuration
+# ------------------------------------------------------------------------------
+processor:
+  # null uses native checkpoint pipelines; external factories remain optional.
+  factory: null
+  options: {}
+  camera_names: null
+  action_dim: null
+  action_dtype: float32
+  image_resize_backend: pil
