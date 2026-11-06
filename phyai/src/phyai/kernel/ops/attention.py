@@ -7,7 +7,7 @@ import importlib
 from typing import Mapping
 
 from phyai.utils import get_logger
-from phyai.kernel.facts import lib, attrs, dtype, shape, device
+from phyai.kernel.facts import lib, attrs, dtype, shape, device, model
 from phyai.kernel.opspec import Impl, OpSpec, Priority, returns_instance
 from phyai.kernel.policy import PolicyError
 from phyai.kernel.registry import Catalog
@@ -290,6 +290,40 @@ def register(catalog: Catalog) -> None:
     for spec in (ATTENTION, ATTENTION_PAGED, ATTENTION_GDN):
         catalog.register_op(spec)
 
+    catalog.register(
+        Impl(
+            kernel_id="thor.attention.compact",
+            capture_safe=False,
+            op="attention",
+            priority=Priority.SPECIALIZED,
+            when=all_of(
+                model.family == "cosmos3_policy",
+                model.tags.has("thor_compact_attention"),
+                NVIDIA_FLASHINFER,
+                lib.has("phyai_kernel"),
+                device.arch == "sm110",
+                dtype.input == "bf16",
+                dtype.key == "bf16",
+                dtype.value == "bf16",
+                shape.heads == 32,
+                shape.kv_heads == 8,
+                shape.head_dim == 128,
+                attrs.layout == "padded",
+                attrs.causal == False,
+                attrs.sliding_window.is_none(),
+                attrs.logits_soft_cap.is_none(),
+                attrs.mask_kind.is_none(),
+                attrs.has_attn_bias != True,
+            ),
+            prepare=_backend_prepare(
+                ("phyai.kernel.impls.thor_attention", "CompactAttentionBackend")
+            ),
+            metadata={
+                "package": "phyai_kernel",
+                "note": "explicit policy only; capture uses FlashInfer",
+            },
+        )
+    )
     catalog.register_many(
         (
             *_prefill_variants(

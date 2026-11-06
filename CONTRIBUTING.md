@@ -43,6 +43,7 @@ scripts/setup_dev_env.sh
 To install only the Python workspace, run:
 
 ```bash
+git submodule update --init third_party/cutlass
 uv sync
 ```
 
