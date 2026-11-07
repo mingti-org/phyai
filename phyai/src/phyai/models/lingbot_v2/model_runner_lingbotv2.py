@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -20,12 +21,15 @@ from phyai.layers.attention import (
 )
 from phyai.runtime.model_runner import ModelRunner
 from phyai.layers.attention.shared import select_paged_backend
+from phyai.layers.linear import LinearBase, resolve_linear_kernel
 from phyai.layers.rotary_embedding import InterleavedMRotaryEmbedding
+from phyai.parallel.state import graph_capture, resolve_mesh
 from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphError
 from phyai.models.lingbot_v2.modeling_lingbotv2 import (
     LingBotV2Model,
     Qwen3VLTextModel,
     LingBotV2ExpertStack,
+    LingBotV2TokenMoE,
     LingBotV2ActionTimeHeads,
     build_lingbot_v2_mrope_position_ids,
 )
@@ -127,6 +131,15 @@ class _LingBotV2EulerGraphState:
     graph: CudaGraph
     state_plan: PagedAttnPlanHandle
     action_plan: PagedAttnPlanHandle
+    wavefront: _LingBotV2WavefrontState | None = None
+
+
+@dataclass(frozen=True)
+class _LingBotV2WavefrontState:
+    """Keep the state stream and per-step layer events alive with their graph."""
+
+    stream: torch.cuda.Stream
+    events: tuple[tuple[torch.cuda.Event, ...], ...]
 
 
 class LingBotV2VisionRunner(ModelRunner):
@@ -442,7 +455,9 @@ class LingBotV2ExpertRunner(ModelRunner):
         params_dtype: torch.dtype,
         device: torch.device | str,
         use_cuda_graph: bool = True,
+        use_wavefront_pipeline: bool = False,
     ) -> None:
+        """Select attention backends and check Wavefront execution requirements."""
         self.expert_stack = expert_stack
         self.heads = heads
         self.mrope = mrope
@@ -482,6 +497,17 @@ class LingBotV2ExpertRunner(ModelRunner):
             and self.state_backend.supports_capture()
             and self.action_backend.supports_capture()
         )
+        self.use_wavefront_pipeline = bool(use_wavefront_pipeline)
+        if self.use_wavefront_pipeline and not self.use_cuda_graph:
+            raise ValueError("LingBot wavefront pipeline requires Euler CUDA Graph.")
+        if self.use_wavefront_pipeline and any(
+            backend.name != "sdpa"
+            for backend in (self.state_backend, self.action_backend)
+        ):
+            raise ValueError(
+                "LingBot wavefront pipeline requires SDPA paged attention; "
+                f"got state={self.state_backend.name}, action={self.action_backend.name}."
+            )
         self._time_schedule: torch.Tensor | None = None
         self._dt: torch.Tensor | None = None
         self._step_conditions: tuple[_LingBotV2StepCondition, ...] = ()
@@ -490,11 +516,22 @@ class LingBotV2ExpertRunner(ModelRunner):
         self.reset()
 
     def setup(self) -> None:
-        """Prepare the fixed time schedule and its learned affine parameters."""
+        """Validate Wavefront kernels and prepare the fixed Euler conditions."""
         self._euler_graphs.clear()
         self._failed_graph_keys.clear()
         self._step_conditions = ()
         self.reset()
+        if self.use_wavefront_pipeline:
+            with torch.no_grad():
+                state = torch.zeros(
+                    1,
+                    self.heads.flow_config.max_state_dim,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
+                self._validate_wavefront_kernels(
+                    self.heads.embed_state(state).reshape(1, -1)
+                )
         common = {
             "max_batch_size": self.max_batch_size,
             "max_paged_kv_indices": self.max_paged_kv_indices,
@@ -630,10 +667,17 @@ class LingBotV2ExpertRunner(ModelRunner):
         state_sin: torch.Tensor,
         action_cos: torch.Tensor,
         action_sin: torch.Tensor,
+        wavefront: _LingBotV2WavefrontState | None = None,
+        step: int = 0,
     ) -> torch.Tensor:
+        """Run State/Action layers with ordered KV reads and a final stream join."""
         batch_size = state_hidden.shape[0]
         cond = condition.cond[:batch_size]
         action_hidden = self.heads.embed_action(x_t, cond)
+        main_stream = None
+        if wavefront is not None:
+            main_stream = torch.cuda.current_stream(self.device)
+            wavefront.stream.wait_stream(main_stream)
         for index, layer in enumerate(self.expert_stack.layers):
             input_modulation = tuple(
                 t[:batch_size] for t in condition.input_modulations[index]
@@ -641,16 +685,26 @@ class LingBotV2ExpertRunner(ModelRunner):
             post_modulation = tuple(
                 t[:batch_size] for t in condition.post_modulations[index]
             )
-            state_hidden = layer(
-                state_hidden,
-                cond=cond,
-                input_modulation=input_modulation,
-                post_modulation=post_modulation,
-                rope=self.mrope,
-                cos=state_cos,
-                sin=state_sin,
-                attn_ctx=state_context,
-            )
+            with (
+                torch.cuda.stream(wavefront.stream)
+                if wavefront is not None
+                else nullcontext()
+            ):
+                state_hidden = layer(
+                    state_hidden,
+                    cond=cond,
+                    input_modulation=input_modulation,
+                    post_modulation=post_modulation,
+                    rope=self.mrope,
+                    cos=state_cos,
+                    sin=state_sin,
+                    attn_ctx=state_context,
+                )
+                if wavefront is not None:
+                    wavefront.events[step][index].record(wavefront.stream)
+            if wavefront is not None:
+                # Action reads this layer's state KV; state never reads action KV.
+                main_stream.wait_event(wavefront.events[step][index])
             action_hidden = layer(
                 action_hidden,
                 cond=cond,
@@ -661,6 +715,9 @@ class LingBotV2ExpertRunner(ModelRunner):
                 sin=action_sin,
                 attn_ctx=action_context,
             )
+        if wavefront is not None:
+            # Finish the fork before the next step can overwrite the shared KV.
+            main_stream.wait_stream(wavefront.stream)
         return self.heads.project_action(self.expert_stack.norm(action_hidden))
 
     def forward(self, batch: LingBotV2ExpertForwardBatch) -> torch.Tensor:
@@ -699,14 +756,16 @@ class LingBotV2ExpertRunner(ModelRunner):
         action_sin: torch.Tensor,
         state_write_indices: torch.Tensor,
         action_write_indices: torch.Tensor,
+        wavefront: _LingBotV2WavefrontState | None = None,
     ) -> torch.Tensor:
+        """Advance action noise through the cached Euler conditions."""
         if not self._step_conditions or self._dt is None:
             raise RuntimeError("setup must run before the LingBot V2 Euler loop.")
         state_context, action_context = self._contexts(
             state_plan, action_plan, state_write_indices, action_write_indices
         )
         x_t = noise.clone()
-        for condition in self._step_conditions:
+        for step, condition in enumerate(self._step_conditions):
             velocity = self._velocity(
                 state_hidden,
                 x_t,
@@ -717,28 +776,138 @@ class LingBotV2ExpertRunner(ModelRunner):
                 state_sin=state_sin,
                 action_cos=action_cos,
                 action_sin=action_sin,
+                wavefront=wavefront,
+                step=step,
             )
             x_t += self._dt * velocity
         return x_t
 
+    def _validate_wavefront_kernels(self, state_hidden: torch.Tensor) -> None:
+        """Reject collectives and unsafe GEMMs for every supported batch size."""
+        for layer in self.expert_stack.layers:
+            if (
+                isinstance(layer.mlp, LingBotV2TokenMoE)
+                and layer.mlp.mesh.group_size("moe_tp") != 1
+            ):
+                raise ValueError("LingBot wavefront pipeline requires moe_tp=1.")
+            for component in (layer.qkv_proj, layer.o_proj, layer.mlp):
+                for linear in component.modules():
+                    if not isinstance(linear, LinearBase):
+                        continue
+                    group = getattr(linear, "group", None)
+                    if group is not None:
+                        mesh = resolve_mesh(linear.mesh_name)
+                        if mesh.group_size(group) != 1:
+                            raise ValueError(
+                                f"LingBot wavefront pipeline requires {group}=1."
+                            )
+                    for batch_size in range(1, self.max_batch_size + 1):
+                        for capture in (False, True):
+                            with graph_capture() if capture else nullcontext():
+                                for tokens in (
+                                    batch_size,
+                                    batch_size * self.chunk_size,
+                                ):
+                                    selection = resolve_linear_kernel(
+                                        linear,
+                                        state_hidden,
+                                        M=tokens,
+                                        N=linear.output_size_per_partition,
+                                        K=linear.input_size_per_partition,
+                                    )
+                                    if selection.kernel_id != "torch.gemm.bf16":
+                                        raise ValueError(
+                                            "LingBot wavefront pipeline requires "
+                                            "torch.gemm.bf16 for concurrent linear layers; "
+                                            f"{linear.prefix} selects {selection.kernel_id} "
+                                            f"with M={tokens}, capture={capture}."
+                                        )
+
+    def _validate_wavefront_stream(self) -> None:
+        """Reject Wavefront on streams owned by a CUDA green context."""
+        try:
+            from cuda.bindings import driver as cu
+        except ImportError as error:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                "cuda.bindings.driver is unavailable."
+            ) from error
+
+        try:
+            with torch.cuda.device(self.device):
+                stream_handle = int(torch.cuda.current_stream(self.device).cuda_stream)
+                status, green_context = cu.cuStreamGetGreenCtx(stream_handle)
+            success = cu.CUresult.CUDA_SUCCESS
+            green_context_handle = int(green_context)
+        except Exception as error:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                "cuStreamGetGreenCtx failed."
+            ) from error
+
+        if status != success:
+            raise ValueError(
+                "LingBot wavefront pipeline cannot verify the CUDA stream context; "
+                f"cuStreamGetGreenCtx returned {status}."
+            )
+        if green_context_handle:
+            raise ValueError(
+                "LingBot wavefront pipeline does not support vGPU green-context "
+                "streams; disable use_wavefront_pipeline for vGPU execution."
+            )
+
     def _capture_euler_graph(
         self, inputs: dict[str, torch.Tensor]
     ) -> _LingBotV2EulerGraphState:
+        """Capture Euler steps and retain their plans, stream, and events."""
         assert self._state_metadata is not None and self._action_metadata is not None
         state_plan = self.state_backend.init_capture_metadata(self._state_metadata)
         action_plan = self.action_backend.init_capture_metadata(self._action_metadata)
+        wavefront = (
+            _LingBotV2WavefrontState(
+                stream=torch.cuda.Stream(device=self.device),
+                events=tuple(
+                    tuple(torch.cuda.Event() for _ in self.expert_stack.layers)
+                    for _ in self._step_conditions
+                ),
+            )
+            if self.use_wavefront_pipeline
+            else None
+        )
+
+        stream_rejection: ValueError | None = None
 
         def captured_loop(**inputs: torch.Tensor) -> torch.Tensor:
+            nonlocal stream_rejection
+            if self.use_wavefront_pipeline:
+                try:
+                    self._validate_wavefront_stream()
+                except ValueError as error:
+                    stream_rejection = error
+                    raise
             return self._euler_loop(
-                state_plan=state_plan, action_plan=action_plan, **inputs
+                state_plan=state_plan,
+                action_plan=action_plan,
+                wavefront=wavefront,
+                **inputs,
             )
 
         graph = CudaGraph()
-        graph.capture(captured_loop, inputs)
-        return _LingBotV2EulerGraphState(graph, state_plan, action_plan)
+        try:
+            graph.capture(captured_loop, inputs)
+        except BaseException:
+            try:
+                graph.reset()
+            finally:
+                if stream_rejection is not None:
+                    raise stream_rejection
+            raise
+        return _LingBotV2EulerGraphState(graph, state_plan, action_plan, wavefront)
 
     def forward_euler(self, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Embed the state once, then run or replay the full Euler loop."""
+        if self.use_wavefront_pipeline:
+            self._validate_wavefront_stream()
         if self._state_plan is None or self._action_plan is None:
             raise RuntimeError("plan_inference must run before the Euler loop.")
         inputs = {
@@ -747,6 +916,7 @@ class LingBotV2ExpertRunner(ModelRunner):
             **self._position_inputs,
         }
         key = (
+            self.use_wavefront_pipeline,
             self._layout_key,
             tuple(
                 (name, tuple(t.shape), t.dtype, t.device) for name, t in inputs.items()
