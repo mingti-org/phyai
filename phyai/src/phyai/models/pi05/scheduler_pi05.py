@@ -375,6 +375,8 @@ class PI05Scheduler(Scheduler):
             num_steps=num_steps,
         )
         if self.expert_runner.recapture_after_weight_update():
+            # Recapture stages seed metadata; the next request must replan.
+            self._last_layout_key = None
             logger.info(
                 "Recaptured PI05 expert CUDA graph after hot weight update.",
             )
