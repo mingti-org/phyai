@@ -41,6 +41,7 @@ class Cosmos3T2VRunner(ModelRunner):
         device: torch.device | str | None = None,
         use_cuda_graph: bool = False,
         use_fused_rope: bool = True,
+        fuse_eager_attention: bool = False,
         torch_compile: bool = False,
         compile_kwargs: dict | None = None,
     ) -> None:
@@ -57,7 +58,10 @@ class Cosmos3T2VRunner(ModelRunner):
             OrderedDict()
         )
         self.use_cuda_graph = bool(use_cuda_graph)
-        self._attention_fusion = Cosmos3AttentionFusion(enabled=use_fused_rope)
+        self._attention_fusion = Cosmos3AttentionFusion(
+            enabled=use_fused_rope,
+            eager_enabled=fuse_eager_attention and not self.use_cuda_graph,
+        )
         self._graphs: OrderedDict[str, Cosmos3CudaGraphRunner] = OrderedDict()
         self._attention_contexts: OrderedDict[str, Cosmos3AttentionContexts] = (
             OrderedDict()
