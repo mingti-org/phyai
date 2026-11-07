@@ -341,7 +341,81 @@ def _torch_rmsnorm_silu_mul(facts, params):
     return rmsnorm_silu_mul
 
 
+ROUNDED_ADD = OpSpec(
+    name="rmsnorm_rounded_add",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "weight", "residual"),
+    attributes=("variant",),
+    signature="(x, residual, norm) -> (normalized, summed)",
+    doc="Out-of-place residual add rounded before the original RMSNorm.",
+)
+
+
+def _rounded_add_reference(facts, params):
+    def run(x, residual, norm):
+        summed = residual + x
+        return norm(summed), summed
+
+    return run
+
+
+def _rounded_add_thor(facts, params):
+    reference = _rounded_add_reference(facts, params)
+
+    def run(x, residual, norm):
+        if (
+            not x.is_contiguous()
+            or not residual.is_contiguous()
+            or x.shape != residual.shape
+            or x.shape[-1] != 4096
+            or x.device != residual.device
+            or x.device != norm.weight.device
+            or not norm.weight.is_contiguous()
+            or x.numel() == 0
+        ):
+            return reference(x, residual, norm)
+        from phyai_kernel.cuda.rounded_add_rmsnorm import rounded_add_rmsnorm
+
+        summed, normalized = rounded_add_rmsnorm(
+            x, residual, norm.weight, norm.variance_epsilon
+        )
+        return normalized, summed
+
+    return run
+
+
 def register(catalog: Catalog) -> None:
+    catalog.register_op(ROUNDED_ADD)
+    catalog.register_many(
+        (
+            Impl(
+                kernel_id="torch.rmsnorm_rounded_add",
+                op="rmsnorm_rounded_add",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=dtype.input.is_set(),
+                prepare=_rounded_add_reference,
+            ),
+            Impl(
+                kernel_id="thor.rmsnorm_rounded_add",
+                capture_safe=False,
+                op="rmsnorm_rounded_add",
+                priority=Priority.SPECIALIZED,
+                when=all_of(
+                    NVIDIA_FLASHINFER,
+                    lib.has("phyai_kernel"),
+                    device.arch == "sm110",
+                    shape.hidden == 4096,
+                    attrs.variant == "rms",
+                    dtype.input == "bf16",
+                    dtype.weight == "bf16",
+                    dtype.residual == "bf16",
+                ),
+                prepare=_rounded_add_thor,
+            ),
+        )
+    )
+
     for spec in (
         RMSNORM,
         RMSNORM_ADD,
