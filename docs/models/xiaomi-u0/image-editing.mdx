@@ -1,0 +1,39 @@
+---
+title: "Xiaomi U0 image editing"
+description: "Edit a reference image with Xiaomi-Robotics-U0-4B in PhyAI."
+---
+
+Give Xiaomi-Robotics-U0-4B one reference image and a text instruction. PhyAI encodes the reference, generates image tokens, and decodes them into one 1024 × 1024 RGB image.
+
+## Edit an image
+
+Set up the [checkpoints and environment](/models/xiaomi-u0/text-to-image#prepare-the-models), then run this command from the PhyAI repository root. Use a new or empty output directory.
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --vision-tokenizer-dir "$U0_VISION_TOKENIZER" \
+  --reference-image docs/images/models/xiaomi-u0/teapot-stoneware-reference.png \
+  --prompt "Give the ceramic teapot a speckled stoneware glaze while keeping its shape and the wooden table." \
+  --output-dir ./outputs/u0-stoneware \
+  --seed 42
+```
+
+The example uses a 1 GiB FlashInfer workspace for the image-conditioned prompt. It runs one request on one CUDA GPU with CUDA Graph disabled. The reference keeps approximately its original aspect ratio as it is resized to dimensions divisible by 16. The generated image is square.
+
+## Read the output
+
+Open `outputs/u0-stoneware/image.png` to view the edit. The example writes the usual [generation files](/models/xiaomi-u0/text-to-image#read-the-output) and saves the reference grid to `reference_codes.npy`. Both `input_ids.npy` and `unconditional_ids.npy` include the reference image. Only the conditional prompt contains the editing instruction.
+
+Use `--prepare-only` with `--reference-image` to save the reference codes and prompt tokens before autoregressive generation. This mode uses the vision encoder and requires `--vision-tokenizer-dir`.
+
+## Thor example
+
+The 1024 × 768 reference encoded to a 55 × 74 code grid. The edit adds speckling to the glaze and keeps the teapot and wooden table. The square result frames the teapot more tightly.
+
+| Reference | Edited result |
+| --- | --- |
+| ![Cream ceramic teapot on a wooden table](/images/models/xiaomi-u0/teapot-stoneware-reference.png) | ![Speckled stoneware teapot filling more of the square frame](/images/models/xiaomi-u0/teapot-stoneware-result.png) |
+
+On NVIDIA Thor, this edit and a text-to-image regression both reached EOS after 4169 generated tokens and produced 1024 × 1024 RGB images.

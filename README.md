@@ -82,7 +82,7 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
         <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
         <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>,
-        <a href="https://phyai.mintlify.app/models/xiaomi-u0/text-to-image"><strong>Xiaomi Robotics U0</strong></a> (T2I)
+        <a href="https://phyai.mintlify.app/models/xiaomi-u0/text-to-image"><strong>Xiaomi Robotics U0</strong></a> (T2I, X2I)
       </td>
     </tr>
   </tbody>
