@@ -9,6 +9,7 @@ import torch
 from phyai.layers.attention.enums import AttnLayout, AttnMode
 from phyai.layers.attention.paged.base import PagedAttnMetadata
 from phyai.models.xiaomi_u0.logits_processor_unis import (
+    BOI,
     EOI,
     EOS,
     UnbatchedClassifierFreeGuidanceLogitsForVisualTokenWithDifferentialTopKProcessor,
@@ -139,9 +140,9 @@ class _Branch:
         end = self.history.shape[1]
         self.runner.plan_inference(_metadata(start, end, ids.device))
         positions = torch.arange(start, end, device=ids.device).unsqueeze(0)
-        self.last_logits = self.runner.forward(UNISForwardBatch(ids, positions))[
-            :, -1
-        ].clone()
+        last_token_only = start == 0 and (ids == BOI).any().item()
+        batch = UNISForwardBatch(ids, positions, last_token_only=last_token_only)
+        self.last_logits = self.runner.forward(batch)[:, -1].clone()
         return self.last_logits
 
     def __call__(
@@ -170,7 +171,7 @@ class _Branch:
 class UNISGenerationScheduler(Scheduler):
     """Own CFG branches, processing, sampling and EOS termination.
 
-    The first implementation supports one unpadded, tokenized T2I request,
+    Supports one unpadded, tokenized T2I or X2I request,
     a fixed 64-by-64 visual grid and no_text CFG. Image decode is separate.
     """
 

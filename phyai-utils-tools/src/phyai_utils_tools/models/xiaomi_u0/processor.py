@@ -1,4 +1,4 @@
-"""Local checkpoint tokenization and single-image U0 postprocessing."""
+"""Local checkpoint tokenization and single-image U0 processing."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import torch
 # Copyright 2025 BAAI. and/or its affiliates. SPDX-License-Identifier: Apache-2.0
 PATTERN = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 TEMPLATE = "<|extra_203|>You are a helpful assistant for t2i task. USER: {text} ASSISTANT: <|extra_100|>"
+X2I_PREFIX = "<|extra_203|>You are a helpful assistant. USER: "
+X2I_SUFFIX = " ASSISTANT: <|extra_100|>"
 
 
 class U0TextProcessor:
@@ -81,13 +83,16 @@ class U0TextProcessor:
             disallowed_special=(),
         )
 
-    def build_inputs(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build unpadded conditional and no-text CFG prompts on the CPU."""
+    def _validate_prompt(self, prompt: str) -> None:
+        """Reject empty user text and reserved control tokens."""
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("A nonempty text prompt is required.")
-        # User content must not inject control tokens into the fixed T2I template.
         if any(name in prompt for name in self.special_tokens):
             raise ValueError("Prompt contains a reserved U0 token.")
+
+    def build_inputs(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build unpadded conditional and no-text CFG prompts on the CPU."""
+        self._validate_prompt(prompt)
         conditional = torch.tensor(
             [self.encode(TEMPLATE.format(text=prompt))], dtype=torch.int64
         )
@@ -96,12 +101,57 @@ class U0TextProcessor:
         )
         return conditional, unconditional
 
+    def build_x2i_inputs(
+        self, prompt: str, codes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build X2I CFG prompts that share one serialized reference image."""
+        self._validate_prompt(prompt)
+        if codes.ndim != 2 or codes.dtype != torch.int64 or not codes.numel():
+            raise ValueError("Expected a nonempty two-dimensional int64 code grid.")
+        if ((codes < 0) | (codes >= 131072)).any().item():
+            raise ValueError("Reference codes must be in [0, 131072).")
+        height, width = codes.shape
+        prefix = self.encode(X2I_PREFIX)
+        prefix += [self.special_tokens["<|image start|>"]]
+        prefix += self.encode(f"{height}*{width}")
+        prefix += [self.special_tokens["<|image token|>"]]
+        rows = (codes.detach().cpu() + 151854).tolist()
+        for index, row in enumerate(rows):
+            if index:
+                prefix.append(self.special_tokens["<|extra_200|>"])
+            prefix.extend(row)
+        prefix.append(self.special_tokens["<|image end|>"])
+        conditional = prefix + self.encode(prompt + X2I_SUFFIX)
+        unconditional = prefix + self.encode(X2I_SUFFIX)
+        return (
+            torch.tensor([conditional], dtype=torch.int64),
+            torch.tensor([unconditional], dtype=torch.int64),
+        )
+
     def header_mapping(self) -> dict[str, list[int]]:
         """Derive the fixed-grid scheduler mapping from the real vocabulary."""
         return {
             text: self.encode(text)
             for text in [*(str(i) for i in range(10)), "*", "64*64"]
         }
+
+
+def reference_image_pixels(path: str | Path) -> torch.Tensor:
+    """Resize one reference to the official area and return normalized RGB pixels."""
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as image:
+        aspect_ratio = image.width / image.height
+        height = int((1024 * 1024 / aspect_ratio) ** 0.5)
+        width = int(height * aspect_ratio)
+        height = ((height + 8) // 16) * 16
+        width = ((width + 8) // 16) * 16
+        if not height or not width:
+            raise ValueError("Reference aspect ratio is too extreme for the U0 grid.")
+        rgb = image.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
+    pixels = torch.tensor(np.asarray(rgb) / 127.5 - 1.0, dtype=torch.float32)
+    return pixels.permute(2, 0, 1).unsqueeze(0)
 
 
 def visual_codes(tokens: torch.Tensor) -> torch.Tensor:

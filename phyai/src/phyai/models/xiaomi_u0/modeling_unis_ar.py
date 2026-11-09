@@ -149,8 +149,12 @@ class UNISForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         ctx: PagedAttnCtx | None = None,
+        *,
+        last_token_only: bool = False,
     ) -> torch.Tensor:
         """Project backbone states to vocabulary logits and return them in FP32."""
         hidden_states = self.model(input_ids, position_ids, ctx)
+        if last_token_only:
+            hidden_states = hidden_states[:, -1:]
         logits, _ = self.lm_head(hidden_states)
         return logits.float()

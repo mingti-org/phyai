@@ -25,6 +25,7 @@ class UNISForwardBatch:
 
     input_ids: torch.Tensor
     position_ids: torch.Tensor
+    last_token_only: bool = False
 
 
 class UNISModelRunner(ModelRunner):
@@ -166,6 +167,10 @@ class UNISModelRunner(ModelRunner):
         # Consume the plan so a second forward cannot silently reuse stale metadata.
         self._meta = None
         self._plan = None
+        if batch.last_token_only:
+            return self.model(
+                batch.input_ids, batch.position_ids, ctx, last_token_only=True
+            )
         return self.model(batch.input_ids, batch.position_ids, ctx)
 
     def reset(self) -> None:

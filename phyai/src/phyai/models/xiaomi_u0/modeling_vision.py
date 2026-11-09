@@ -1,7 +1,7 @@
-"""Native image-only Emu3.5 codebook lookup and convolutional decoder.
+"""Native image-only Emu3.5 encoding and decoding.
 
 Architecture and checkpoint names follow BAAI/Emu3.5-VisionTokenizer.
-Only the decode path is constructed; the image encoder is not needed for T2I.
+The encoder and decoder load separately.
 """
 
 from __future__ import annotations
@@ -190,22 +190,124 @@ class U0VisionStage(nn.Module):
 class U0VisionMiddle(nn.Module):
     """Bottleneck residual-attention-residual sequence."""
 
-    def __init__(self, channels: int, *, device: torch.device | str) -> None:
+    def __init__(
+        self, channels: int, *, prefix: str = "decoder.mid", device: torch.device | str
+    ) -> None:
         """Construct the three checkpoint-backed bottleneck modules."""
         super().__init__()
         self.block_1 = U0VisionResidual(
-            channels, channels, prefix="decoder.mid.block_1", device=device
+            channels, channels, prefix=f"{prefix}.block_1", device=device
         )
         self.attn_1 = U0VisionAttention(
-            channels, prefix="decoder.mid.attn_1", device=device
+            channels, prefix=f"{prefix}.attn_1", device=device
         )
         self.block_2 = U0VisionResidual(
-            channels, channels, prefix="decoder.mid.block_2", device=device
+            channels, channels, prefix=f"{prefix}.block_2", device=device
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the bottleneck before the spatial upsampling stages."""
+        """Apply both residual blocks around the spatial attention layer."""
         return self.block_2(self.attn_1(self.block_1(x)))
+
+
+class U0VisionDownsample(nn.Module):
+    """Halve the spatial dimensions with right and bottom padding."""
+
+    def __init__(
+        self, channels: int, *, prefix: str, device: torch.device | str
+    ) -> None:
+        """Build the stride-two convolution under its checkpoint key."""
+        super().__init__()
+        self.conv = Conv2d(
+            channels,
+            channels,
+            3,
+            stride=2,
+            dtype=torch.float32,
+            device=device,
+            prefix=f"{prefix}.conv",
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad the right and bottom edges before applying the convolution."""
+        return self.conv(F.pad(x, (0, 1, 0, 1)))
+
+
+class U0VisionEncoderStage(nn.Module):
+    """One encoder resolution with checkpoint-indexed residual and attention blocks."""
+
+    def __init__(
+        self,
+        config: U0VisionConfig,
+        level: int,
+        inputs: int,
+        *,
+        device: torch.device | str,
+    ) -> None:
+        """Build the encoder blocks and downsample between resolutions."""
+        super().__init__()
+        prefix = f"encoder.down.{level}"
+        outputs = config.ch * config.ch_mult[level]
+        self.block = nn.ModuleList(
+            U0VisionResidual(
+                inputs if index == 0 else outputs,
+                outputs,
+                prefix=f"{prefix}.block.{index}",
+                device=device,
+            )
+            for index in range(config.num_res_blocks)
+        )
+        self.attn = nn.ModuleList()
+        if (config.resolution >> level) in config.attn_resolutions:
+            self.attn.extend(
+                U0VisionAttention(
+                    outputs, prefix=f"{prefix}.attn.{index}", device=device
+                )
+                for index in range(config.num_res_blocks)
+            )
+        if level < len(config.ch_mult) - 1:
+            self.downsample = U0VisionDownsample(
+                outputs, prefix=f"{prefix}.downsample", device=device
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the blocks in order and downsample if another stage follows."""
+        for index, block in enumerate(self.block):
+            x = block(x)
+            if self.attn:
+                x = self.attn[index](x)
+        return self.downsample(x) if hasattr(self, "downsample") else x
+
+
+class U0VisionEncoder(nn.Module):
+    """Map normalized RGB pixels to a latent grid for IBQ quantization."""
+
+    def __init__(self, config: U0VisionConfig, *, device: torch.device | str) -> None:
+        """Build the checkpoint's fine-to-coarse encoder."""
+        super().__init__()
+        channels = config.ch
+        self.conv_in = vision_conv(
+            3, channels, 3, prefix="encoder.conv_in", device=device
+        )
+        self.down = nn.ModuleList()
+        for level, multiplier in enumerate(config.ch_mult):
+            self.down.append(
+                U0VisionEncoderStage(config, level, channels, device=device)
+            )
+            channels = config.ch * multiplier
+        self.mid = U0VisionMiddle(channels, prefix="encoder.mid", device=device)
+        self.norm_out = vision_norm(channels, prefix="encoder.norm_out", device=device)
+        self.conv_out = vision_conv(
+            channels, config.z_channels, 3, prefix="encoder.conv_out", device=device
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the latent grid before the quantization projection."""
+        x = self.conv_in(x)
+        for stage in self.down:
+            x = stage(x)
+        x = self.norm_out(self.mid(x))
+        return self.conv_out(x * torch.sigmoid(x))
 
 
 class U0VisionDecoder(nn.Module):
@@ -243,6 +345,41 @@ class U0VisionDecoder(nn.Module):
         return self.conv_out(x * torch.sigmoid(x))
 
 
+def vision_codebook(config: U0VisionConfig, device: torch.device | str) -> nn.Module:
+    """Create the shared checkpoint codebook with FP32 loader metadata."""
+    quantize = nn.Module()
+    quantize.embedding = nn.Embedding(
+        config.codebook_size, config.embed_dim, dtype=torch.float32, device=device
+    )
+    weight = quantize.embedding.weight
+    weight.requires_grad_(False)
+    weight.hf_keys = [("quantize.embedding.weight", None)]
+    weight.weight_loader = replicated()
+    return quantize
+
+
+class U0VisionImageEncoder(nn.Module):
+    """Encode normalized RGB pixels into Emu3.5 codebook IDs."""
+
+    def __init__(self, config: U0VisionConfig, *, device: torch.device | str) -> None:
+        """Build the encoder, pre-quantization projection and IBQ codebook."""
+        super().__init__()
+        self.config = config
+        self.encoder = U0VisionEncoder(config, device=device)
+        self.quant_conv = vision_conv(
+            config.z_channels, config.embed_dim, 1, prefix="quant_conv", device=device
+        )
+        self.quantize = vision_codebook(config, device)
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Return one code ID per latent cell using the largest codebook dot product."""
+        latent = self.quant_conv(self.encoder(pixels))
+        scores = torch.einsum(
+            "b d h w, n d -> b n h w", latent, self.quantize.embedding.weight
+        )
+        return scores.argmax(dim=1)
+
+
 class U0VisionTokenizer(nn.Module):
     """Stateless image decoding from Emu3.5 codebook IDs, using FP32 parameters."""
 
@@ -250,14 +387,7 @@ class U0VisionTokenizer(nn.Module):
         """Allocate codebook lookup, post-quantization projection and the RGB decoder."""
         super().__init__()
         self.config = config
-        self.quantize = nn.Module()
-        self.quantize.embedding = nn.Embedding(
-            config.codebook_size, config.embed_dim, dtype=torch.float32, device=device
-        )
-        weight = self.quantize.embedding.weight
-        weight.requires_grad_(False)
-        weight.hf_keys = [("quantize.embedding.weight", None)]
-        weight.weight_loader = replicated()
+        self.quantize = vision_codebook(config, device)
         self.post_quant_conv = vision_conv(
             config.embed_dim,
             config.z_channels,
@@ -286,5 +416,12 @@ class U0VisionTokenizer(nn.Module):
 def vision_decode_weight_remap(name: str) -> str | None:
     """Skip only the encoder and encoder-side quantization projection during loading."""
     if name.startswith(("encoder.", "quant_conv.")):
+        return None
+    return name
+
+
+def vision_encode_weight_remap(name: str) -> str | None:
+    """Skip only the decoder and its post-quantization projection when encoding."""
+    if name.startswith(("decoder.", "post_quant_conv.")):
         return None
     return name
