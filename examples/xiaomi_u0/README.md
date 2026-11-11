@@ -1,13 +1,13 @@
-# Xiaomi U0 text-to-image
+# Xiaomi U0 image generation and editing
 
-Generate a 1024 × 1024 image from a text prompt with Xiaomi-Robotics-U0-4B. PhyAI runs both the autoregressive model and the Emu3.5 image decoder. Token generation uses BF16 and FlashInfer paged attention; image decoding uses the released FP32 weights.
+Generate a 1024 × 1024 image from text, or edit one reference image with a text instruction. PhyAI runs Xiaomi-Robotics-U0-4B with BF16 and FlashInfer paged attention. The native Emu3.5 encoder and decoder use the released FP32 weights.
 
 You need one CUDA GPU, the repository runtime, and two local checkpoints:
 
 - `Xiaomi-Robotics-U0-4B`, containing model weights, `config.json`, `unis.tiktoken`, and `unis_vision_tokens.txt`.
-- `Emu3.5-VisionTokenizer`, containing model weights and `config.json`. PhyAI reads these files directly to load the decoder.
+- `Emu3.5-VisionTokenizer`, containing model weights and `config.json`.
 
-See the [full guide](../../docs/models/xiaomi-u0/text-to-image.mdx) for the inference flow and output format.
+See the [text-to-image guide](../../docs/models/xiaomi-u0/text-to-image.mdx) or the [image editing guide](../../docs/models/xiaomi-u0/image-editing.mdx) for checkpoint setup and output files.
 
 ## Install
 
@@ -49,7 +49,28 @@ uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
   --prepare-only
 ```
 
-## Generated examples
+## Edit a reference image
+
+Pass one image with `--reference-image` and describe the edit in `--prompt`. Use a 1 GiB FlashInfer workspace for this example.
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir /path/to/Xiaomi-Robotics-U0-4B \
+  --vision-tokenizer-dir /path/to/Emu3.5-VisionTokenizer \
+  --reference-image docs/images/models/xiaomi-u0/teapot-stoneware-reference.png \
+  --prompt "Give the ceramic teapot a speckled stoneware glaze while keeping its shape and the wooden table." \
+  --output-dir ./outputs/u0-stoneware \
+  --seed 42
+```
+
+Open `outputs/u0-stoneware/image.png`. The output directory also contains `reference_codes.npy` and the two prompt token arrays. With `--reference-image`, `--prepare-only` still loads the vision encoder to produce these files.
+
+| 4:3 reference | Edited result |
+| --- | --- |
+| ![Cream ceramic teapot on a wooden table](../../docs/images/models/xiaomi-u0/teapot-stoneware-reference.png) | ![Speckled stoneware teapot filling more of the square frame](../../docs/images/models/xiaomi-u0/teapot-stoneware-result.png) |
+
+## Text-to-image examples
 
 These images were generated on Thor with seed 42, using FlashInfer and the native PhyAI decoder.
 
@@ -75,10 +96,12 @@ To reproduce the camera or gripper, use its prompt in the generation command abo
 
 ## Supported configuration
 
-Each request generates one image from a fixed 64 × 64 code grid, using no-text classifier-free guidance at scale 3. Run with CUDA Graph disabled. The example does not support concurrent requests, video, or other output sizes.
+The example processes one request on one GPU with CUDA Graph disabled. It generates a fixed 64 × 64 output code grid and uses no-text classifier-free guidance at scale 3. For image editing, both guidance branches receive the reference image.
 
 ## Validation
 
 On Thor, the native decoder passed a numerical comparison with the released decoder for one saved code grid. Each of the three prompts above produced a 1024 × 1024 image with seed 42, using FlashInfer and the native decoder.
+
+The 4:3 edit and a text-to-image regression both reached EOS after 4169 generated tokens on Thor. The edit encoded the reference as a 55 × 74 grid and saved a 1024 × 1024 RGB result.
 
 See the [full guide](../../docs/models/xiaomi-u0/text-to-image.mdx#validation) for a validation summary and links to the comparison results.

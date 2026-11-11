@@ -1,0 +1,39 @@
+---
+title: "Xiaomi U0 图片编辑"
+description: "在 PhyAI 中使用 Xiaomi-Robotics-U0-4B 编辑参考图。"
+---
+
+给 Xiaomi-Robotics-U0-4B 一张参考图和一条编辑指令，即可生成一张 1024 × 1024 的 RGB 图片。参考图编码、token 生成和图像解码都在 PhyAI 内完成。
+
+## 编辑图片
+
+按[文生图指南](/zh/models/xiaomi-u0/text-to-image#准备模型)准备环境和权重。然后在 PhyAI 仓库根目录运行以下命令，并指定一个新目录或空目录保存结果。
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --vision-tokenizer-dir "$U0_VISION_TOKENIZER" \
+  --reference-image docs/images/models/xiaomi-u0/teapot-stoneware-reference.png \
+  --prompt "Give the ceramic teapot a speckled stoneware glaze while keeping its shape and the wooden table." \
+  --output-dir ./outputs/u0-stoneware \
+  --seed 42
+```
+
+这个样例给 FlashInfer 分配 1 GiB 工作区，在单张 CUDA GPU 上处理一个请求，并关闭 CUDA Graph。参考图在缩放时尽量保留原来的宽高比，宽高取 16 的倍数。输出为正方形。
+
+## 查看输出
+
+打开 `outputs/u0-stoneware/image.png` 查看编辑结果。除了[文生图的输出文件](/zh/models/xiaomi-u0/text-to-image#查看输出)，目录里还会多一个 `reference_codes.npy`，记录参考图的视觉码网格。两路 CFG 输入都包含参考图，只有有条件分支包含编辑指令。
+
+加上 `--prepare-only` 可以只保存参考图的视觉码和提示词 token。此时仍需用 `--vision-tokenizer-dir` 提供视觉编码器权重。
+
+## Thor 样例
+
+这张 1024 × 768 的参考图编码为 55 × 74 的视觉码网格。编辑结果为茶壶加上了斑点釉面，保留了茶壶和木桌。正方形的结果图取景更近。
+
+| 参考图 | 编辑结果 |
+| --- | --- |
+| ![木桌上的米白色陶瓷茶壶](../../../images/models/xiaomi-u0/teapot-stoneware-reference.png) | ![取景更近的斑点釉面茶壶](../../../images/models/xiaomi-u0/teapot-stoneware-result.png) |
+
+在 NVIDIA Thor 上，这个编辑样例和一次文生图回归都生成了 4169 个 token，以 EOS 结束，并保存了 1024 × 1024 的 RGB 图片。
