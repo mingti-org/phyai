@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `phyai-model-optimizer/` | Placeholder, no source yet. |
 | `phyai-utils-tools/` | Placeholder, no source yet. |
 
-Hard pins: `torch==2.11`, `flashinfer-python[cu13]==v0.6.17`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions. (The `[cu13]` extra is required: flashinfer 0.6.17's `gdn_prefill` imports the CuTe DSL unconditionally, and `nvidia-cutlass-dsl` 4.5.x ships the importable `cutlass` module only in its per-CUDA `libs` wheels.)
+Hard pins: `torch==2.11`, `flashinfer-python[cu13]==v0.7.4`, `humming-kernels==0.1.19`, `transformers==5.8.1`. Don't bump these casually — green-context and kernel backend behaviour is tied to these versions. Keep the `[cu13]` extra for the CUDA 13 CUTLASS DSL runtime.
 
 ## Common commands
 

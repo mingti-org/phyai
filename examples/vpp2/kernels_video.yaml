@@ -1,0 +1,23 @@
+schema: phyai.kernel/v1
+profile: static
+overrides:
+  # Match the reference accumulation for multi-step standalone video CFG.
+  - id: vpp2-video-attention
+    match: {op: attention, role: vpp2.attention}
+    use: sdpa.attention
+    params:
+      select_kernel: false
+  - id: vpp2-layernorm-modulation
+    match: {op: layernorm_modulate, role: vpp2.norm_modulation}
+    use: phyai_kernel.layernorm_modulate
+  - id: vpp2-qk-normalization
+    match: {op: rmsnorm_cast_affine, role: vpp2.qk_norm}
+    use: phyai_kernel.rmsnorm_cast_affine
+  - id: vpp2-qk-normalization-rope
+    match: {op: qk_rmsnorm_rope, role: vpp2.qk_norm_rope}
+    use: phyai_kernel.qk_rmsnorm_rope
+    params:
+      num_warps: 16
+  - id: vpp2-gated-residual-normalization
+    match: {op: layernorm_gated_residual, role: vpp2.residual_norm}
+    use: phyai_kernel.layernorm_gated_residual

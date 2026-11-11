@@ -29,6 +29,7 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
+- [2026/11] Support [VPP2](https://phyai.mintlify.app/models/vpp2/inference) action and video inference with TP and video CFG parallelism.
 - [2026/11] 🤗 Support [HumanWAM-Goal](https://phyai.mintlify.app/models/humanwam-goal/inference), [arxiv](https://arxiv.org/pdf/2611.06817).
 - [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
 - [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
@@ -71,7 +72,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
       <td align="center">
         <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
         <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>,
-        <a href="docs/models/humanwam-goal/inference.mdx"><strong>HumanWAM-Goal</strong></a>
+        <a href="docs/models/humanwam-goal/inference.mdx"><strong>HumanWAM-Goal</strong></a>,
+        <a href="https://phyai.mintlify.app/models/vpp2/inference"><strong>VPP2</strong></a>
       </td>
     </tr>
     <tr>

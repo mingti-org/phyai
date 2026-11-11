@@ -5,6 +5,7 @@ description = "phyai — Shared utilities and tools."
 requires-python = ">=3.12"
 dependencies = [
     "av>=14.0.0",
+    "ftfy",
     "huggingface-hub",
     "numpy",
     "opencv-python-headless",

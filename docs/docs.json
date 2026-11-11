@@ -54,6 +54,12 @@
                 ]
               },
               {
+                "group": "VPP2",
+                "pages": [
+                  "models/vpp2/inference"
+                ]
+              },
+              {
                 "group": "HumanWAM-Goal",
                 "pages": [
                   "models/humanwam-goal/inference"
@@ -168,6 +174,12 @@
                 "group": "DreamZero",
                 "pages": [
                   "zh/models/dreamzero/ws1"
+                ]
+              },
+              {
+                "group": "VPP2",
+                "pages": [
+                  "zh/models/vpp2/inference"
                 ]
               },
               {

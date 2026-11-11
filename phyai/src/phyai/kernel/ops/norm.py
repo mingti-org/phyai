@@ -108,6 +108,17 @@ RMSNORM_ADD = OpSpec(
     doc="Fused residual add followed by RMSNorm, in place.",
 )
 
+RMSNORM_CAST_AFFINE = OpSpec(
+    name="rmsnorm_cast_affine",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "weight"),
+    attributes=("rank",),
+    params=("weight",),
+    signature="(x, weight, eps) -> Tensor",
+    bench_args=_bench_rmsnorm,
+    doc="RMSNorm with an activation-dtype cast before affine multiplication.",
+)
+
 LAYERNORM = OpSpec(
     name="layernorm",
     dims=("tokens", "hidden"),
@@ -117,6 +128,17 @@ LAYERNORM = OpSpec(
     params=("weight", "bias"),
     signature="(x, weight, bias, eps) -> Tensor",
     bench_args=_bench_layernorm,
+)
+
+LAYERNORM_GATED_RESIDUAL = OpSpec(
+    name="layernorm_gated_residual",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "branch", "gate", "weight"),
+    optional_dtypes=("bias",),
+    attributes=("bias",),
+    params=("weight", "bias"),
+    signature="(x, branch, gate, weight, bias, eps) -> (Tensor, Tensor)",
+    doc="Gated residual update with separately rounded operations, then affine LayerNorm.",
 )
 
 CHANNEL_L2_NORM = OpSpec(
@@ -224,6 +246,25 @@ def _triton_rmsnorm_add(facts, params):
     return gemma_fused_add_rmsnorm if _gemma(facts) else fused_add_rmsnorm
 
 
+def _triton_rmsnorm_cast_affine(facts, params):
+    from phyai_kernel import rmsnorm_cast_affine
+
+    return rmsnorm_cast_affine
+
+
+def _torch_rmsnorm_cast_affine(facts, params):
+    import torch
+
+    def rmsnorm_cast_affine(x, weight, eps):
+        promoted = x.float()
+        normalized = promoted * torch.rsqrt(
+            promoted.square().mean(dim=-1, keepdim=True) + eps
+        )
+        return normalized.to(x.dtype) * weight
+
+    return rmsnorm_cast_affine
+
+
 def _torch_rmsnorm_fn(gemma: bool):
     import torch
 
@@ -276,6 +317,29 @@ def _torch_layernorm(facts, params):
         return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
 
     return layernorm
+
+
+def _triton_layernorm_gated_residual(facts, params):
+    from phyai_kernel.triton.layer_norm_residual import layernorm_gated_residual
+
+    return layernorm_gated_residual
+
+
+def _torch_layernorm_gated_residual(facts, params):
+    import torch.nn.functional as F
+
+    def layernorm_gated_residual(x, branch, gate, weight, bias, eps):
+        updated = (x + branch * gate.unsqueeze(1)).contiguous()
+        normalized = F.layer_norm(
+            updated.float(),
+            (x.shape[-1],),
+            weight.float(),
+            None if bias is None else bias.float(),
+            eps,
+        ).to(x.dtype)
+        return normalized.contiguous(), updated
+
+    return layernorm_gated_residual
 
 
 def _triton_channel_l2_norm(facts, params):
@@ -345,7 +409,9 @@ def register(catalog: Catalog) -> None:
     for spec in (
         RMSNORM,
         RMSNORM_ADD,
+        RMSNORM_CAST_AFFINE,
         LAYERNORM,
+        LAYERNORM_GATED_RESIDUAL,
         CHANNEL_L2_NORM,
         ADARMSNORM,
         RMSNORM_SILU_MUL,
@@ -354,6 +420,57 @@ def register(catalog: Catalog) -> None:
 
     catalog.register_many(
         (
+            Impl(
+                kernel_id="phyai_kernel.layernorm_gated_residual",
+                op="layernorm_gated_residual",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    TRITON_NORM,
+                    shape.hidden <= 8192,
+                    dtype.branch == dtype.input,
+                    dtype.gate == dtype.input,
+                    dtype.weight.in_(TRITON_FLOATS),
+                    implies(attrs.bias, dtype.bias.in_(TRITON_FLOATS)),
+                ),
+                prepare=_triton_layernorm_gated_residual,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.layernorm_gated_residual",
+                op="layernorm_gated_residual",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    dtype.input.in_(TRITON_FLOATS),
+                    dtype.branch == dtype.input,
+                    dtype.gate == dtype.input,
+                    dtype.weight.in_(TRITON_FLOATS),
+                    implies(attrs.bias, dtype.bias.in_(TRITON_FLOATS)),
+                ),
+                prepare=_torch_layernorm_gated_residual,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
+            Impl(
+                kernel_id="phyai_kernel.rmsnorm_cast_affine",
+                op="rmsnorm_cast_affine",
+                priority=Priority.OPTIMIZED,
+                when=all_of(TRITON_NORM, RMSNORM_LAYOUT, dtype.input == dtype.weight),
+                prepare=_triton_rmsnorm_cast_affine,
+                params={"weight": matches_activation()},
+            ),
+            Impl(
+                kernel_id="torch.rmsnorm_cast_affine",
+                op="rmsnorm_cast_affine",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    dtype.input.in_(TRITON_FLOATS),
+                    RMSNORM_LAYOUT,
+                    dtype.input == dtype.weight,
+                ),
+                prepare=_torch_rmsnorm_cast_affine,
+                params={"weight": matches_activation()},
+            ),
             # RMSNorm.
             Impl(
                 kernel_id="flashinfer.rmsnorm",

@@ -177,11 +177,7 @@ def _register_humming(catalog: Catalog) -> None:
         ("w4a16", quant.format == "int4", a16),
         ("w8a16", quant.format == "int8", a16),
         ("fp8_a16", quant.format.in_({"fp8_e4m3", "fp8_e5m2"}), a16),
-        (
-            "mxfp4_a16",
-            quant.format == "mxfp4",
-            all_of(a16, dtype.output == "bf16"),
-        ),
+        ("mxfp4_a16", quant.format == "mxfp4", a16),
         ("nvfp4_a16", quant.format == "nvfp4", a16),
         (
             "fp8_a8",
