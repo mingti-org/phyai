@@ -42,6 +42,7 @@ class ResizeWithPadStep(ProcessorStep):
     num_images: int
     num_channels: int
     pad_value: float = 0.0
+    backend: str = "torch"
 
     def __call__(self, transition: Transition) -> Transition:
         images = transition[IMAGES]
@@ -78,7 +79,11 @@ class ResizeWithPadStep(ProcessorStep):
                 )
             processed.append(
                 resize_with_pad(
-                    cam, self.target_size, self.target_size, pad_value=self.pad_value
+                    cam,
+                    self.target_size,
+                    self.target_size,
+                    pad_value=self.pad_value,
+                    backend=self.backend,
                 )
             )
 
@@ -93,15 +98,16 @@ class ResizeWithPadStep(ProcessorStep):
             "num_images": self.num_images,
             "num_channels": self.num_channels,
             "pad_value": self.pad_value,
+            **({"backend": self.backend} if self.backend != "torch" else {}),
         }
 
 
 @ProcessorStepRegistry.register("normalize_image_step")
 @dataclass
 class NormalizeImageStep(ProcessorStep):
-    """Map ``PIXEL_VALUES`` from ``[0, 1]`` to ``[-1, 1]`` (SigLIP range).
+    """Map float ``[0, 1]`` or uint8 ``[0, 255]`` pixels to SigLIP ``[-1, 1]``.
 
-    Optional: include this step only when the caller feeds ``[0, 1]`` pixels.
+    Optional: include this step for raw uint8 or float ``[0, 1]`` pixels.
     Operates in place on the canonical ``PIXEL_VALUES`` produced by
     :class:`ResizeWithPadStep`.
     """
