@@ -32,8 +32,8 @@ implementation eligible instead of testing a backend name.
 Reductions and the affine multiply run in fp32 on every backend; output
 is cast back to ``x.dtype``. RMSNorm's ``forward`` accepts an optional
 ``residual`` for the fused ``residual += x; rmsnorm(residual)`` path used
-between attention and the MLP in most decoder blocks. LayerNorm has no
-fused-add path today (encoder paths don't need one). AdaRMSNorm's
+between attention and the MLP in most decoder blocks. LayerNorm exposes a
+separately selectable ``forward_gated_residual`` path. AdaRMSNorm's
 ``forward(x, cond)`` returns a ``(out, gate)`` tuple.
 """
 
@@ -92,6 +92,11 @@ class RMSNorm(nn.Module):
         gamma. This matches checkpoints whose reference uses a separate
         low-precision affine multiply; weight and activation dtypes must match.
         Has no effect when ``elementwise_affine=False``.
+    fuse_cast_before_affine:
+        Use the separately selectable ``rmsnorm_cast_affine`` operation to
+        combine the normalization, activation cast, and gamma multiplication.
+        Requires ``cast_before_affine=True`` and no residual. Kernel policy
+        selects this operation independently of the ordinary RMSNorm backend.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -120,6 +125,7 @@ class RMSNorm(nn.Module):
         prefix: str = "",
         kernel_role: str = "norm",
         cast_before_affine: bool = False,
+        fuse_cast_before_affine: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -129,6 +135,9 @@ class RMSNorm(nn.Module):
         self.kernel_role = kernel_role
         self.elementwise_affine = elementwise_affine
         self.cast_before_affine = cast_before_affine and elementwise_affine
+        self.fuse_cast_before_affine = fuse_cast_before_affine
+        if fuse_cast_before_affine and not self.cast_before_affine:
+            raise ValueError("fuse_cast_before_affine requires cast_before_affine=True")
         if self.cast_before_affine and self.variant != "rms":
             raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
@@ -151,6 +160,9 @@ class RMSNorm(nn.Module):
             role=kernel_role,
             prefer=self._prefer_fused,
             dims={"hidden": hidden_size},
+        )
+        self._cast_affine_call = CallSite(
+            "rmsnorm_cast_affine", role=kernel_role, dims={"hidden": hidden_size}
         )
         weight = self._initial_weight(hidden_size, dtype, device)
         if elementwise_affine:
@@ -197,6 +209,27 @@ class RMSNorm(nn.Module):
         if self.cast_before_affine and self.weight.dtype != x.dtype:
             raise ValueError(
                 "cast_before_affine requires matching activation and weight dtypes"
+            )
+        if self.fuse_cast_before_affine:
+            if not self.cast_before_affine or residual is not None:
+                raise ValueError(
+                    "fuse_cast_before_affine requires cast_before_affine and no residual"
+                )
+            original_shape = x.shape
+            if x.ndim not in (2, 3) or x.stride(-1) != 1:
+                x = x.contiguous().reshape(-1, original_shape[-1])
+            handle = self._cast_affine_call.select(
+                device=x.device,
+                dtype={
+                    "input": x.dtype,
+                    "weight": self.weight.dtype,
+                    "output": x.dtype,
+                },
+                dims=token_shape(x),
+                attrs={"rank": x.ndim},
+            )
+            return handle.execute(x, self.weight.data, self.variance_epsilon).reshape(
+                original_shape
             )
         weight = self._unit_weight if self.cast_before_affine else self.weight
         dtypes: dict[str, object] = {
@@ -435,6 +468,9 @@ class LayerNorm(nn.Module):
         if device is None:
             device = get_engine_config().device.target
         self._prefer = backend_preference("layernorm", backend)
+        self._gated_residual_call = CallSite(
+            "layernorm_gated_residual", role=kernel_role, dims={"hidden": hidden_size}
+        )
         self._call = CallSite(
             "layernorm",
             role=kernel_role,
@@ -521,6 +557,48 @@ class LayerNorm(nn.Module):
             x = x.contiguous().reshape(-1, orig_shape[-1])
         out = handle.execute(x, self.weight.data, beta, self.variance_epsilon)
         return out.reshape(orig_shape) if needs_reshape else out
+
+    def forward_gated_residual(
+        self, x: torch.Tensor, branch: torch.Tensor, gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize ``x + branch * gate`` and also return its residual stream.
+
+        ``x`` and ``branch`` share shape ``(B, S, D)``. The 2-D gate broadcasts
+        to ``(B, D)``. Each residual operation rounds to the input dtype, then
+        normalization and affine operations run in fp32 before one output cast.
+        This method reuses the existing affine parameters and has its own
+        ``layernorm_gated_residual`` kernel policy. Inputs are never modified.
+        """
+        if x.ndim != 3 or x.shape[-1] != self.hidden_size or branch.shape != x.shape:
+            raise ValueError("expected matching (B, S, hidden_size) x and branch")
+        if (
+            gate.ndim != 2
+            or gate.shape[0] not in (1, x.shape[0])
+            or gate.shape[1] not in (1, self.hidden_size)
+        ):
+            raise ValueError("gate must broadcast to (B, D)")
+        if any(
+            value.device != x.device or value.dtype != x.dtype
+            for value in (branch, gate)
+        ):
+            raise ValueError("x, branch, and gate must share dtype and device")
+        beta = self.bias.data if self.has_bias else None
+        handle = self._gated_residual_call.select(
+            device=x.device,
+            dtype={
+                "input": x.dtype,
+                "branch": branch.dtype,
+                "gate": gate.dtype,
+                "weight": self.weight.dtype,
+                "bias": None if beta is None else beta.dtype,
+                "output": x.dtype,
+            },
+            dims=token_shape(x),
+            attrs={"bias": beta is not None},
+        )
+        return handle.execute(
+            x, branch, gate, self.weight.data, beta, self.variance_epsilon
+        )
 
     def extra_repr(self) -> str:
         return (

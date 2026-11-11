@@ -4,11 +4,12 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Triton RMSNorm kernels for the Qwen and Gemma model families.
 
-Five public entry points:
+Six public entry points:
 
 * :func:`rmsnorm`                   — Llama/Qwen-style standard RMSNorm.
 * :func:`rmsnorm_hf`                — HF semantics: cast back to ``x.dtype`` BEFORE the
   weight multiply (matches ``transformers.LlamaRMSNorm`` and Qwen3 q/k-norm).
+* :func:`rmsnorm_cast_affine`       — the same rounding with strided 2-D/3-D inputs.
 * :func:`fused_add_rmsnorm`         — in-place ``residual += x`` then rmsnorm into ``x``.
 * :func:`gemma_rmsnorm`             — Gemma/Gemma3 RMSNorm, weight is ``(1 + w)``.
 * :func:`gemma_fused_add_rmsnorm`   — Gemma fused add+norm, in-place.
@@ -50,12 +51,20 @@ def _rmsnorm_fwd_kernel(
     HF_SEMANTICS: tl.constexpr,
     GEMMA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    X_BATCH_STRIDE: tl.constexpr = 0,
+    ROWS_PER_BATCH: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < n_cols
 
-    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    if ROWS_PER_BATCH:
+        x_offset = (
+            row // ROWS_PER_BATCH * X_BATCH_STRIDE + row % ROWS_PER_BATCH * x_row_stride
+        )
+    else:
+        x_offset = row * x_row_stride
+    x = tl.load(x_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / n_cols
     rstd = tl.rsqrt(var + eps)
     x_hat = x * rstd
@@ -395,6 +404,64 @@ def rmsnorm_hf(
     out2d = out_t.reshape(-1, orig_shape[-1])
     _launch_rmsnorm(x2d, weight, out2d, eps, hf_semantics=True, gemma=False)
     return out_t
+
+
+def rmsnorm_cast_affine(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Normalize strided rows, round to the input dtype, then multiply gamma.
+
+    Accepts rank-two or rank-three inputs with a contiguous last dimension.
+    Outer strides may contain gaps, as in slices of a fused QKV projection.
+    The result is contiguous and neither input is modified. Weight must be
+    contiguous and have the same dtype and device as the input.
+    """
+    _check_inputs(x, weight)
+    if x.ndim not in (2, 3) or x.stride(-1) != 1 or x.shape[-1] == 0:
+        raise ValueError(
+            "rmsnorm_cast_affine requires 2-D/3-D rows with unit last stride"
+        )
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("rmsnorm_cast_affine requires fp16, bf16, or fp32 inputs")
+    if (
+        weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "rmsnorm_cast_affine weight must be contiguous and match input dtype/device"
+        )
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if x.numel() == 0:
+        return out
+    hidden = x.shape[-1]
+    if hidden > _SINGLE_BLOCK_MAX:
+        # Retain the existing two-pass reduction for unusually wide rows.
+        return rmsnorm_hf(x.contiguous(), weight, eps, out=out)
+    rows_per_batch = 0
+    batch_stride = 0
+    if x.ndim == 3 and x.shape[0] > 1 and x.stride(0) != x.shape[1] * x.stride(1):
+        rows_per_batch, batch_stride = x.shape[1], x.stride(0)
+    block_size = triton.next_power_of_2(hidden)
+    num_warps = 4 if block_size <= 1024 else (8 if block_size <= 4096 else 16)
+    _rmsnorm_fwd_kernel[(x.numel() // hidden,)](
+        x,
+        weight,
+        out,
+        x.stride(-2),
+        hidden,
+        hidden,
+        eps,
+        HF_SEMANTICS=True,
+        GEMMA=False,
+        BLOCK_SIZE=block_size,
+        X_BATCH_STRIDE=batch_stride,
+        ROWS_PER_BATCH=rows_per_batch,
+        num_warps=num_warps,
+    )
+    return out
 
 
 def fused_add_rmsnorm(

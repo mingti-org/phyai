@@ -255,17 +255,19 @@ def test_ptq_rejects_invalid_local_weight_configuration(shape, dtype):
         )
 
 
-def test_mxfp4_rejects_fp16_compute_for_pinned_humming_release():
-    with pytest.raises(ValueError, match="MXFP4.*BF16"):
-        HummingSpec(_scheme(QDType.MXFP4)).allocate(
-            nn.Module(),
-            AllocationRequest(
-                weight_shape=(128, 128),
-                logical_widths=[128],
-                params_dtype=torch.float16,
-                device="cpu",
-            ),
-        )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mxfp4_accepts_half_precision_compute(dtype):
+    layer = nn.Module()
+    HummingSpec(_scheme(QDType.MXFP4)).allocate(
+        layer,
+        AllocationRequest(
+            weight_shape=(128, 128),
+            logical_widths=[128],
+            params_dtype=dtype,
+            device="cpu",
+        ),
+    )
+    assert layer._humming_params_dtype is dtype
 
 
 def _eligible(scheme, *, arch="sm90", available=True, n=128, k=128, dtype="bf16"):
@@ -318,7 +320,7 @@ def test_humming_eligibility_checks_compute_architecture_and_alignment():
     assert _eligible(_scheme(), k=112) == set()
     assert _eligible(_scheme(QDType.INT4, QDType.FP8_E4M3), arch="sm80") == set()
     assert _eligible(_scheme(QDType.FP8_E5M2, QDType.FP8_E5M2), dtype="fp16") == set()
-    assert _eligible(_scheme(QDType.MXFP4), dtype="fp16") == set()
+    assert _eligible(_scheme(QDType.MXFP4), dtype="fp16") == {"humming.gemm.mxfp4_a16"}
 
 
 def test_missing_humming_dependency_fails_without_replacing_staged_weights(
@@ -395,8 +397,6 @@ NUMERICAL_CASES += [
 
 def _require_humming(scheme, dtype):
     pytest.importorskip("humming")
-    if scheme.weight.dtype is QDType.MXFP4 and dtype is torch.float16:
-        pytest.skip("humming-kernels 0.1.16 supports MXFP4 with BF16 compute only")
     major, minor = torch.cuda.get_device_capability()
     sm = major * 10 + minor
     minimum = 80 if dtype == torch.bfloat16 else 75
@@ -593,6 +593,42 @@ def test_cuda_row_parallel_adds_bias_on_rank_zero_only(fake_mesh, rank):
     assert returned_bias is layer.bias
     expected = unbiased + layer.bias if rank == 0 else unbiased
     torch.testing.assert_close(y, expected, atol=0, rtol=0)
+
+
+def test_cuda_mxfp4_fp16_preserves_small_weight_scales(fake_mesh, monkeypatch):
+    _require_humming(_scheme(QDType.MXFP4), torch.float16)
+    from humming.schema.humming import HummingWeightSchema
+
+    fake_mesh()
+    torch.manual_seed(24)
+    reference_weights = []
+    original_quant = HummingWeightSchema.quant_tensor
+
+    def quant_tensor(cls, tensor, schema, param_dtype, **kwargs):
+        tensors = original_quant(tensor, schema, param_dtype, **kwargs)
+        reference_weights.append(schema.dequant_tensors(tensors).float())
+        return tensors
+
+    monkeypatch.setattr(HummingWeightSchema, "quant_tensor", classmethod(quant_tensor))
+    layer = L.ReplicatedLinear(
+        128,
+        128,
+        scheme=_scheme(QDType.MXFP4),
+        params_dtype=torch.float16,
+        device="cuda",
+        prefix="projection",
+        bias=False,
+    )
+    session = WeightLoadSession(layer)
+    session.load(
+        {"projection.weight": torch.randn(128, 128, dtype=torch.float16) * 1e-5}
+    )
+    session.finish()
+    x = torch.randn(6, 128, device="cuda", dtype=torch.float16)
+    actual, _ = layer(x)
+    expected = F.linear(x.float(), reference_weights[0])
+    assert torch.isfinite(actual).all()
+    assert (actual.float() - expected).norm() / expected.norm() < 0.03
 
 
 def test_cuda_humming_graph_replays_with_new_inputs(fake_mesh):

@@ -206,13 +206,6 @@ class HummingSpec:
         if request.params_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("Humming requires FP16 or BF16 layer precision")
         if (
-            self.scheme.weight.dtype is QDType.MXFP4
-            and request.params_dtype is not torch.bfloat16
-        ):
-            raise ValueError(
-                "Humming MXFP4 requires BF16 layer precision with humming-kernels 0.1.16"
-            )
-        if (
             self.scheme.input is not None
             and self.scheme.input.dtype is QDType.FP8_E5M2
             and request.params_dtype is not torch.bfloat16
@@ -327,6 +320,7 @@ class HummingSpec:
         try:
             from humming.schema import HummingInputSchema, HummingWeightSchema
             from humming.transform import (
+                prepare_fp16_e8m0_scale,
                 prepare_layer_config,
                 transform_humming_tensors,
             )
@@ -422,6 +416,7 @@ class HummingSpec:
                 }
             else:
                 tensors = HummingWeightSchema.quant_tensor(source, weight_schema, dtype)
+            config, tensors = prepare_fp16_e8m0_scale(config, tensors)
             return config, transform_humming_tensors(config, tensors)
 
 
