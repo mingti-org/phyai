@@ -36,6 +36,7 @@ class Cosmos3PolicyScheduler(Scheduler):
         flow_shift: float = 10.0,
         use_karras_sigmas: bool = True,
         use_cuda_graph: bool = False,
+        conditioning_prefix: bool = False,
     ) -> None:
         self.transformer = transformer
         self.vae = vae
@@ -53,8 +54,12 @@ class Cosmos3PolicyScheduler(Scheduler):
                 "Cosmos3 CFG parallelism supports cfg_size=1 or 2, got "
                 f"{self.cfg_size}."
             )
+        fast_paths = self.tp_size == self.cfg_size == 1 and not use_cuda_graph
+        self.conditioning_prefix = bool(conditioning_prefix and fast_paths)
         self.runner = Cosmos3ActionRunner(
-            transformer, device=self.device, use_cuda_graph=use_cuda_graph
+            transformer,
+            device=self.device,
+            use_cuda_graph=use_cuda_graph,
         )
         self.vae_runner = (
             Cosmos3VAERunner(vae, device=self.device, dtype=self.dtype)
@@ -108,7 +113,18 @@ class Cosmos3PolicyScheduler(Scheduler):
                 )
             import dataclasses
 
-            encoded = self.vae_runner.encode(request.cond_video_pixels)
+            if (
+                self.conditioning_prefix
+                and request.mode == "policy"
+                and self.tp_size == self.cfg_size == 1
+            ):
+                encoded = self.vae_runner.encode_conditioning(
+                    request.cond_video_pixels,
+                    latent_frames=request.video_shape[0],
+                    frame_indexes=request.cond_frame_indexes,
+                )
+            else:
+                encoded = self.vae_runner.encode(request.cond_video_pixels)
             request = dataclasses.replace(request, cond_video_latents=encoded)
 
         dev, dt = self.device, self.dtype
