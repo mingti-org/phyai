@@ -1,6 +1,7 @@
 """Text conditioning, visual encoding, and ten-step HumanWAM-Goal sampling."""
 
 import math
+from collections import OrderedDict
 from dataclasses import fields, replace
 
 import numpy as np
@@ -67,6 +68,24 @@ class HumanWAMGoalScheduler(Scheduler):
             )
         )
         self.schedule = None
+        self.noise_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+
+    def initial_noise(self, shape: tuple[int, ...], seed: int) -> torch.Tensor:
+        """Retain bounded CPU draws; each modality still converts to its own dtype."""
+        key = (seed, shape)
+        cacheable = type(seed) is int
+        noise = self.noise_cache.get(key) if cacheable else None
+        if noise is None:
+            noise = torch.from_numpy(
+                np.random.RandomState(seed).standard_normal(shape).astype(np.float32)
+            )
+            if cacheable:
+                self.noise_cache[key] = noise
+                if len(self.noise_cache) > 8:
+                    self.noise_cache.popitem(last=False)
+        if cacheable:
+            self.noise_cache.move_to_end(key)
+        return noise
 
     def setup(self) -> None:
         self.vlm.setup()
@@ -114,7 +133,7 @@ class HumanWAMGoalScheduler(Scheduler):
             raise ValueError(
                 "Frame rates and horizon must form complete temporal VAE groups"
             )
-        latents = tuple(self.vae.encode(frame) for frame in request.pixels)
+        latents = self.vae.encode_frames(request.pixels, self.dit.collective)
         current = latents[-1]
         rollout = torch.cat(
             (
@@ -184,14 +203,12 @@ class HumanWAMGoalScheduler(Scheduler):
             for value, mask in zip(vision, request.video_noisy_masks, strict=True)
         ) + (request.action_noisy_mask.to(self.device).unsqueeze(-1) & valid,)
         noisy = torch.cat([mask.reshape(1, -1) for mask in masks], dim=1)
-        # Each modality restarts the CPU RNG; clean rows still consume noise.
+        # Each modality uses the same seed; clean rows still consume noise.
         initial_parts = []
         for value, mask in zip(clean, masks, strict=True):
-            noise = torch.from_numpy(
-                np.random.RandomState(request.seed)
-                .standard_normal(tuple(value.shape[1:]))
-                .astype(np.float32)
-            ).to(device=self.device, dtype=value.dtype)
+            noise = self.initial_noise(tuple(value.shape[1:]), request.seed).to(
+                device=self.device, dtype=value.dtype
+            )
             mask = mask.to(value.dtype)
             # Action noise is rounded to the model dtype before joining the
             # FP32 visual state; the solver then accumulates both in FP32.
@@ -274,3 +291,4 @@ class HumanWAMGoalScheduler(Scheduler):
         if self.vae is not None:
             self.vae.close()
         self.schedule = None
+        self.noise_cache.clear()
