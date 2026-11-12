@@ -18,6 +18,7 @@ class Cosmos3ActionRunner(Cosmos3T2VRunner):
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
         use_fused_rope: bool = True,
+        fuse_eager_attention: bool = False,
         torch_compile: bool = False,
         compile_kwargs: dict | None = None,
     ) -> None:
@@ -26,6 +27,7 @@ class Cosmos3ActionRunner(Cosmos3T2VRunner):
             device=device,
             use_cuda_graph=use_cuda_graph,
             use_fused_rope=use_fused_rope,
+            fuse_eager_attention=fuse_eager_attention,
             torch_compile=torch_compile,
             compile_kwargs=compile_kwargs,
         )
