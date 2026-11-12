@@ -64,6 +64,9 @@ jobs:
           ref: ${{ inputs.source-ref }}
           fetch-depth: 0
 
+      - name: Fetch pinned CUTLASS headers
+        run: git submodule update --init --depth 1 third_party/cutlass
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
