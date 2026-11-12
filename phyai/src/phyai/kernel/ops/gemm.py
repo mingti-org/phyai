@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from phyai.kernel.facts import lib, dtype, quant, shape, device
+from phyai.kernel.facts import lib, dtype, quant, shape, device, model
 from phyai.kernel.opspec import Impl, OpSpec, Priority
 from phyai.kernel.registry import Catalog
 from phyai.kernel.predicate import all_of, any_of
@@ -222,8 +222,46 @@ def _register_humming(catalog: Catalog) -> None:
         )
 
 
+def _thor_dense(facts, params):
+    from phyai.kernel.impls.thor_gemm import ThorDenseGEMM
+
+    if params:
+        raise ValueError("Thor BF16 GEMM currently accepts no policy parameters")
+    return ThorDenseGEMM()
+
+
 def register(catalog: Catalog) -> None:
     catalog.register_op(GEMM)
+    catalog.register(
+        Impl(
+            kernel_id="thor.gemm.bf16",
+            capture_safe=False,
+            op="gemm",
+            priority=Priority.SPECIALIZED,
+            when=all_of(
+                model.family == "cosmos3_policy",
+                model.tags.has("thor_gemm"),
+                lib.has("phyai_kernel"),
+                device.vendor == "nvidia",
+                device.arch == "sm110",
+                quant.format == "bf16",
+                dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output == "bf16",
+                shape.M.in_({1472, 3542}),
+                any_of(
+                    all_of(shape.N == 6144, shape.K == 4096),
+                    all_of(shape.N == 4096, shape.K.in_({4096, 12288})),
+                    all_of(shape.N == 24576, shape.K == 4096),
+                ),
+            ),
+            prepare=_thor_dense,
+            metadata={
+                "package": "phyai_kernel",
+                "note": "explicit policy only; runtime layout fallback",
+            },
+        )
+    )
 
     rows = (
         # FlashInfer.

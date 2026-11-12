@@ -185,7 +185,7 @@ def test_libraries_and_id_patterns_are_derived_from_the_rows(catalog):
         "flash_qla",
         "humming",
     }
-    assert catalog.libraries("gemm") == {"flashinfer", "humming"}
+    assert catalog.libraries("gemm") == {"flashinfer", "humming", "phyai_kernel"}
     assert catalog.libraries("attention_gdn") == {"flashinfer", "fla", "flash_qla"}
     assert set(catalog.match_ids("flashinfer.gemm.*")) == {
         "flashinfer.gemm.bf16",

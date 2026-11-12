@@ -1,0 +1,166 @@
+{
+  "3542": {
+    "cross_attention_qkv_proj": {
+      "shape": [
+        3542,
+        6144,
+        4096
+      ],
+      "b_row": false,
+      "method": "lt",
+      "attrs": [
+        66,
+        509,
+        1,
+        0,
+        1,
+        1,
+        35,
+        0,
+        5
+      ]
+    },
+    "cross_attention_to_out": {
+      "shape": [
+        3542,
+        4096,
+        4096
+      ],
+      "b_row": true,
+      "method": "torch_mm",
+      "attrs": [
+        66,
+        433,
+        1,
+        0,
+        0,
+        1,
+        35,
+        0,
+        3
+      ]
+    },
+    "mlp_down_proj": {
+      "shape": [
+        3542,
+        4096,
+        12288
+      ],
+      "b_row": true,
+      "method": "torch_mm",
+      "attrs": [
+        66,
+        20,
+        1,
+        0,
+        1,
+        1,
+        35,
+        0,
+        6
+      ]
+    },
+    "mlp_gate_up_proj": {
+      "shape": [
+        3542,
+        24576,
+        4096
+      ],
+      "b_row": false,
+      "method": "lt",
+      "attrs": [
+        66,
+        513,
+        1,
+        0,
+        1,
+        3,
+        35,
+        0,
+        6
+      ]
+    }
+  },
+  "1472": {
+    "cross_attention_qkv_proj": {
+      "shape": [
+        1472,
+        6144,
+        4096
+      ],
+      "b_row": false,
+      "method": "lt",
+      "attrs": [
+        66,
+        210,
+        1,
+        0,
+        0,
+        1,
+        35,
+        0,
+        3
+      ]
+    },
+    "cross_attention_to_out": {
+      "shape": [
+        1472,
+        4096,
+        4096
+      ],
+      "b_row": false,
+      "method": "lt",
+      "attrs": [
+        66,
+        433,
+        1,
+        0,
+        0,
+        1,
+        35,
+        0,
+        3
+      ]
+    },
+    "mlp_gate_up_proj": {
+      "shape": [
+        1472,
+        24576,
+        4096
+      ],
+      "b_row": false,
+      "method": "lt",
+      "attrs": [
+        66,
+        513,
+        1,
+        0,
+        1,
+        3,
+        35,
+        0,
+        6
+      ]
+    },
+    "mlp_down_proj": {
+      "shape": [
+        1472,
+        4096,
+        12288
+      ],
+      "b_row": true,
+      "method": "lt",
+      "attrs": [
+        66,
+        447,
+        1,
+        0,
+        0,
+        1,
+        35,
+        0,
+        3
+      ]
+    }
+  }
+}
