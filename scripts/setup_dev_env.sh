@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 
 # Workspace Python deps: creates the repo-root .venv and installs all five
 # workspace members editable (phyai, phyai-kernel, phyai-ext, ...).
+git submodule update --init third_party/cutlass
 uv sync
 
 # DIR for Agent: .memory/ (agent work logs) and .profile/ (profiling output).

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from dataclasses import replace
 
 from phyai.kernel.types import KernelMode
 from phyai.kernel.bootstrap import get_kernel_selector
@@ -20,6 +21,14 @@ class Cosmos3AttentionContexts:
         self.revision = 0
 
     def reset(self) -> None:
+        seen = set()
+        for context in self.contexts:
+            backend = context.backend
+            if id(backend) not in seen and getattr(
+                backend, "share_across_layers", False
+            ):
+                backend.release()
+                seen.add(id(backend))
         self.contexts = ()
         self.signature = None
         self.revision += 1
@@ -50,7 +59,9 @@ class Cosmos3AttentionContexts:
         )
         if self.signature == signature:
             return self.contexts
+        self.reset()
         contexts = []
+        shared_backends = {}
         for layer in layers:
             if not isinstance(layer, Cosmos3GenDecoderLayer):
                 raise TypeError("Cosmos3 attention metadata requires Generator layers")
@@ -71,11 +82,14 @@ class Cosmos3AttentionContexts:
                 dtype=dtype,
                 device=device,
             )
-            contexts.append(
-                attention.attn._build_default_ctx(
-                    query, key, key, AttnLayout.PADDED_4D, None, None, mode=mode
-                )
+            context = attention.attn._build_default_ctx(
+                query, key, key, AttnLayout.PADDED_4D, None, None, mode=mode
             )
+            if getattr(context.backend, "share_across_layers", False):
+                key = (type(context.backend), context.backend.sharing_key)
+                backend = shared_backends.setdefault(key, context.backend)
+                context = replace(context, backend=backend)
+            contexts.append(context)
         self.contexts = tuple(contexts)
         self.signature = signature
         self.revision += 1

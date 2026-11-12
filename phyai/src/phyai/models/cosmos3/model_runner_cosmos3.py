@@ -41,6 +41,8 @@ class Cosmos3T2VRunner(ModelRunner):
         device: torch.device | str | None = None,
         use_cuda_graph: bool = False,
         use_fused_rope: bool = True,
+        fuse_eager_attention: bool = False,
+        rounded_residual_norm: bool = False,
         torch_compile: bool = False,
         compile_kwargs: dict | None = None,
     ) -> None:
@@ -57,7 +59,13 @@ class Cosmos3T2VRunner(ModelRunner):
             OrderedDict()
         )
         self.use_cuda_graph = bool(use_cuda_graph)
-        self._attention_fusion = Cosmos3AttentionFusion(enabled=use_fused_rope)
+        self._attention_fusion = Cosmos3AttentionFusion(
+            enabled=use_fused_rope,
+            eager_enabled=fuse_eager_attention and not self.use_cuda_graph,
+        )
+        self.rounded_residual_norm = bool(
+            rounded_residual_norm and not self.use_cuda_graph
+        )
         self._graphs: OrderedDict[str, Cosmos3CudaGraphRunner] = OrderedDict()
         self._attention_contexts: OrderedDict[str, Cosmos3AttentionContexts] = (
             OrderedDict()
@@ -119,6 +127,10 @@ class Cosmos3T2VRunner(ModelRunner):
             contexts.reset()
         self._attention_contexts.clear()
         self._attention_fusion.reset()
+        # The helper is cheap when no opt-in route has ever packed a weight.
+        from phyai.kernel.impls.thor_gemm import invalidate_thor_gemm
+
+        invalidate_thor_gemm(self.transformer)
 
     def condition(
         self,
@@ -264,6 +276,14 @@ class Cosmos3T2VRunner(ModelRunner):
             and hidden_states.shape[0] == 1
         )
         attention_key = None
+        if self.rounded_residual_norm and not self.use_cuda_graph:
+            from phyai.models.cosmos3.model_runner_norm_cosmos3 import (
+                Cosmos3ResidualNorm,
+            )
+
+            if not hasattr(self, "_residual_norm"):
+                self._residual_norm = Cosmos3ResidualNorm()
+            cond = replace(cond, residual_norm=self._residual_norm)
         attention_preparation = self._attention_fusion.prepare(
             device=hidden_states.device, use_cuda_graph=use_cuda_graph
         )
