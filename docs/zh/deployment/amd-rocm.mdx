@@ -70,4 +70,4 @@ config = EngineConfig(
 - PI0.5 的 CUDA Graph setup 会失败。paged attention 选中 `sdpa.attention_paged`，它的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移（`ValueError: SDPA paged replay cannot change sequence offsets`）。任何没有 FlashInfer 的设备都会遇到。
 - 没有 AMD 专属的 kernel 行。Triton 行限定在 NVIDIA 上，所有 op 都使用 Torch reference 或 SDPA 实现。
 - FlashInfer、humming 量化（NVFP4）与 vGPU green context 不可用。
-- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败：这些用例断言由 FlashInfer 控制的行，或把 `device="cuda"` 当作 NVIDIA GPU。
+- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败，因为这些用例依赖 FlashInfer 的行；后续 PR 会解决。
