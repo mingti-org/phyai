@@ -120,6 +120,8 @@ uv pip install phyai phyai-ext \
   --prerelease=allow
 ```
 
+**AMD ROCm (experimental):** see the [AMD ROCm guide](https://phyai.mintlify.app/deployment/amd-rocm).
+
 ## Quantization
 
 PhyAI supports post-training quantization (PTQ) when loading an unquantized
