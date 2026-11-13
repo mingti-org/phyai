@@ -70,4 +70,4 @@ config = EngineConfig(
 - CUDA Graph setup fails for PI0.5. Paged attention selects `sdpa.attention_paged`, whose graph replay cannot change sequence offsets between PI0.5's prefix buckets (`ValueError: SDPA paged replay cannot change sequence offsets`). Any device without FlashInfer hits this.
 - No AMD-specific kernel rows. The Triton rows are gated to NVIDIA, so every op uses its Torch reference or SDPA implementation.
 - FlashInfer, humming quantization (NVFP4), and vGPU green contexts are unavailable.
-- `pytest phyai/tests/kernel` has 27 failures on ROCm. These tests assert rows gated on FlashInfer, or treat `device="cuda"` as an NVIDIA GPU.
+- `pytest phyai/tests/kernel` has 27 failures on ROCm because those tests depend on FlashInfer rows. A follow-up PR will fix them.
