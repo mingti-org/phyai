@@ -17,10 +17,16 @@ from pathlib import Path
 import pytest
 
 from phyai.kernel.facts import facts_from_query
+from phyai.kernel.library import library_available
 from phyai.kernel.policy import Policy, load_policy
 from phyai.kernel.registry import Catalog, build_catalog
 from phyai.kernel.selector import Selector
 from phyai.kernel.types import KernelQuery
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 
 EXAMPLE_POLICY = (
@@ -193,6 +199,7 @@ def test_the_example_does_not_capture_unrelated_calls(
     assert policy.decide(plain_rmsnorm, catalog).matched_rules == ()
 
 
+@requires_flashinfer
 def test_the_example_policy_drives_a_real_selection(
     policy: Policy, catalog: Catalog
 ) -> None:

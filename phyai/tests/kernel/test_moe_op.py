@@ -6,10 +6,16 @@ import pytest
 from phyai.kernel.ops import moe as moe_ops
 from phyai.kernel.types import Arch, KernelQuery
 from phyai.kernel.ops.moe import MOE, CUTLASS_MOE_ARCHES
+from phyai.kernel.library import library_available
 from phyai.kernel.registry import Catalog, build_catalog
 from phyai.kernel.selector import Selector, NoKernelError
 
 KERNEL_ID = "flashinfer.moe.cutlass_fused_moe"
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 #: Facts that satisfy the declared capability exactly.
 SUPPORTED = {
@@ -72,6 +78,7 @@ def test_moe_is_not_reported_as_a_coverage_gap(catalog):
 # --------------------------------------------------------------------------- #
 
 
+@requires_flashinfer
 def test_selector_chooses_the_flashinfer_impl(catalog):
     assert thor_selector(catalog).select(moe_query()).kernel_id == KERNEL_ID
 
@@ -94,6 +101,7 @@ def test_declared_architectures_convert_to_the_kernel_dispatch_keys():
     assert keys == {"89", "90", "100", "103", "107", "110", "120", "121"}
 
 
+@requires_flashinfer
 @pytest.mark.parametrize("arch", sorted(CUTLASS_MOE_ARCHES))
 def test_every_declared_architecture_is_selectable(catalog, arch):
     selector = Selector(catalog, device=f"nvidia:{arch}")

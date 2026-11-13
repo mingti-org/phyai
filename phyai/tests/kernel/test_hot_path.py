@@ -29,9 +29,15 @@ from phyai.kernel.call import (
 from phyai.kernel.facts import dtype
 from phyai.kernel.opspec import Impl, OpSpec
 from phyai.kernel.policy import Policy, policy_from_mapping
+from phyai.kernel.library import library_available
 from phyai.kernel.registry import Catalog, build_catalog
 from phyai.kernel.selector import Selector
 from phyai.kernel.types import KernelQuery, ModelContext
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 
 def elapsed_us(fn, n: int = 2000) -> float:
@@ -164,13 +170,14 @@ def test_memo_key_covers_the_facts_the_policy_reads(selector):
     assert "model.family" in CallSite("gemm").key_paths()
 
 
+@requires_flashinfer
 def test_dtype_device_and_mode_changes_are_not_served_from_the_memo():
     site = CallSite("rmsnorm", role="norm", dims={"hidden": 4096})
-    bf16 = site.select(device="cuda", dtype=BF16)
+    bf16 = site.select(device="nvidia:SM90", dtype=BF16)
     assert (
         bf16.kernel_id
         != site.select(
-            device="cuda", dtype={"input": "fp32", "weight": "fp32"}
+            device="nvidia:SM90", dtype={"input": "fp32", "weight": "fp32"}
         ).kernel_id
     )
     assert bf16.kernel_id != site.select(device="cpu", dtype=BF16).kernel_id
@@ -192,6 +199,7 @@ def test_dtype_device_and_mode_changes_are_not_served_from_the_memo():
     assert eager.kernel_id != captured.kernel_id
 
 
+@requires_flashinfer
 def test_the_memo_is_rebuilt_when_the_policy_or_model_context_changes(selector):
     """Otherwise a policy swap, or a model-scoped rule, would be served stale
     answers forever."""

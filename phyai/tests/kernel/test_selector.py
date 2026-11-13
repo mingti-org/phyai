@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from phyai.kernel.facts import device as device_ns, dtype as dtype_ns, lib
+from phyai.kernel.library import library_available
 from phyai.kernel.opspec import (
     Impl,
     OpSpec,
@@ -417,6 +418,10 @@ def test_autotune_degrades_to_priority_order_when_it_cannot_measure(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 def test_param_dtypes_follow_the_real_catalog_contracts():
     """layernorm gamma is fp32 (FlashInfer's contract), rmsnorm gamma follows
     the activation (FlashInfer reads it through the input type), and a CPU

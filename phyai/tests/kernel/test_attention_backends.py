@@ -12,11 +12,17 @@ from pathlib import Path
 
 import pytest
 
+from phyai.kernel.library import library_available
 from phyai.kernel.ops.attention import FA3_HEAD_DIMS
 from phyai.kernel.policy import Policy, PolicyError, load_policy, policy_from_mapping
 from phyai.kernel.registry import build_catalog
 from phyai.kernel.selector import Selector
 from phyai.kernel.types import KernelQuery, ModelContext
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 
 def _query(op: str, *, head_dim: int = 256, role: str = "", **attrs):
@@ -87,6 +93,7 @@ def test_prefill_rows_are_registered_per_wrapper_and_record_their_backend():
     )
 
 
+@requires_flashinfer
 @pytest.mark.parametrize("op", ("attention", "attention_paged"))
 def test_auto_outranks_every_pinned_row_which_outranks_sdpa_and_is_the_default(op):
     """No rule, no autotune: the same row as before these variants existed."""
@@ -105,6 +112,7 @@ def test_auto_outranks_every_pinned_row_which_outranks_sdpa_and_is_the_default(o
 # --------------------------------------------------------------------------- #
 
 
+@requires_flashinfer
 @pytest.mark.parametrize("op", ("attention", "attention_paged"))
 def test_fa3_is_eligible_on_hopper_only(op):
     """SM120 is the case a ``sm >= 90`` floor gets wrong; the GDN row carried
@@ -135,6 +143,7 @@ def test_fa3_needs_a_supported_head_dim(op):
         assert eligible == {"sdpa.attention_paged"}
 
 
+@requires_flashinfer
 def test_blackwell_rows_need_blackwell_and_fa2_is_the_universal_fallback():
     for arch, expected in (("SM90", False), ("SM100", True)):
         assert (
@@ -178,6 +187,7 @@ def _pi05_policy() -> Policy:
     )
 
 
+@requires_flashinfer
 def test_a_role_and_model_scoped_rule_pins_only_what_was_measured():
     """pi0.5 measured FA2 against auto on the action expert's joint attention
     alone. A global field also pinned the LLM prefix and the vision tower,
@@ -201,6 +211,7 @@ def test_a_role_and_model_scoped_rule_pins_only_what_was_measured():
     )
 
 
+@requires_flashinfer
 def test_rule_params_reach_the_pinned_row_and_only_the_pinned_row():
     """A row pins its kernel by existing; ``params:`` still wins over it, a
     mis-spelled parameter raises instead of silently vanishing, and params
@@ -284,6 +295,7 @@ def test_pi05_example_policy_parses_and_is_scoped_to_its_measurement():
     assert rule.source_match["device.arch"] == "sm90"  # measured on sm90 only
 
 
+@requires_flashinfer
 def test_pi05_example_policy_pins_the_expert_on_sm90_and_nothing_else():
     policy = load_policy(PI05_EXAMPLE_POLICY, build_catalog())
     pi05 = _selector("nvidia:SM90", policy, model=ModelContext(family="pi05"))
@@ -312,6 +324,7 @@ def test_pi05_example_policy_pins_the_expert_on_sm90_and_nothing_else():
         )
 
 
+@requires_flashinfer
 def test_pi05_rlinf_policy_pins_all_paged_attention_to_fa2():
     """The RL rollout policy keeps prefix and expert kernels stable."""
     policy = load_policy(PI05_RLINF_BF16_POLICY, build_catalog())

@@ -6,9 +6,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from phyai.kernel.library import library_available
 from phyai.kernel.registry import build_catalog
 from phyai.kernel.selector import Selector
 from phyai.kernel.types import KernelQuery
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 
 @pytest.mark.parametrize(
@@ -62,13 +68,13 @@ def test_gelu_rows_preserve_exact_vs_tanh_semantics(
 @pytest.mark.parametrize(
     ("dtype", "kernel_id"),
     (
-        ("bf16", "phyai_kernel.activation.t5_gelu"),
-        ("fp16", "phyai_kernel.activation.t5_gelu"),
+        pytest.param("bf16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer),
+        pytest.param("fp16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer),
         ("fp32", "torch.activation.t5_gelu"),
     ),
 )
 def test_t5_gelu_selection(dtype, kernel_id):
-    selector = Selector(build_catalog(), device="cuda")
+    selector = Selector(build_catalog(), device="nvidia:SM90")
     selection = selector.select(
         KernelQuery.build(
             "activation",

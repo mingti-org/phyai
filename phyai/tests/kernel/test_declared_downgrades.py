@@ -17,9 +17,15 @@ from __future__ import annotations
 
 import pytest
 
+from phyai.kernel.library import library_available
 from phyai.kernel.registry import build_catalog
 from phyai.kernel.selector import Selector
 from phyai.kernel.types import KernelQuery
+
+requires_flashinfer = pytest.mark.skipif(
+    not library_available("flashinfer"),
+    reason="expects a row gated on lib.flashinfer; flashinfer is not importable",
+)
 
 
 @pytest.fixture
@@ -41,7 +47,10 @@ def norm_query(dtype: str) -> dict:
 
 @pytest.mark.parametrize(
     "dtype, expected",
-    [("bf16", "flashinfer.rmsnorm"), ("fp32", "phyai_kernel.rmsnorm")],
+    [
+        pytest.param("bf16", "flashinfer.rmsnorm", marks=requires_flashinfer),
+        ("fp32", "phyai_kernel.rmsnorm"),
+    ],
 )
 def test_an_fp32_norm_lands_on_triton_without_a_rewrite(
     selector, dtype, expected
@@ -58,7 +67,10 @@ def test_an_fp32_norm_lands_on_triton_without_a_rewrite(
 
 @pytest.mark.parametrize(
     "head_dim, expected",
-    [(128, "flashinfer.attention"), (72, "sdpa.attention")],
+    [
+        pytest.param(128, "flashinfer.attention", marks=requires_flashinfer),
+        (72, "sdpa.attention"),
+    ],
 )
 def test_siglip_head_dim_lands_on_sdpa_without_a_rewrite(
     selector, head_dim, expected
@@ -109,6 +121,7 @@ def test_paged_attention_has_an_sdpa_fallback(selector) -> None:
     assert vendors == {"flashinfer", "sdpa"}
 
 
+@requires_flashinfer
 def test_rope_falls_back_to_eager_on_its_own(selector) -> None:
     """Replaces ``rope_backend = "flashinfer" if attn_backend == ... else "eager"``.
 
