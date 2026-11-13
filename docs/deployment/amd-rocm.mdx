@@ -44,6 +44,8 @@ uv pip install --override rocm-overrides.txt \
 
 `phyai-ext` builds from source with the same CMake setup as on CUDA.
 
+Run Python from the activated environment, or with `uv run --no-sync`. Plain `uv run` and `uv sync` re-sync the workspace dependencies, which reinstalls the CUDA Torch build and the dropped packages.
+
 ## Check the install
 
 ```bash
@@ -54,16 +56,30 @@ phyai-kernel show-env
 
 ## Run PI0.5
 
-Use the existing PI0.5 entry points with CUDA Graph capture turned off. ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it:
+Build the engine with CUDA Graph capture turned off. ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it:
 
 ```python
+from phyai import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.main_pi05 import PI05Args
 
-config = EngineConfig(
-    device=DeviceConfig(target="cuda"),
-    runtime=RuntimeConfig(use_cuda_graph=False),
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 3,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda"),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
 )
 ```
+
+`examples/pi05/run_pi05.py` enables CUDA Graph unless `--dump-dir` is set, so running it unchanged hits the first limitation below.
 
 ## Limitations
 

@@ -44,6 +44,8 @@ uv pip install --override rocm-overrides.txt \
 
 `phyai-ext` 使用与 CUDA 相同的 CMake 配置从源码构建。
 
+用激活后环境里的 `python` 运行，或用 `uv run --no-sync`。普通的 `uv run` 与 `uv sync` 会重新同步 workspace 依赖，装回 CUDA 版 Torch 和上面排除的包。
+
 ## 检查安装
 
 ```bash
@@ -54,16 +56,30 @@ phyai-kernel show-env
 
 ## 运行 PI0.5
 
-使用现有的 PI0.5 入口，并关闭 CUDA Graph 捕获。ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它：
+构建引擎时关闭 CUDA Graph 捕获。ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它：
 
 ```python
+from phyai import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.main_pi05 import PI05Args
 
-config = EngineConfig(
-    device=DeviceConfig(target="cuda"),
-    runtime=RuntimeConfig(use_cuda_graph=False),
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 3,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda"),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
 )
 ```
+
+`examples/pi05/run_pi05.py` 在不传 `--dump-dir` 时会开启 CUDA Graph，原样运行会遇到下面第一条限制。
 
 ## 限制
 
