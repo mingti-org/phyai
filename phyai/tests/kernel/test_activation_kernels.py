@@ -68,8 +68,12 @@ def test_gelu_rows_preserve_exact_vs_tanh_semantics(
 @pytest.mark.parametrize(
     ("dtype", "kernel_id"),
     (
-        pytest.param("bf16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer),
-        pytest.param("fp16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer),
+        pytest.param(
+            "bf16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer
+        ),
+        pytest.param(
+            "fp16", "phyai_kernel.activation.t5_gelu", marks=requires_flashinfer
+        ),
         ("fp32", "torch.activation.t5_gelu"),
     ),
 )
