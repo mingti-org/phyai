@@ -1,0 +1,89 @@
+---
+title: "AMD ROCm (experimental)"
+description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5 in eager mode."
+---
+
+PhyAI installs and runs PI0.5 on AMD Instinct MI300X (gfx942) without source changes. Kernel selection falls back to the Torch reference and SDPA rows on AMD, so there are no AMD-tuned kernels yet. Run in eager mode: CUDA Graph capture does not work on this path (see [Limitations](#limitations)).
+
+Tested with ROCm 6.4, Python 3.12, and `torch==2.8.0+rocm6.4`. The workspace pins `torch==2.11.0` for CUDA; other ROCm and Torch versions are untested.
+
+## Install
+
+Start from a ROCm PyTorch container with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`), for example `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1`. From the repository root, write an override file. It pins the ROCm Torch wheels and drops the dependencies that only exist for CUDA:
+
+```bash
+cat > rocm-overrides.txt <<'EOF'
+torch==2.8.0+rocm6.4
+torchvision==0.23.0+rocm6.4
+flashinfer-python ; sys_platform == "never"
+humming-kernels ; sys_platform == "never"
+flash-qla ; sys_platform == "never"
+nvidia-ml-py ; sys_platform == "never"
+triton ; sys_platform == "never"
+torch-c-dlpack-ext ; sys_platform == "never"
+EOF
+```
+
+| Dropped package | Why |
+| --- | --- |
+| `flashinfer-python`, `humming-kernels`, `flash-qla` | CUDA-only. They are imported lazily, and the kernel selector skips their rows when they are missing. |
+| `nvidia-ml-py` | NVML is NVIDIA-only. |
+| `triton` | The PyPI wheel is the CUDA build. It installs into the same `triton/` directory as `pytorch-triton-rocm` and crashes on import. |
+| `torch-c-dlpack-ext` | It ships only CPU and CUDA addons and picks the CUDA one on ROCm, so `import phyai_ext` fails on the missing `libtorch_cuda.so`. Without it, `apache-tvm-ffi` builds a ROCm addon on first use. |
+
+Then install the workspace packages against the ROCm wheel index:
+
+```bash
+pip install uv
+uv venv --python 3.12
+uv pip install --override rocm-overrides.txt \
+  --extra-index-url https://download.pytorch.org/whl/rocm6.4 --index-strategy unsafe-best-match \
+  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+`phyai-ext` builds from source with the same CMake setup as on CUDA.
+
+Run Python from the activated environment, or with `uv run --no-sync`. Plain `uv run` and `uv sync` re-sync the workspace dependencies, which reinstalls the CUDA Torch build and the dropped packages.
+
+## Check the install
+
+```bash
+source .venv/bin/activate
+python -c "import torch, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+phyai-kernel show-env
+```
+
+## Run PI0.5
+
+Build the engine with CUDA Graph capture turned off. ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it:
+
+```python
+from phyai import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 3,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda"),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+```
+
+`examples/pi05/run_pi05.py` enables CUDA Graph unless `--dump-dir` is set, so running it unchanged hits the first limitation below.
+
+## Limitations
+
+- CUDA Graph setup fails for PI0.5. Paged attention selects `sdpa.attention_paged`, whose graph replay cannot change sequence offsets between PI0.5's prefix buckets (`ValueError: SDPA paged replay cannot change sequence offsets`). Any device without FlashInfer hits this.
+- No AMD-specific kernel rows. The Triton rows are gated to NVIDIA, so every op uses its Torch reference or SDPA implementation.
+- FlashInfer, humming quantization (NVFP4), and vGPU green contexts are unavailable.
+- `pytest phyai/tests/kernel` has 27 failures on ROCm because those tests depend on FlashInfer rows. A follow-up PR will fix them.

@@ -117,7 +117,8 @@
             "group": "Deployment",
             "pages": [
               "deployment/server-gateway",
-              "deployment/parallel-serving"
+              "deployment/parallel-serving",
+              "deployment/amd-rocm"
             ]
           },
           {
@@ -238,8 +239,9 @@
           {
             "group": "部署",
             "pages": [
-              "zh/deployment/server-gateway",
-              "zh/deployment/parallel-serving"
+                "zh/deployment/server-gateway",
+                "zh/deployment/parallel-serving",
+                "zh/deployment/amd-rocm"
             ]
           },
           {

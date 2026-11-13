@@ -1,0 +1,89 @@
+---
+title: "AMD ROCm（实验性）"
+description: "在 AMD Instinct GPU 上从源码安装 PhyAI，并以 eager 模式运行 PI0.5。"
+---
+
+PhyAI 不改源码即可在 AMD Instinct MI300X（gfx942）上安装并运行 PI0.5。AMD 上的 kernel 选择回落到 Torch reference 与 SDPA 实现，目前还没有针对 AMD 调优的 kernel。请使用 eager 模式：这条路径上 CUDA Graph 捕获不可用（见[限制](#限制)）。
+
+已测试组合：ROCm 6.4、Python 3.12、`torch==2.8.0+rocm6.4`。workspace 为 CUDA 固定的是 `torch==2.11.0`；其它 ROCm 与 Torch 版本未测试。
+
+## 安装
+
+从一个透传 GPU 设备（`--device=/dev/kfd --device=/dev/dri`）的 ROCm PyTorch 容器开始，例如 `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1`。在仓库根目录写一个 override 文件，固定 ROCm 版 Torch，并去掉只为 CUDA 存在的依赖：
+
+```bash
+cat > rocm-overrides.txt <<'EOF'
+torch==2.8.0+rocm6.4
+torchvision==0.23.0+rocm6.4
+flashinfer-python ; sys_platform == "never"
+humming-kernels ; sys_platform == "never"
+flash-qla ; sys_platform == "never"
+nvidia-ml-py ; sys_platform == "never"
+triton ; sys_platform == "never"
+torch-c-dlpack-ext ; sys_platform == "never"
+EOF
+```
+
+| 去掉的包 | 原因 |
+| --- | --- |
+| `flashinfer-python`、`humming-kernels`、`flash-qla` | 仅支持 CUDA。它们是惰性导入的，缺失时 kernel selector 会跳过对应的行。 |
+| `nvidia-ml-py` | NVML 只支持 NVIDIA。 |
+| `triton` | PyPI 上的是 CUDA 版，会装进与 `pytorch-triton-rocm` 相同的 `triton/` 目录，导入时崩溃。 |
+| `torch-c-dlpack-ext` | 只带 CPU 与 CUDA 两种 addon，在 ROCm 上会选中 CUDA 版，`import phyai_ext` 因缺少 `libtorch_cuda.so` 失败。不装它时，`apache-tvm-ffi` 会在首次使用时编译 ROCm addon。 |
+
+然后对 ROCm wheel 索引安装 workspace 包：
+
+```bash
+pip install uv
+uv venv --python 3.12
+uv pip install --override rocm-overrides.txt \
+  --extra-index-url https://download.pytorch.org/whl/rocm6.4 --index-strategy unsafe-best-match \
+  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+`phyai-ext` 使用与 CUDA 相同的 CMake 配置从源码构建。
+
+用激活后环境里的 `python` 运行，或用 `uv run --no-sync`。普通的 `uv run` 与 `uv sync` 会重新同步 workspace 依赖，装回 CUDA 版 Torch 和上面排除的包。
+
+## 检查安装
+
+```bash
+source .venv/bin/activate
+python -c "import torch, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+phyai-kernel show-env
+```
+
+## 运行 PI0.5
+
+构建引擎时关闭 CUDA Graph 捕获。ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它：
+
+```python
+from phyai import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 3,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda"),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+```
+
+`examples/pi05/run_pi05.py` 在不传 `--dump-dir` 时会开启 CUDA Graph，原样运行会遇到下面第一条限制。
+
+## 限制
+
+- PI0.5 的 CUDA Graph setup 会失败。paged attention 选中 `sdpa.attention_paged`，它的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移（`ValueError: SDPA paged replay cannot change sequence offsets`）。任何没有 FlashInfer 的设备都会遇到。
+- 没有 AMD 专属的 kernel 行。Triton 行限定在 NVIDIA 上，所有 op 都使用 Torch reference 或 SDPA 实现。
+- FlashInfer、humming 量化（NVFP4）与 vGPU green context 不可用。
+- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败，因为这些用例依赖 FlashInfer 的行；后续 PR 会解决。
