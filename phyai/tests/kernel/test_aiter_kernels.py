@@ -77,6 +77,27 @@ def test_aiter_rmsnorm_rejects_fp32_weight(monkeypatch):
     )
 
 
+ADARMSNORM_FIELDS = dict(
+    dtype={"input": "bf16", "modulation": "bf16"},
+    shape={"tokens": 50, "hidden": 1024, "cond_dim": 1024},
+)
+
+
+def test_triton_adarmsnorm_is_selected_on_amd(monkeypatch):
+    monkeypatch.setattr(
+        selector_module,
+        "library_facts",
+        lambda names: {
+            **library_facts(names),
+            "lib.phyai_kernel": "phyai_kernel" in names,
+        },
+    )
+    amd = Selector(build_catalog(), device="amd:gfx942").explain(
+        KernelQuery.build("adarmsnorm", **ADARMSNORM_FIELDS)
+    )
+    assert amd.selected == "phyai_kernel.adarmsnorm"
+
+
 rocm = pytest.mark.skipif(
     torch.version.hip is None or not torch.cuda.is_available(),
     reason="aiter kernels need a ROCm GPU",
@@ -92,6 +113,34 @@ def _select(op: str, reference: bool = False, **fields):
     return selector.select(
         query, prefer=[k for k in eligible if k.startswith(("torch.", "eager."))][:1]
     )
+
+
+@rocm
+@pytest.mark.parametrize(
+    "x_shape, modulation_shape",
+    [
+        ((1, 50, 1024), (1, 1, 3072)),
+        ((2, 25, 1024), (2, 1, 3072)),
+        ((50, 1024), (1, 3072)),
+    ],
+)
+def test_triton_adarmsnorm_matches_torch(x_shape, modulation_shape):
+    pytest.importorskip("phyai_kernel")
+    triton_row = _select("adarmsnorm", **ADARMSNORM_FIELDS)
+    torch_row = _select("adarmsnorm", reference=True, **ADARMSNORM_FIELDS)
+    assert (triton_row.kernel_id, torch_row.kernel_id) == (
+        "phyai_kernel.adarmsnorm",
+        "torch.adarmsnorm",
+    )
+    torch.manual_seed(0)
+    x = torch.randn(x_shape, device="cuda", dtype=torch.bfloat16)
+    modulation = torch.randn(modulation_shape, device="cuda", dtype=torch.bfloat16)
+    for actual, expected in zip(
+        triton_row.execute(x, modulation, 1e-6), torch_row.execute(x, modulation, 1e-6)
+    ):
+        torch.testing.assert_close(
+            actual, expected.expand_as(actual), atol=3e-2, rtol=2e-2
+        )
 
 
 @rocm

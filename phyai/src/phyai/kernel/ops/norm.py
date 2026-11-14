@@ -18,6 +18,7 @@ NVIDIA = device.vendor == "nvidia"
 NVIDIA_FLASHINFER = lib.has("flashinfer") & NVIDIA
 NVIDIA_TRITON = lib.has("phyai_kernel") & NVIDIA
 AMD_AITER = lib.has("aiter") & (device.vendor == "amd")
+AMD_TRITON = lib.has("phyai_kernel") & (device.vendor == "amd")
 
 #: The dtypes the Triton norm entry points accept.
 TRITON_FLOATS = frozenset({"bf16", "fp16", "fp32"})
@@ -605,7 +606,9 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.adarmsnorm",
                 op="adarmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=TRITON_NORM,
+                when=any_of(
+                    TRITON_NORM, all_of(AMD_TRITON, dtype.input.in_(TRITON_FLOATS))
+                ),
                 prepare=_triton_adarmsnorm,
             ),
             Impl(
