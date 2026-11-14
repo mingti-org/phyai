@@ -93,6 +93,34 @@ def _flashinfer_nvfp4(facts, params):
     return gemm_nvfp4
 
 
+def _aiter_bf16(facts, params):
+    import os
+    from pathlib import Path
+
+    import aiter.jit.core as aiter_core
+    from aiter import tuned_gemm
+
+    # aiter merges every CSV listed in this variable; shapes missing from all
+    # of them fall back to torch inside tgemm. The merged file and per-shape
+    # lookups are memoized on first use, so they are cleared after extending it.
+    tuned = str(Path(__file__).with_name("aiter_bf16_tuned_gemm.csv"))
+    configured = os.environ.get(
+        "AITER_CONFIG_GEMM_BF16", aiter_core.AITER_CONFIG_GEMM_BF16
+    )
+    if tuned not in configured.split(os.pathsep):
+        os.environ["AITER_CONFIG_GEMM_BF16"] = os.pathsep.join((configured, tuned))
+        type(aiter_core.AITER_CONFIGS).get_config_file.cache_clear()
+        tuned_gemm.get_GEMM_A16W16_config_.cache_clear()
+        tuned_gemm.get_GEMM_A16W16_config.cache_clear()
+
+    def gemm(layer, x, bias):
+        if x.numel() == 0:
+            return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
+        return tuned_gemm.tgemm.mm(x, layer.weight, bias)
+
+    return gemm
+
+
 def _torch_fp8_per_tensor(facts, params):
     from phyai.layers.linear.backends.torch import gemm_fp8_per_tensor
 
@@ -270,6 +298,22 @@ def register(catalog: Catalog) -> None:
             ),
             prepare=_flashinfer_nvfp4,
             metadata={"package": "flashinfer"},
+        ),
+        # aiter.
+        Impl(
+            kernel_id="aiter.gemm.bf16",
+            op="gemm",
+            priority=Priority.OPTIMIZED,
+            when=all_of(
+                lib.has("aiter"),
+                device.vendor == "amd",
+                quant.format == "bf16",
+                dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output == "bf16",
+            ),
+            prepare=_aiter_bf16,
+            metadata={"package": "aiter", "note": "tgemm with tuned shapes"},
         ),
         # Torch.
         Impl(
