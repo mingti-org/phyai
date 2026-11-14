@@ -94,6 +94,15 @@ FLASHINFER_PAGED = all_of(
     dtype.input.in_(HALF_FLOATS),
 )
 
+# aiter's CK batch prefill reads the same paged layout (indptr, page indices,
+# last-page lengths) as FlashInfer.
+AITER_PAGED = all_of(
+    lib.has("aiter"),
+    device.vendor == "amd",
+    shape.head_dim.in_({64, 128, 256}),
+    dtype.input.in_(HALF_FLOATS),
+)
+
 # SDPA supports padded layouts.
 SDPA_ATTENTION = attrs.layout == "padded"
 
@@ -152,6 +161,10 @@ ATTENTION_EAGER_CLS = (
 PAGED_FLASHINFER_CLS = (
     "phyai.layers.attention.paged.backends.flashinfer",
     "FlashInferPagedBackend",
+)
+PAGED_AITER_CLS = (
+    "phyai.layers.attention.paged.backends.aiter",
+    "AiterPagedBackend",
 )
 PAGED_SDPA_CLS = (
     "phyai.layers.attention.paged.backends.sdpa",
@@ -341,6 +354,14 @@ def register(catalog: Catalog) -> None:
                 when=FLASHINFER_PAGED,
                 prepare=_backend_prepare(PAGED_FLASHINFER_CLS),
                 metadata={"package": "flashinfer"},
+            ),
+            Impl(
+                kernel_id="aiter.attention_paged",
+                op="attention_paged",
+                priority=Priority.OPTIMIZED + 2,
+                when=AITER_PAGED,
+                prepare=_backend_prepare(PAGED_AITER_CLS),
+                metadata={"package": "aiter"},
             ),
             Impl(
                 kernel_id="sdpa.attention_paged",

@@ -27,6 +27,14 @@ FLASHINFER_ROPE = all_of(
 )
 
 
+AITER_ROPE = all_of(
+    lib.has("aiter"),
+    device.vendor == "amd",
+    dtype.input.in_({"bf16", "fp16"}),
+    shape.rotary_dim == shape.head_dim,
+)
+
+
 def _flatten_tokens(positions, q, k):
     """Normalize padded/ragged Q, K, positions to flat ``(nnz, H*D)`` / ``(nnz,)``."""
     head_dim = q.shape[-1]
@@ -85,6 +93,37 @@ def _flashinfer(facts, params):
     return rope
 
 
+def _aiter(facts, params):
+    from aiter import rope_cached_2c_fwd
+
+    # aiter rotate_style: 0 rotates halves (NeoX), 1 rotates pairs (GPT-J).
+    rotate_style = 1 if facts.lookup("attrs.interleave") else 0
+
+    def rope(positions, q, k, cos_sin_cache):
+        flat_pos, flat_q, flat_k = _flatten_tokens(positions, q, k)
+        head_dim = q.shape[-1]
+        tokens = flat_pos.shape[0]
+        # aiter reads cos and sin as contiguous ``(tokens, 1, 1, rotary_dim // 2)``
+        # and silently misreads strided views of the packed cache.
+        cos, sin = (
+            cos_sin_cache.index_select(0, flat_pos)
+            .view(tokens, 1, 1, -1)
+            .chunk(2, dim=-1)
+        )
+        q_out, k_out = rope_cached_2c_fwd(
+            flat_q.contiguous().view(tokens, 1, -1, head_dim),
+            flat_k.contiguous().view(tokens, 1, -1, head_dim),
+            cos.contiguous(),
+            sin.contiguous(),
+            rotate_style,
+            True,
+            False,
+        )
+        return q_out.view(q.shape), k_out.view(k.shape)
+
+    return rope
+
+
 def _eager(facts, params):
     # Import during preparation. The rotation helpers live with the layer's
     # other public RoPE math; reusing them here keeps the eager kernel and
@@ -118,6 +157,14 @@ def register(catalog: Catalog) -> None:
                 when=FLASHINFER_ROPE,
                 prepare=_flashinfer,
                 metadata={"package": "flashinfer"},
+            ),
+            Impl(
+                kernel_id="aiter.rope",
+                op="rope",
+                priority=Priority.OPTIMIZED + 2,
+                when=AITER_ROPE,
+                prepare=_aiter,
+                metadata={"package": "aiter"},
             ),
             Impl(
                 kernel_id="eager.rope",
