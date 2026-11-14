@@ -17,6 +17,8 @@ from phyai.kernel.predicate import all_of, any_of, implies
 NVIDIA = device.vendor == "nvidia"
 NVIDIA_FLASHINFER = lib.has("flashinfer") & NVIDIA
 NVIDIA_TRITON = lib.has("phyai_kernel") & NVIDIA
+AMD_AITER = lib.has("aiter") & (device.vendor == "amd")
+AMD_TRITON = lib.has("phyai_kernel") & (device.vendor == "amd")
 
 #: The dtypes the Triton norm entry points accept.
 TRITON_FLOATS = frozenset({"bf16", "fp16", "fp32"})
@@ -187,6 +189,12 @@ FLASHINFER_LAYERNORM = all_of(
     implies(attrs.bias, dtype.bias == "fp32"),
 )
 
+# aiter's HIP RMSNorm takes a half-precision weight in the input dtype; an
+# fp32 weight produces inf.
+AITER_RMSNORM = all_of(
+    AMD_AITER, dtype.input.in_({"bf16", "fp16"}), dtype.weight == dtype.input
+)
+
 TRITON_NORM = all_of(NVIDIA_TRITON, dtype.input.in_(TRITON_FLOATS))
 RMSNORM_LAYOUT = any_of(attrs.rank.is_none(), attrs.rank.in_({2, 3}))
 
@@ -227,6 +235,21 @@ def _flashinfer_rmsnorm_add(facts, params):
         return (x, residual) if result is None else result
 
     return wrapped
+
+
+def _aiter_rmsnorm(facts, params):
+    from aiter import rms_norm
+
+    if not _gemma(facts):
+        return _rmsnorm_flattened(rms_norm)
+
+    # aiter has no Gemma variant, so it is fed ``1 + weight``. Derive it on
+    # every call: a cached copy first made during graph capture is filled only
+    # when that one graph replays.
+    def gemma_rms_norm(x, weight, eps):
+        return rms_norm(x, weight + 1, eps)
+
+    return _rmsnorm_flattened(gemma_rms_norm)
 
 
 def _triton_rmsnorm(facts, params):
@@ -482,6 +505,15 @@ def register(catalog: Catalog) -> None:
                 params={"weight": matches_activation()},
             ),
             Impl(
+                kernel_id="aiter.rmsnorm",
+                op="rmsnorm",
+                priority=Priority.OPTIMIZED + 2,
+                when=all_of(AITER_RMSNORM, RMSNORM_LAYOUT),
+                prepare=_aiter_rmsnorm,
+                params={"weight": matches_activation()},
+                metadata={"package": "aiter"},
+            ),
+            Impl(
                 kernel_id="phyai_kernel.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED,
@@ -574,7 +606,9 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.adarmsnorm",
                 op="adarmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=TRITON_NORM,
+                when=any_of(
+                    TRITON_NORM, all_of(AMD_TRITON, dtype.input.in_(TRITON_FLOATS))
+                ),
                 prepare=_triton_adarmsnorm,
             ),
             Impl(
