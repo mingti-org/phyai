@@ -147,6 +147,7 @@ def _select(op: str, reference: bool = False, **fields):
         ((1, 50, 1024), (1, 1, 3072)),
         ((2, 25, 1024), (2, 1, 3072)),
         ((50, 1024), (1, 3072)),
+        ((0, 1024), (1, 3072)),
     ],
 )
 def test_triton_adarmsnorm_matches_torch(x_shape, modulation_shape):
@@ -163,9 +164,7 @@ def test_triton_adarmsnorm_matches_torch(x_shape, modulation_shape):
     for actual, expected in zip(
         triton_row.execute(x, modulation, 1e-6), torch_row.execute(x, modulation, 1e-6)
     ):
-        torch.testing.assert_close(
-            actual, expected.expand_as(actual), atol=3e-2, rtol=2e-2
-        )
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=2e-2)
 
 
 @rocm
