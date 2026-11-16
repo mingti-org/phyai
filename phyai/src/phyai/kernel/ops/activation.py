@@ -41,6 +41,17 @@ def _flashinfer(function_name: str):
     return prepare
 
 
+def _aiter(function_name: str):
+    """Prepare one named aiter gated activation."""
+
+    def prepare(facts, params):
+        from phyai_kernel.aiter import activation as module
+
+        return getattr(module, function_name)
+
+    return prepare
+
+
 def _torch(name: str, *, gated: bool):
     """Prepare one exact Torch activation topology."""
 
@@ -125,6 +136,24 @@ def register(catalog: Catalog) -> None:
                     "activation": activation,
                     "gated": True,
                 },
+            )
+            for activation, function_name in FLASHINFER_KERNELS
+        )
+        + tuple(
+            Impl(
+                kernel_id=f"aiter.activation.{function_name}",
+                op="activation",
+                priority=Priority.OPTIMIZED + 2,
+                when=all_of(
+                    device.vendor == "amd",
+                    lib.has("phyai_kernel"),
+                    lib.has("aiter"),
+                    attrs.gated,
+                    dtype.input.in_({"bf16", "fp16"}),
+                    attrs.activation == activation,
+                ),
+                prepare=_aiter(function_name),
+                metadata={"package": "aiter", "activation": activation, "gated": True},
             )
             for activation, function_name in FLASHINFER_KERNELS
         )

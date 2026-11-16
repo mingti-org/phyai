@@ -93,6 +93,17 @@ def _flashinfer_nvfp4(facts, params):
     return gemm_nvfp4
 
 
+def _aiter_bf16(facts, params):
+    from phyai_kernel.aiter.gemm import ensure_tuned_config, mm
+
+    ensure_tuned_config()
+
+    def gemm(layer, x, bias):
+        return mm(x, layer.weight, bias)
+
+    return gemm
+
+
 def _torch_fp8_per_tensor(facts, params):
     from phyai.layers.linear.backends.torch import gemm_fp8_per_tensor
 
@@ -270,6 +281,23 @@ def register(catalog: Catalog) -> None:
             ),
             prepare=_flashinfer_nvfp4,
             metadata={"package": "flashinfer"},
+        ),
+        # aiter.
+        Impl(
+            kernel_id="aiter.gemm.bf16",
+            op="gemm",
+            priority=Priority.OPTIMIZED,
+            when=all_of(
+                device.vendor == "amd",
+                lib.has("phyai_kernel"),
+                lib.has("aiter"),
+                quant.format == "bf16",
+                dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output == "bf16",
+            ),
+            prepare=_aiter_bf16,
+            metadata={"package": "aiter", "note": "tgemm with tuned shapes"},
         ),
         # Torch.
         Impl(

@@ -70,6 +70,7 @@ def test_implementations_are_ordered_best_first_whatever_the_registration_order(
 ):
     rows = catalog.impls("rmsnorm")
     assert [item.kernel_id for item in rows] == [
+        "aiter.rmsnorm",
         "flashinfer.rmsnorm",
         "phyai_kernel.rmsnorm",
         "torch.rmsnorm",
@@ -178,6 +179,7 @@ def test_manifest_and_describe_render_every_row_stably(catalog):
 def test_libraries_and_id_patterns_are_derived_from_the_rows(catalog):
     """The selector must import only what eligibility actually depends on."""
     assert catalog.libraries() == {
+        "aiter",
         "flashinfer",
         "phyai_kernel",
         "triton",
@@ -185,7 +187,12 @@ def test_libraries_and_id_patterns_are_derived_from_the_rows(catalog):
         "flash_qla",
         "humming",
     }
-    assert catalog.libraries("gemm") == {"flashinfer", "humming"}
+    assert catalog.libraries("gemm") == {
+        "aiter",
+        "flashinfer",
+        "humming",
+        "phyai_kernel",
+    }
     assert catalog.libraries("attention_gdn") == {"flashinfer", "fla", "flash_qla"}
     assert set(catalog.match_ids("flashinfer.gemm.*")) == {
         "flashinfer.gemm.bf16",

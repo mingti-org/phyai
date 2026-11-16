@@ -27,6 +27,15 @@ FLASHINFER_ROPE = all_of(
 )
 
 
+AITER_ROPE = all_of(
+    device.vendor == "amd",
+    lib.has("phyai_kernel"),
+    lib.has("aiter"),
+    dtype.input.in_({"bf16", "fp16"}),
+    shape.rotary_dim == shape.head_dim,
+)
+
+
 def _flatten_tokens(positions, q, k):
     """Normalize padded/ragged Q, K, positions to flat ``(nnz, H*D)`` / ``(nnz,)``."""
     head_dim = q.shape[-1]
@@ -85,6 +94,21 @@ def _flashinfer(facts, params):
     return rope
 
 
+def _aiter(facts, params):
+    from phyai_kernel.aiter.rope import rope_cached
+
+    interleave = bool(facts.lookup("attrs.interleave"))
+
+    def rope(positions, q, k, cos_sin_cache):
+        flat_pos, flat_q, flat_k = _flatten_tokens(positions, q, k)
+        q_out, k_out = rope_cached(
+            flat_pos, flat_q, flat_k, cos_sin_cache, q.shape[-1], interleave
+        )
+        return q_out.view(q.shape), k_out.view(k.shape)
+
+    return rope
+
+
 def _eager(facts, params):
     # Import during preparation. The rotation helpers live with the layer's
     # other public RoPE math; reusing them here keeps the eager kernel and
@@ -118,6 +142,14 @@ def register(catalog: Catalog) -> None:
                 when=FLASHINFER_ROPE,
                 prepare=_flashinfer,
                 metadata={"package": "flashinfer"},
+            ),
+            Impl(
+                kernel_id="aiter.rope",
+                op="rope",
+                priority=Priority.OPTIMIZED + 2,
+                when=AITER_ROPE,
+                prepare=_aiter,
+                metadata={"package": "aiter"},
             ),
             Impl(
                 kernel_id="eager.rope",

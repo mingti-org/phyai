@@ -106,7 +106,7 @@ def test_adarmsnorm_lands_on_triton_because_no_flashinfer_row_exists(
 def test_paged_attention_has_an_sdpa_fallback(selector) -> None:
     catalog = build_catalog()
     vendors = {row.kernel_id.split(".")[0] for row in catalog.impls("attention_paged")}
-    assert vendors == {"flashinfer", "sdpa"}
+    assert vendors == {"aiter", "flashinfer", "sdpa"}
 
 
 def test_rope_falls_back_to_eager_on_its_own(selector) -> None:

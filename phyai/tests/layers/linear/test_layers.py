@@ -27,7 +27,9 @@ import phyai.layers.linear as L
 # ---------------------------------------------------------------------------
 
 
-def test_replicated_linear_matches_F_linear_and_can_defer_its_bias(fake_mesh):
+def test_replicated_linear_matches_F_linear_and_can_defer_its_bias(
+    fake_mesh, torch_gemm
+):
     fake_mesh()
     layer = L.ReplicatedLinear(
         in_features=32, out_features=16, bias=True, params_dtype=torch.bfloat16
