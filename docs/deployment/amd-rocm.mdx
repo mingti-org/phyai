@@ -1,96 +1,51 @@
 ---
 title: "AMD ROCm (experimental)"
-description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5, with CUDA Graph when aiter is installed."
+description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5 with CUDA Graph."
 ---
 
-PhyAI runs PI0.5 on AMD Instinct MI300X (gfx942) in eager mode on plain ROCm PyTorch, and in CUDA Graph mode when [aiter](https://github.com/ROCm/aiter) is installed. With aiter, the kernel selector picks aiter rows for paged attention, bf16 GEMM, RMSNorm, RoPE, and gated GELU. Without aiter, these ops fall back to their Torch reference or SDPA rows, and CUDA Graph capture fails (see [Limitations](#limitations)). AdaRMSNorm uses PhyAI's Triton kernel in both setups.
+PhyAI runs PI0.5 on AMD Instinct MI300X (gfx942) in eager and CUDA Graph mode. On AMD, the kernel selector picks [aiter](https://github.com/ROCm/aiter) rows for paged attention, bf16 GEMM, RMSNorm, RoPE, and gated GELU, and PhyAI's Triton kernel for AdaRMSNorm.
 
-| Setup | Base image | Torch | Modes |
-| --- | --- | --- | --- |
-| [Eager](#install-eager) | `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1` | `2.8.0+rocm6.4` | eager |
-| [aiter](#install-with-aiter-cuda-graph) | `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` | `2.11.0+rocm7.2`, aiter 0.1.26 | eager and CUDA Graph |
+Tested on MI300X with the `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` image (ROCm 7.2, Python 3.12, `torch==2.11.0+rocm7.2`, aiter 0.1.26). MI355X and other Instinct GPUs, and other images, are untested.
 
-Both setups use Python 3.12. Other ROCm, Torch, and aiter versions are untested.
+## Install from source
 
-## Install (eager)
+Start the image with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`). It ships ROCm builds of Torch, TorchVision, Triton, and aiter in `/opt/venv`, at the Torch versions PhyAI pins.
 
-Start from the ROCm PyTorch container above with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`). From the repository root, write an override file. It pins the ROCm Torch wheels and drops the dependencies that only exist for CUDA:
+`phyai/pyproject_amd.toml` and `phyai-kernel/pyproject_amd.toml` declare the same dependencies as the default `pyproject.toml` files without the CUDA-only packages. Copy them over the defaults, then install the workspace packages into the image's environment:
 
 ```bash
-cat > rocm-overrides.txt <<'EOF'
-torch==2.8.0+rocm6.4
-torchvision==0.23.0+rocm6.4
-flashinfer-python ; sys_platform == "never"
-humming-kernels ; sys_platform == "never"
-flash-qla ; sys_platform == "never"
-nvidia-ml-py ; sys_platform == "never"
-triton ; sys_platform == "never"
-torch-c-dlpack-ext ; sys_platform == "never"
-EOF
+git clone https://github.com/mingti-org/phyai.git
+cd phyai
+cp phyai/pyproject_amd.toml phyai/pyproject.toml
+cp phyai-kernel/pyproject_amd.toml phyai-kernel/pyproject.toml
+source /opt/venv/bin/activate
+pip install uv
+uv pip install -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
 ```
 
-| Dropped package | Why |
+| Left out on AMD | Why |
 | --- | --- |
 | `flashinfer-python`, `humming-kernels`, `flash-qla` | CUDA-only. They are imported lazily, and the kernel selector skips their rows when they are missing. |
 | `nvidia-ml-py` | NVML is NVIDIA-only. |
-| `triton` | The PyPI wheel is the CUDA build. It installs into the same `triton/` directory as `pytorch-triton-rocm` and crashes on import. |
 | `torch-c-dlpack-ext` | It ships only CPU and CUDA addons and picks the CUDA one on ROCm, so `import phyai_ext` fails on the missing `libtorch_cuda.so`. Without it, `apache-tvm-ffi` builds a ROCm addon on first use. |
 
-Then install the workspace packages against the ROCm wheel index:
-
-```bash
-pip install uv
-uv venv --python 3.12
-uv pip install --override rocm-overrides.txt \
-  --extra-index-url https://download.pytorch.org/whl/rocm6.4 --index-strategy unsafe-best-match \
-  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
-  -e ./phyai-utils-tools -e ./phyai-model-optimizer
-```
-
-`phyai-ext` builds from source with the same CMake setup as on CUDA.
-
-Run Python from the activated environment, or with `uv run --no-sync`. Plain `uv run` and `uv sync` re-sync the workspace dependencies, which reinstalls the CUDA Torch build and the dropped packages.
-
-## Install with aiter (CUDA Graph)
-
-Start from the SGLang ROCm container in the table above, which ships Torch, Triton, and aiter in `/opt/venv`. Install PhyAI into that environment and keep the image's Torch, TorchVision, and Triton, so the override file drops them too:
-
-```bash
-source /opt/venv/bin/activate
-cat > rocm-aiter-overrides.txt <<'EOF'
-torch ; sys_platform == "never"
-torchvision ; sys_platform == "never"
-triton ; sys_platform == "never"
-flashinfer-python ; sys_platform == "never"
-humming-kernels ; sys_platform == "never"
-flash-qla ; sys_platform == "never"
-nvidia-ml-py ; sys_platform == "never"
-torch-c-dlpack-ext ; sys_platform == "never"
-EOF
-pip install uv
-uv pip install --override rocm-aiter-overrides.txt \
-  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
-  -e ./phyai-utils-tools -e ./phyai-model-optimizer
-```
-
-The aiter rows are selected only when `import aiter` succeeds on a ROCm build of Torch; otherwise each op falls back as in the eager setup.
+`phyai-ext` builds from source with the same CMake setup as on CUDA. Do not run `uv sync` or plain `uv run`: they resolve the default `uv.lock` and reinstall the CUDA builds.
 
 ## Check the install
 
 ```bash
-python -c "import torch, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+python -c "import torch, aiter, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
 phyai-kernel show-env
 ```
 
-In the eager setup, activate `.venv` first. In the aiter setup, `python -c "import aiter"` should also succeed.
-
 ## Run PI0.5
 
-ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it. In the aiter setup, CUDA Graph works with the default `RuntimeConfig`. In the eager setup, turn it off:
+ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it, and CUDA Graph works with the default `RuntimeConfig`:
 
 ```python
 from phyai import Engine, EngineArgs
-from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.engine_config import DeviceConfig, EngineConfig
 from phyai.models.pi05.main_pi05 import PI05Args
 
 engine = Engine(
@@ -99,21 +54,15 @@ engine = Engine(
         plugin_args=PI05Args(
             checkpoint_dir="/path/to/pi05_base/",
             max_batch_size=1,
-            inputs_image_shape=[[224, 224, 3]] * 3,
+            inputs_image_shape=[[224, 224, 3]] * 2,
         ),
-        config=EngineConfig(
-            device=DeviceConfig(target="cuda"),
-            runtime=RuntimeConfig(use_cuda_graph=False),  # eager setup only
-        ),
+        config=EngineConfig(device=DeviceConfig(target="cuda")),
     )
 )
 ```
-
-`examples/pi05/run_pi05.py` enables CUDA Graph unless `--dump-dir` is set, so it needs the aiter setup.
-
 ## Limitations
 
-- Without aiter, CUDA Graph setup fails for PI0.5. Paged attention then selects `sdpa.attention_paged`, whose graph replay cannot change sequence offsets between PI0.5's prefix buckets (`ValueError: SDPA paged replay cannot change sequence offsets`).
+- Without aiter, paged attention, GEMM, RMSNorm, RoPE, and gated GELU fall back to their Torch reference or SDPA rows, and CUDA Graph setup fails for PI0.5: `sdpa.attention_paged` cannot replay changed sequence offsets between PI0.5's prefix buckets.
 - Layernorm, embedding, and plain GELU stay on their Torch rows on AMD. The bundled aiter GEMM tuning table covers four PI0.5 shapes on MI300X; aiter runs other shapes through Torch.
 - FlashInfer, humming quantization (NVFP4), and vGPU green contexts are unavailable.
 - `pytest phyai/tests/kernel` has 27 failures on ROCm: the tests expect FlashInfer or NVIDIA-only Triton rows, and `op='moe'` has no row on ROCm. A follow-up PR will fix them.
