@@ -1,15 +1,20 @@
 ---
 title: "AMD ROCm (experimental)"
-description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5 in eager mode."
+description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5, with CUDA Graph when aiter is installed."
 ---
 
-PhyAI installs and runs PI0.5 on AMD Instinct MI300X (gfx942) without source changes. Kernel selection falls back to the Torch reference and SDPA rows on AMD, so there are no AMD-tuned kernels yet. Run in eager mode: CUDA Graph capture does not work on this path (see [Limitations](#limitations)).
+PhyAI runs PI0.5 on AMD Instinct MI300X (gfx942) in eager mode on plain ROCm PyTorch, and in CUDA Graph mode when [aiter](https://github.com/ROCm/aiter) is installed. With aiter, the kernel selector picks aiter rows for paged attention, bf16 GEMM, RMSNorm, RoPE, and gated GELU. Without aiter, these ops fall back to their Torch reference or SDPA rows, and CUDA Graph capture fails (see [Limitations](#limitations)). AdaRMSNorm uses PhyAI's Triton kernel in both setups.
 
-Tested with ROCm 6.4, Python 3.12, and `torch==2.8.0+rocm6.4`. The workspace pins `torch==2.11.0` for CUDA; other ROCm and Torch versions are untested.
+| Setup | Base image | Torch | Modes |
+| --- | --- | --- | --- |
+| [Eager](#install-eager) | `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1` | `2.8.0+rocm6.4` | eager |
+| [aiter](#install-with-aiter-cuda-graph) | `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` | `2.11.0+rocm7.2`, aiter 0.1.26 | eager and CUDA Graph |
 
-## Install
+Both setups use Python 3.12. Other ROCm, Torch, and aiter versions are untested.
 
-Start from a ROCm PyTorch container with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`), for example `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1`. From the repository root, write an override file. It pins the ROCm Torch wheels and drops the dependencies that only exist for CUDA:
+## Install (eager)
+
+Start from the ROCm PyTorch container above with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`). From the repository root, write an override file. It pins the ROCm Torch wheels and drops the dependencies that only exist for CUDA:
 
 ```bash
 cat > rocm-overrides.txt <<'EOF'
@@ -46,17 +51,42 @@ uv pip install --override rocm-overrides.txt \
 
 Run Python from the activated environment, or with `uv run --no-sync`. Plain `uv run` and `uv sync` re-sync the workspace dependencies, which reinstalls the CUDA Torch build and the dropped packages.
 
+## Install with aiter (CUDA Graph)
+
+Start from the SGLang ROCm container in the table above, which ships Torch, Triton, and aiter in `/opt/venv`. Install PhyAI into that environment and keep the image's Torch, TorchVision, and Triton, so the override file drops them too:
+
+```bash
+source /opt/venv/bin/activate
+cat > rocm-aiter-overrides.txt <<'EOF'
+torch ; sys_platform == "never"
+torchvision ; sys_platform == "never"
+triton ; sys_platform == "never"
+flashinfer-python ; sys_platform == "never"
+humming-kernels ; sys_platform == "never"
+flash-qla ; sys_platform == "never"
+nvidia-ml-py ; sys_platform == "never"
+torch-c-dlpack-ext ; sys_platform == "never"
+EOF
+pip install uv
+uv pip install --override rocm-aiter-overrides.txt \
+  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+The aiter rows are selected only when `import aiter` succeeds on a ROCm build of Torch; otherwise each op falls back as in the eager setup.
+
 ## Check the install
 
 ```bash
-source .venv/bin/activate
 python -c "import torch, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
 phyai-kernel show-env
 ```
 
+In the eager setup, activate `.venv` first. In the aiter setup, `python -c "import aiter"` should also succeed.
+
 ## Run PI0.5
 
-Build the engine with CUDA Graph capture turned off. ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it:
+ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it. In the aiter setup, CUDA Graph works with the default `RuntimeConfig`. In the eager setup, turn it off:
 
 ```python
 from phyai import Engine, EngineArgs
@@ -73,17 +103,17 @@ engine = Engine(
         ),
         config=EngineConfig(
             device=DeviceConfig(target="cuda"),
-            runtime=RuntimeConfig(use_cuda_graph=False),
+            runtime=RuntimeConfig(use_cuda_graph=False),  # eager setup only
         ),
     )
 )
 ```
 
-`examples/pi05/run_pi05.py` enables CUDA Graph unless `--dump-dir` is set, so running it unchanged hits the first limitation below.
+`examples/pi05/run_pi05.py` enables CUDA Graph unless `--dump-dir` is set, so it needs the aiter setup.
 
 ## Limitations
 
-- CUDA Graph setup fails for PI0.5. Paged attention selects `sdpa.attention_paged`, whose graph replay cannot change sequence offsets between PI0.5's prefix buckets (`ValueError: SDPA paged replay cannot change sequence offsets`). Any device without FlashInfer hits this.
-- No AMD-specific kernel rows. The Triton rows are gated to NVIDIA, so every op uses its Torch reference or SDPA implementation.
+- Without aiter, CUDA Graph setup fails for PI0.5. Paged attention then selects `sdpa.attention_paged`, whose graph replay cannot change sequence offsets between PI0.5's prefix buckets (`ValueError: SDPA paged replay cannot change sequence offsets`).
+- Layernorm, embedding, and plain GELU stay on their Torch rows on AMD. The bundled aiter GEMM tuning table covers four PI0.5 shapes on MI300X; aiter runs other shapes through Torch.
 - FlashInfer, humming quantization (NVFP4), and vGPU green contexts are unavailable.
-- `pytest phyai/tests/kernel` has 27 failures on ROCm because those tests depend on FlashInfer rows. A follow-up PR will fix them.
+- `pytest phyai/tests/kernel` has 27 failures on ROCm: the tests expect FlashInfer or NVIDIA-only Triton rows, and `op='moe'` has no row on ROCm. A follow-up PR will fix them.

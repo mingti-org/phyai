@@ -1,15 +1,20 @@
 ---
 title: "AMD ROCm（实验性）"
-description: "在 AMD Instinct GPU 上从源码安装 PhyAI，并以 eager 模式运行 PI0.5。"
+description: "在 AMD Instinct GPU 上从源码安装 PhyAI 并运行 PI0.5，装了 aiter 时可用 CUDA Graph。"
 ---
 
-PhyAI 不改源码即可在 AMD Instinct MI300X（gfx942）上安装并运行 PI0.5。AMD 上的 kernel 选择回落到 Torch reference 与 SDPA 实现，目前还没有针对 AMD 调优的 kernel。请使用 eager 模式：这条路径上 CUDA Graph 捕获不可用（见[限制](#限制)）。
+PhyAI 在 AMD Instinct MI300X（gfx942）上运行 PI0.5：普通 ROCm PyTorch 环境下用 eager 模式，装了 [aiter](https://github.com/ROCm/aiter) 时可用 CUDA Graph 模式。有 aiter 时，kernel selector 为 paged attention、bf16 GEMM、RMSNorm、RoPE 与门控 GELU 选 aiter 的行。没有 aiter 时，这些 op 回落到 Torch reference 或 SDPA 的行，CUDA Graph 捕获会失败（见[限制](#限制)）。两种环境下 AdaRMSNorm 都用 PhyAI 的 Triton kernel。
 
-已测试组合：ROCm 6.4、Python 3.12、`torch==2.8.0+rocm6.4`。workspace 为 CUDA 固定的是 `torch==2.11.0`；其它 ROCm 与 Torch 版本未测试。
+| 环境 | 基础镜像 | Torch | 模式 |
+| --- | --- | --- | --- |
+| eager | `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1` | `2.8.0+rocm6.4` | eager |
+| aiter | `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` | `2.11.0+rocm7.2`，aiter 0.1.26 | eager 与 CUDA Graph |
 
-## 安装
+两种环境都用 Python 3.12。其它 ROCm、Torch 与 aiter 版本未测试。
 
-从一个透传 GPU 设备（`--device=/dev/kfd --device=/dev/dri`）的 ROCm PyTorch 容器开始，例如 `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1`。在仓库根目录写一个 override 文件，固定 ROCm 版 Torch，并去掉只为 CUDA 存在的依赖：
+## 安装（eager）
+
+从上表的 ROCm PyTorch 容器开始，透传 GPU 设备（`--device=/dev/kfd --device=/dev/dri`）。在仓库根目录写一个 override 文件，固定 ROCm 版 Torch，并去掉只为 CUDA 存在的依赖：
 
 ```bash
 cat > rocm-overrides.txt <<'EOF'
@@ -46,17 +51,42 @@ uv pip install --override rocm-overrides.txt \
 
 用激活后环境里的 `python` 运行，或用 `uv run --no-sync`。普通的 `uv run` 与 `uv sync` 会重新同步 workspace 依赖，装回 CUDA 版 Torch 和上面排除的包。
 
+## 安装 aiter 环境（CUDA Graph）
+
+从上表的 SGLang ROCm 容器开始，它在 `/opt/venv` 里带 Torch、Triton 与 aiter。把 PhyAI 装进这个环境并保留镜像自带的 Torch、TorchVision 与 Triton，所以 override 文件把它们也去掉：
+
+```bash
+source /opt/venv/bin/activate
+cat > rocm-aiter-overrides.txt <<'EOF'
+torch ; sys_platform == "never"
+torchvision ; sys_platform == "never"
+triton ; sys_platform == "never"
+flashinfer-python ; sys_platform == "never"
+humming-kernels ; sys_platform == "never"
+flash-qla ; sys_platform == "never"
+nvidia-ml-py ; sys_platform == "never"
+torch-c-dlpack-ext ; sys_platform == "never"
+EOF
+pip install uv
+uv pip install --override rocm-aiter-overrides.txt \
+  -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+只有在 ROCm 版 Torch 上 `import aiter` 成功时才会选 aiter 的行；否则各 op 与 eager 环境一样回落。
+
 ## 检查安装
 
 ```bash
-source .venv/bin/activate
 python -c "import torch, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
 phyai-kernel show-env
 ```
 
+eager 环境先激活 `.venv`。aiter 环境里 `python -c "import aiter"` 也应成功。
+
 ## 运行 PI0.5
 
-构建引擎时关闭 CUDA Graph 捕获。ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它：
+ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它。aiter 环境用默认的 `RuntimeConfig` 即可开启 CUDA Graph；eager 环境要关闭它：
 
 ```python
 from phyai import Engine, EngineArgs
@@ -73,17 +103,17 @@ engine = Engine(
         ),
         config=EngineConfig(
             device=DeviceConfig(target="cuda"),
-            runtime=RuntimeConfig(use_cuda_graph=False),
+            runtime=RuntimeConfig(use_cuda_graph=False),  # 仅 eager 环境
         ),
     )
 )
 ```
 
-`examples/pi05/run_pi05.py` 在不传 `--dump-dir` 时会开启 CUDA Graph，原样运行会遇到下面第一条限制。
+`examples/pi05/run_pi05.py` 在不传 `--dump-dir` 时会开启 CUDA Graph，所以需要 aiter 环境。
 
 ## 限制
 
-- PI0.5 的 CUDA Graph setup 会失败。paged attention 选中 `sdpa.attention_paged`，它的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移（`ValueError: SDPA paged replay cannot change sequence offsets`）。任何没有 FlashInfer 的设备都会遇到。
-- 没有 AMD 专属的 kernel 行。Triton 行限定在 NVIDIA 上，所有 op 都使用 Torch reference 或 SDPA 实现。
+- 没有 aiter 时 PI0.5 的 CUDA Graph setup 会失败。此时 paged attention 选中 `sdpa.attention_paged`，它的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移（`ValueError: SDPA paged replay cannot change sequence offsets`）。
+- AMD 上 layernorm、embedding 与非门控 GELU 仍走 Torch 的行。随包的 aiter GEMM 调优表只覆盖 MI300X 上 PI0.5 的四个形状，其它形状由 aiter 转交 Torch。
 - FlashInfer、humming 量化（NVFP4）与 vGPU green context 不可用。
-- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败，因为这些用例依赖 FlashInfer 的行；后续 PR 会解决。
+- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败：这些用例期望选中 FlashInfer 或仅限 NVIDIA 的 Triton 行，`op='moe'` 在 ROCm 上没有可用的行；后续 PR 会解决。
