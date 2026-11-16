@@ -285,6 +285,7 @@ def adarmsnorm(
     gate2d = gate_t.reshape(-1, n_cols)
 
     if n_total == 0:
+        gate_t.copy_(modulation[..., 2 * n_cols :])
         return out_t, gate_t
     if n_mod == 0 or n_total % n_mod != 0:
         raise RuntimeError(
