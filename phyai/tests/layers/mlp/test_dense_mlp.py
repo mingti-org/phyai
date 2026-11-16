@@ -148,7 +148,7 @@ def test_forward_gated_matches_torch_reference(fake_mesh, activation):
     torch.testing.assert_close(m(x), ref, atol=2e-2, rtol=2e-2)
 
 
-def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh):
+def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh, torch_gemm):
     fake_mesh()
     # Plain path uses F.gelu — the torch reference row, no flashinfer needed.
     H, I = 32, 96

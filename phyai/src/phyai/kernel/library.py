@@ -18,6 +18,10 @@ _DISTRIBUTIONS = {
     "humming": "humming-kernels",
 }
 
+#: Import name -> module whose ``available()`` probes it, for libraries that
+#: phyai reaches only through phyai_kernel and must not import itself.
+_DELEGATED_PROBES = {"aiter": "phyai_kernel.aiter.availability"}
+
 _probes: dict[str, bool] = {}
 
 
@@ -29,7 +33,11 @@ def library_available(name: str) -> bool:
         return cached
 
     try:
-        importlib.import_module(name)
+        probe = _DELEGATED_PROBES.get(name)
+        if probe is None:
+            importlib.import_module(name)
+        elif not importlib.import_module(probe).available():
+            raise ImportError(f"{probe}.available() returned False")
     except BaseException as exc:
         # Any import-time failure makes the library unavailable.
         logger.debug_rank0(

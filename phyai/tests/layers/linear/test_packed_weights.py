@@ -10,7 +10,9 @@ from phyai.weights import WeightLoadSession
 
 @pytest.mark.parametrize("tp_size,rank", [(1, 0), (2, 0), (2, 1), (4, 3)])
 @pytest.mark.parametrize("bias", [False, True])
-def test_packed_column_checkpoint_and_cuda_forward(fake_mesh, tp_size, rank, bias):
+def test_packed_column_checkpoint_and_cuda_forward(
+    fake_mesh, torch_gemm, tp_size, rank, bias
+):
     fake_mesh(tp_size=tp_size, rank=rank)
     sizes = [64, 32, 32]
     layer = ColumnParallelLinear(
