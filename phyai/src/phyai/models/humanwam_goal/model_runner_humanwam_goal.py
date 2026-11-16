@@ -42,15 +42,18 @@ class HumanWAMGoalVAERunner(Cosmos3OptimizedVAERunner):
             raise ValueError("The frame cache bound must be nonnegative")
         self.max_cached_frames = max_cached_frames
         self.frames: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self.frame_layouts: OrderedDict[tuple, tuple[bool, tuple]] = OrderedDict()
         super().__init__(*args, **kwargs)
 
     def invalidate_cache(self) -> None:
         super().invalidate_cache()
         self.frames.clear()
+        self.frame_layouts.clear()
 
     def stage_encoder(self, device: torch.device | str) -> None:
         # Encoder movement can invalidate cached latents as well as graphs.
         self.frames.clear()
+        self.frame_layouts.clear()
         super().stage_encoder(device)
 
     def encode(self, pixels, *, sample=False, generator=None):
@@ -75,6 +78,93 @@ class HumanWAMGoalVAERunner(Cosmos3OptimizedVAERunner):
             self.frames[key] = latent
         self.frames.move_to_end(key)
         return latent.clone()
+
+    def encode_frames(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        collective: HumanWAMGoalGather | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode independent B1 frames on their owners and exchange latent bytes."""
+        if (
+            collective is None
+            or collective.size not in (2, 4)
+            or len(pixels) < collective.size
+            or any(not isinstance(value, torch.Tensor) for value in pixels)
+        ):
+            return tuple(self.encode(frame) for frame in pixels)
+        pixel_shape = tuple(pixels[0].shape)
+        if (
+            len(pixel_shape) != 5
+            or pixel_shape[:3] != (1, 3, 1)
+            or min(pixel_shape[-2:]) < 1
+            or any(value % 32 for value in pixel_shape[-2:])
+            or any(
+                value.device.type != "cpu"
+                or value.dtype != torch.float32
+                or not value.is_contiguous()
+                or tuple(value.shape) != pixel_shape
+                for value in pixels
+            )
+        ):
+            return tuple(self.encode(frame) for frame in pixels)
+        if collective.closed:
+            raise RuntimeError("Frame exchange cannot use a closed collective")
+        size, rank = collective.size, collective.rank
+        indexes = range(rank, len(pixels), size)
+        first = self.encode(pixels[indexes[0]])
+        shape, elements = tuple(first.shape), first.numel()
+        slots = (len(pixels) + size - 1) // size
+        columns = slots * elements
+        packed_bytes = columns * first.element_size()
+        metadata = (
+            shape,
+            first.dtype,
+            columns,
+            packed_bytes,
+            first.dtype == collective.dtype == torch.bfloat16
+            and first.is_cuda
+            and first.device.index == collective.device
+            and elements > 0
+            and columns % 8 == 0
+            and packed_bytes <= collective.max_bytes,
+        )
+        key = (
+            collective,
+            size,
+            len(pixels),
+            pixel_shape,
+            pixels[0].dtype,
+            collective.max_bytes,
+            collective.dtype,
+        )
+        # First-owned encode can invalidate VAE state; reach consensus after it.
+        if key not in self.frame_layouts:
+            peers = collective._gather(metadata)
+            allowed = all(peer == metadata and peer[-1] for peer in peers)
+            self.frame_layouts[key] = (allowed, metadata)
+            if len(self.frame_layouts) > 8:
+                self.frame_layouts.popitem(last=False)
+        self.frame_layouts.move_to_end(key)
+        allowed, expected = self.frame_layouts[key]
+        if metadata != expected:
+            raise RuntimeError("VAE frame metadata changed after collective admission")
+        if not allowed:
+            return tuple(self.encode(frame) for frame in pixels)
+        local = [first, *(self.encode(pixels[index]) for index in indexes[1:])]
+        packed = first.new_zeros((1, columns))
+        for slot, value in enumerate(local):
+            if (
+                tuple(value.shape) != shape
+                or value.dtype != first.dtype
+                or value.device != first.device
+            ):
+                raise RuntimeError("VAE frame metadata changed within one observation")
+            packed[0, slot * elements : (slot + 1) * elements].copy_(value.reshape(-1))
+        gathered = collective.gather(packed).view(size, slots, *shape)
+        return tuple(
+            gathered[index % size, index // size].clone()
+            for index in range(len(pixels))
+        )
 
     def _stage_normalization(self, device: torch.device) -> None:
         super()._stage_normalization(device)
