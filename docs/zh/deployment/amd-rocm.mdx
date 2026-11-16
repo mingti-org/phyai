@@ -61,6 +61,8 @@ engine = Engine(
 )
 ```
 
+在 MI300X 上，用 LIBERO 两相机输入（`lerobot/pi05_base`、bf16、batch 1、10 步去噪）跑一步 PI0.5，eager 模式 213.9 ms，CUDA Graph 42.8 ms（`engine.step`，20 次预热后 50 次的 p50）。
+
 ## 限制
 
 - 没有 aiter 时，paged attention、GEMM、RMSNorm、RoPE 与门控 GELU 回落到 Torch reference 或 SDPA 的行，PI0.5 的 CUDA Graph setup 会失败：`sdpa.attention_paged` 的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移。

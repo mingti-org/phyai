@@ -60,6 +60,9 @@ engine = Engine(
     )
 )
 ```
+
+On MI300X, one PI0.5 step with the LIBERO 2-camera input (`lerobot/pi05_base`, bf16, batch 1, 10 denoising steps) takes 213.9 ms in eager mode and 42.8 ms with CUDA Graph (`engine.step`, p50 of 50 steps after 20 warmup steps).
+
 ## Limitations
 
 - Without aiter, paged attention, GEMM, RMSNorm, RoPE, and gated GELU fall back to their Torch reference or SDPA rows, and CUDA Graph setup fails for PI0.5: `sdpa.attention_paged` cannot replay changed sequence offsets between PI0.5's prefix buckets.
