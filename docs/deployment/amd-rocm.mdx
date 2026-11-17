@@ -1,0 +1,71 @@
+---
+title: "AMD ROCm (experimental)"
+description: "Install PhyAI from source on AMD Instinct GPUs and run PI0.5 with CUDA Graph."
+---
+
+PhyAI runs PI0.5 on AMD Instinct MI300X (gfx942) in eager and CUDA Graph mode. On AMD, the kernel selector picks [aiter](https://github.com/ROCm/aiter) rows for paged attention, bf16 GEMM, RMSNorm, RoPE, and gated GELU, and PhyAI's Triton kernel for AdaRMSNorm.
+
+Tested on MI300X with the `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` image (ROCm 7.2, Python 3.12, `torch==2.11.0+rocm7.2`, aiter 0.1.26). MI355X and other Instinct GPUs, and other images, are untested.
+
+## Install from source
+
+Start the image with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`). It ships ROCm builds of Torch, TorchVision, Triton, and aiter in `/opt/venv`, at the Torch versions PhyAI pins.
+
+`phyai/pyproject_amd.toml` and `phyai-kernel/pyproject_amd.toml` declare the same dependencies as the default `pyproject.toml` files without the CUDA-only packages. Copy them over the defaults, then install the workspace packages into the image's environment:
+
+```bash
+git clone https://github.com/mingti-org/phyai.git
+cd phyai
+cp phyai/pyproject_amd.toml phyai/pyproject.toml
+cp phyai-kernel/pyproject_amd.toml phyai-kernel/pyproject.toml
+source /opt/venv/bin/activate
+pip install uv
+uv pip install -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+| Left out on AMD | Why |
+| --- | --- |
+| `flashinfer-python`, `humming-kernels`, `flash-qla` | CUDA-only. They are imported lazily, and the kernel selector skips their rows when they are missing. |
+| `nvidia-ml-py` | NVML is NVIDIA-only. |
+| `torch-c-dlpack-ext` | It ships only CPU and CUDA addons and picks the CUDA one on ROCm, so `import phyai_ext` fails on the missing `libtorch_cuda.so`. Without it, `apache-tvm-ffi` builds a ROCm addon on first use. |
+
+`phyai-ext` builds from source with the same CMake setup as on CUDA. Do not run `uv sync` or plain `uv run`: they resolve the default `uv.lock` and reinstall the CUDA builds.
+
+## Check the install
+
+```bash
+python -c "import torch, aiter, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+phyai-kernel show-env
+```
+
+## Run PI0.5
+
+ROCm exposes the GPU as a `cuda` device in Torch, so `DeviceConfig(target="cuda")` selects it, and CUDA Graph works with the default `RuntimeConfig`:
+
+```python
+from phyai import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 2,
+        ),
+        config=EngineConfig(device=DeviceConfig(target="cuda")),
+    )
+)
+```
+
+On MI300X, one PI0.5 step with the LIBERO 2-camera input (`lerobot/pi05_base`, bf16, batch 1, 10 denoising steps) takes 213.9 ms in eager mode and 42.8 ms with CUDA Graph (`engine.step`, p50 of 50 steps after 20 warmup steps).
+
+## Limitations
+
+- Without aiter, paged attention, GEMM, RMSNorm, RoPE, and gated GELU fall back to their Torch reference or SDPA rows, and CUDA Graph setup fails for PI0.5: `sdpa.attention_paged` cannot replay changed sequence offsets between PI0.5's prefix buckets.
+- Layernorm, embedding, and plain GELU stay on their Torch rows on AMD. The bundled aiter GEMM tuning table covers four PI0.5 shapes on MI300X; aiter runs other shapes through Torch.
+- FlashInfer, humming quantization (NVFP4), and vGPU green contexts are unavailable.
+- `pytest phyai/tests/kernel` has 27 failures on ROCm: the tests expect FlashInfer or NVIDIA-only Triton rows, and `op='moe'` has no row on ROCm. A follow-up PR will fix them.

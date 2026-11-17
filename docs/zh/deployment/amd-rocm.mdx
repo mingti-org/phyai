@@ -1,0 +1,71 @@
+---
+title: "AMD ROCm（实验性）"
+description: "在 AMD Instinct GPU 上从源码安装 PhyAI，并以 CUDA Graph 运行 PI0.5。"
+---
+
+PhyAI 在 AMD Instinct MI300X（gfx942）上以 eager 与 CUDA Graph 模式运行 PI0.5。AMD 上，kernel selector 为 paged attention、bf16 GEMM、RMSNorm、RoPE 与门控 GELU 选 [aiter](https://github.com/ROCm/aiter) 的行，AdaRMSNorm 选 PhyAI 的 Triton kernel。
+
+已在 MI300X 上用 `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` 镜像测试（ROCm 7.2、Python 3.12、`torch==2.11.0+rocm7.2`、aiter 0.1.26）。MI355X 等其它 Instinct GPU 以及其它镜像未测试。
+
+## 从源码安装
+
+启动镜像并透传 GPU 设备（`--device=/dev/kfd --device=/dev/dri`）。镜像在 `/opt/venv` 里带 ROCm 版 Torch、TorchVision、Triton 与 aiter，Torch 版本与 PhyAI 固定的版本一致。
+
+`phyai/pyproject_amd.toml` 与 `phyai-kernel/pyproject_amd.toml` 声明的依赖与默认的 `pyproject.toml` 相同，只去掉了仅支持 CUDA 的包。把它们拷成默认文件，再把 workspace 包装进镜像的环境：
+
+```bash
+git clone https://github.com/mingti-org/phyai.git
+cd phyai
+cp phyai/pyproject_amd.toml phyai/pyproject.toml
+cp phyai-kernel/pyproject_amd.toml phyai-kernel/pyproject.toml
+source /opt/venv/bin/activate
+pip install uv
+uv pip install -e ./phyai -e ./phyai-kernel -e ./phyai-ext -e ./phyai-gateway \
+  -e ./phyai-utils-tools -e ./phyai-model-optimizer
+```
+
+| AMD 上不装的包 | 原因 |
+| --- | --- |
+| `flashinfer-python`、`humming-kernels`、`flash-qla` | 仅支持 CUDA。它们是惰性导入的，缺失时 kernel selector 会跳过对应的行。 |
+| `nvidia-ml-py` | NVML 只支持 NVIDIA。 |
+| `torch-c-dlpack-ext` | 只带 CPU 与 CUDA 两种 addon，在 ROCm 上会选中 CUDA 版，`import phyai_ext` 因缺少 `libtorch_cuda.so` 失败。不装它时，`apache-tvm-ffi` 会在首次使用时编译 ROCm addon。 |
+
+`phyai-ext` 使用与 CUDA 相同的 CMake 配置从源码构建。不要运行 `uv sync` 或普通的 `uv run`：它们按默认的 `uv.lock` 解析，会装回 CUDA 版。
+
+## 检查安装
+
+```bash
+python -c "import torch, aiter, phyai, phyai_ext; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+phyai-kernel show-env
+```
+
+## 运行 PI0.5
+
+ROCm 在 Torch 中把 GPU 暴露为 `cuda` 设备，因此 `DeviceConfig(target="cuda")` 即可选中它，默认的 `RuntimeConfig` 即开启 CUDA Graph：
+
+```python
+from phyai import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig
+from phyai.models.pi05.main_pi05 import PI05Args
+
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir="/path/to/pi05_base/",
+            max_batch_size=1,
+            inputs_image_shape=[[224, 224, 3]] * 2,
+        ),
+        config=EngineConfig(device=DeviceConfig(target="cuda")),
+    )
+)
+```
+
+在 MI300X 上，用 LIBERO 两相机输入（`lerobot/pi05_base`、bf16、batch 1、10 步去噪）跑一步 PI0.5，eager 模式 213.9 ms，CUDA Graph 42.8 ms（`engine.step`，20 次预热后 50 次的 p50）。
+
+## 限制
+
+- 没有 aiter 时，paged attention、GEMM、RMSNorm、RoPE 与门控 GELU 回落到 Torch reference 或 SDPA 的行，PI0.5 的 CUDA Graph setup 会失败：`sdpa.attention_paged` 的 graph 重放不能在 PI0.5 的前缀 bucket 之间改变序列偏移。
+- AMD 上 layernorm、embedding 与非门控 GELU 仍走 Torch 的行。随包的 aiter GEMM 调优表只覆盖 MI300X 上 PI0.5 的四个形状，其它形状由 aiter 转交 Torch。
+- FlashInfer、humming 量化（NVFP4）与 vGPU green context 不可用。
+- `pytest phyai/tests/kernel` 在 ROCm 上有 27 个失败：这些用例期望选中 FlashInfer 或仅限 NVIDIA 的 Triton 行，`op='moe'` 在 ROCm 上没有可用的行；后续 PR 会解决。

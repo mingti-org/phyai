@@ -1,0 +1,44 @@
+[project]
+name = "phyai"
+dynamic = ["version"]
+description = "phyai — Physical AI. Main library."
+requires-python = ">=3.12"
+dependencies = [
+    "phyai-ext",
+    "phyai-gateway",
+    "phyai-kernel",
+    "phyai-utils-tools",
+    "numpy",
+    "torch==2.11.0",
+    "safetensors",
+    "torchvision==0.26.0",
+    "flash-linear-attention>=0.5.1",
+    "transformers==5.8.1",
+    "huggingface-hub",
+    "gradio>=6.30.0,<7",
+    "tqdm",
+    "pyyaml",
+    "setproctitle",
+]
+
+[project.scripts]
+phyai = "phyai.cli:main"
+
+[project.optional-dependencies]
+fastokenizer = ["fastokens>=0.2.0"]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "..", fallback_version = "0.1.0" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phyai"]
+
+[tool.uv.sources]
+phyai-kernel = { workspace = true }
+phyai-ext = { workspace = true }
+phyai-gateway = { workspace = true }
