@@ -67,6 +67,30 @@ class Cosmos3VAERunner(ModelRunner):
         )
 
     @torch.no_grad()
+    def encode_conditioning(
+        self,
+        pixels: torch.Tensor,
+        *,
+        latent_frames: int,
+        frame_indexes: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        from phyai.models.cosmos3.conditioning_cosmos3 import conditioning_pixel_count
+
+        if (
+            type(self.vae) is Cosmos3WanVAE
+            and pixels.ndim == 5
+            and pixels.shape[0] == 1
+        ):
+            count = conditioning_pixel_count(
+                pixels.shape[2],
+                latent_frames,
+                frame_indexes,
+                self.vae.scale_factor_temporal,
+            )
+            pixels = pixels[:, :, :count]
+        return self.encode(pixels)
+
+    @torch.no_grad()
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode is the canonical hot path; ``forward`` aliases :meth:`decode`."""
         return self.decode(latents)

@@ -70,3 +70,8 @@ Frames 0, 8, and 16: Cosmos Framework on top, PHYAI below. With the same checkpo
 and inputs, decoded video PSNR is 49.03 dB.
 
 ![Cosmos Framework and PHYAI AgiBot outputs at frames 0, 8, and 16](assets/agibot_comparison.jpg)
+
+## Eager policy options
+
+For opt-in policy configuration and fallback contracts, see
+[eager policy options](policy-eager-optimizations.md).
