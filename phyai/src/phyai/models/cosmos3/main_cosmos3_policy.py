@@ -45,6 +45,8 @@ class Cosmos3PolicyArgs(EntryArgs):
     use_karras_sigmas: bool | None = None
     decode_video: bool = False
     weight_strict: bool = False
+    conditioning_prefix: bool = False
+    fuse_eager_attention: bool = False
 
 
 @Engine.register
@@ -78,8 +80,21 @@ class Cosmos3PolicyEntry(Entry):
                 "Cosmos3PolicyArgs.checkpoint_dir is required (no random-weight debug "
                 "path for a diffusion checkpoint this size)."
             )
-        ckpt = Path(args.checkpoint_dir)
         eng = get_engine_config()
+        from phyai.models.cosmos3.parallel_cosmos3 import group_rank_size
+
+        single_rank = all(group_rank_size(name)[1] == 1 for name in ("dense_tp", "cfg"))
+        fast_paths = single_rank and not eng.runtime.use_cuda_graph
+        if eng.runtime.use_cuda_graph and any(
+            (
+                args.conditioning_prefix,
+                args.fuse_eager_attention,
+            )
+        ):
+            logger.warning_once(
+                "Cosmos3 opt-in paths require Graph to be disabled; using the configured Graph path."
+            )
+        ckpt = Path(args.checkpoint_dir)
         device = eng.device.target
         dtype = eng.device.params_dtype
         self.decode_video = bool(args.decode_video)
@@ -100,7 +115,7 @@ class Cosmos3PolicyEntry(Entry):
             strict=args.weight_strict,
         )
 
-        if self.decode_video:
+        if self.decode_video or args.conditioning_prefix:
             vae_config = load_config(ckpt / "vae", Cosmos3WanVAEConfig)
             self.vae = Cosmos3WanVAE(vae_config)
             load_pretrained(
@@ -119,6 +134,8 @@ class Cosmos3PolicyEntry(Entry):
             flow_shift=args.flow_shift,
             use_karras_sigmas=use_karras,
             use_cuda_graph=eng.runtime.use_cuda_graph,
+            conditioning_prefix=args.conditioning_prefix and fast_paths,
+            fuse_eager_attention=args.fuse_eager_attention and fast_paths,
         )
         self.scheduler.setup()
         logger.info_rank0(
