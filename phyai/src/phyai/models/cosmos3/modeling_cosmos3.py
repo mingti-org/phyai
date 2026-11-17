@@ -503,6 +503,10 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_sin: torch.Tensor,
         attention_context: AttnCtx | None = None,
         attention_preparation: Cosmos3AttentionPreparation | None = None,
+        residual_norm: Callable[
+            [torch.Tensor, torch.Tensor, RMSNorm], tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -515,11 +519,14 @@ class Cosmos3GenDecoderLayer(nn.Module):
             attention_context,
             attention_preparation,
         )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-        return hidden_states
+        if residual_norm is None:
+            residual = residual + hidden_states
+            hidden_states = self.post_attention_layernorm(residual)
+        else:
+            hidden_states, residual = residual_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+        return residual + self.mlp(hidden_states)
 
 
 class Cosmos3LanguageModel(nn.Module):
@@ -596,6 +603,12 @@ class Cosmos3Condition:
     sound_len: int = 0
     attention_contexts: tuple[AttnCtx, ...] | None = None
     attention_preparation: Cosmos3AttentionPreparation | None = None
+    residual_norm: (
+        Callable[
+            [torch.Tensor, torch.Tensor, RMSNorm], tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None
+    ) = None
 
 
 class Cosmos3Transformer(nn.Module):
@@ -1035,6 +1048,7 @@ class Cosmos3Transformer(nn.Module):
                 freqs_sin,
                 context,
                 condition.attention_preparation,
+                condition.residual_norm,
             )
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
