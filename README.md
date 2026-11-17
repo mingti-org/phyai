@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
-- [2026/11] Support inference on [AMD Instinct MI300X](https://phyai.mintlify.app/deployment/amd-rocm) (experimental).
+- [2026/11] With the support of the AMD AIG Team, PhyAI supports inference on [AMD Instinct MI300X](https://phyai.mintlify.app/deployment/amd-rocm) (experimental).
 - [2026/11] Support [VPP2](https://phyai.mintlify.app/models/vpp2/inference) action and video inference with TP and video CFG parallelism.
 - [2026/11] 🤗 Support [HumanWAM-Goal](https://phyai.mintlify.app/models/humanwam-goal/inference), [arxiv](https://arxiv.org/pdf/2611.06817).
 - [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
@@ -189,21 +189,24 @@ We thank the contributors below and welcome more developers to join us in buildi
 
 ## Sponsors & Adoption
 
-PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti, ModelBest and RLInf.
+PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti, ModelBest, RLInf and AMD.
 
 We are actively seeking partnerships with compute providers, chip vendors, and robotics companies. If you are interested in working with us, please [contact us](#contact).
 
 <table align="center" width="80%">
   <tbody>
     <tr>
-      <td align="center" width="30%">
+      <td align="center" width="25%">
         <img src="assets/mingti-new.png" alt="Mingti" width="240">
       </td>
-      <td align="center" width="30%">
+      <td align="center" width="25%">
         <img src="assets/modelbest.svg" alt="ModelBest" width="240">
       </td>
-      <td align="center" width="30%">
+      <td align="center" width="25%">
         <img src="assets/logo_white.svg" alt="RLInf" width="240">
+      </td>
+      <td align="center" width="25%">
+        <img src="assets/amd.svg" alt="AMD" width="240">
       </td>
     </tr>
   </tbody>
