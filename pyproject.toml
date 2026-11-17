@@ -22,7 +22,7 @@ length-sort = true
 package = false
 
 [tool.uv.workspace]
-members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools", "phyai-gateway"]
+members = ["phyai", "phyai-kernel", "phyai-ext", "phyai-model-optimizer", "phyai-utils-tools", "phyai-robot", "phyai-gateway"]
 
 [tool.uv.sources]
 phyai = { workspace = true }
@@ -30,9 +30,14 @@ phyai-kernel = { workspace = true }
 phyai-ext = { workspace = true }
 phyai-model-optimizer = { workspace = true }
 phyai-utils-tools = { workspace = true }
+phyai-robot = { workspace = true }
 phyai-gateway = { workspace = true }
 
 [dependency-groups]
+deployment = [
+    "omegaconf>=2.3,<2.4",
+    "phyai-robot[zmq,images,video]",
+]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
@@ -53,6 +58,8 @@ testpaths = [
     "phyai-ext/tests",
     "phyai-model-optimizer/tests",
     "phyai-utils-tools/tests",
+    "phyai-robot/tests",
+    "examples/deployment/tests",
 ]
 pythonpath = [
     "phyai/src",
@@ -60,4 +67,5 @@ pythonpath = [
     "phyai-ext/src",
     "phyai-model-optimizer/src",
     "phyai-utils-tools/src",
+    "phyai-robot/src",
 ]
