@@ -47,6 +47,8 @@ class VPP2Args(EntryArgs):
     load_encoders: bool = True
     torch_compile: bool = False
     use_cuda_graph: bool = True
+    # Reuse the T5 output while the prompt tokens do not change.
+    cache_text_encoding: bool = False
     progress: bool = False
 
 
@@ -204,6 +206,7 @@ class VPP2Entry(Entry):
                 device=engine.device.target,
                 dtype=engine.device.params_dtype,
                 use_cuda_graph=args.use_cuda_graph and engine.runtime.use_cuda_graph,
+                cache_text_encoding=args.cache_text_encoding,
             )
         runner = VPP2Runner(
             self.model,
