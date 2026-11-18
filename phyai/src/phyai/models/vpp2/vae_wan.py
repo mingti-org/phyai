@@ -16,6 +16,11 @@ from phyai.layers.conv import Conv2d, Conv3d
 from phyai.layers.attention.nocache.layer import Attention
 from phyai.models.vpp2.configuration_encoders import VPP2VAEConfig
 
+# The FP32 VAE keeps normalization in FP32. Restoring the input dtype is a
+# no-op here and makes the existing fused affine epilogue eligible. Backend
+# selection still follows the active kernel policy.
+_RESTORE_L2_INPUT_DTYPE = True
+
 
 @dataclass
 class WanVAECache:
@@ -47,16 +52,77 @@ class CausalConv3d(Conv3d):
         )
         self.padding = (0, 0, 0)
 
+    @staticmethod
+    def _can_fuse_pad(
+        x: torch.Tensor, cache_x: torch.Tensor | None, padding: list[int]
+    ) -> bool:
+        """Whether ``cat([cache_x, x])`` + ``F.pad`` can be one buffer fill."""
+        if x.ndim != 5 or padding[4] < 0 or padding[5] != 0:
+            return False
+        if cache_x is None:
+            return True
+        return (
+            cache_x.ndim == 5
+            and cache_x.dtype == x.dtype
+            and cache_x.device == x.device
+            and cache_x.shape[:2] == x.shape[:2]
+            and cache_x.shape[3:] == x.shape[3:]
+        )
+
+    @staticmethod
+    def _pad_with_cache(
+        x: torch.Tensor, cache_x: torch.Tensor | None, padding: list[int]
+    ) -> torch.Tensor:
+        """Build the zero-padded conv input without the intermediate concat.
+
+        The result holds ``[zeros, cache_x, x]`` along time and zeros around the
+        spatial border, which is exactly what ``F.pad(cat([cache_x, x]))``
+        produces. Only data movement changes, so the values are identical.
+        """
+        left, right, top, bottom, front, _ = padding
+        batch, channels, frames, height, width = x.shape
+        cached = 0 if cache_x is None else cache_x.shape[2]
+        if not (left or right or top or bottom or front):
+            # Nothing to pad: the concat alone already is the padded input.
+            return torch.cat([cache_x, x], dim=2)
+        out = x.new_zeros(
+            (
+                batch,
+                channels,
+                front + cached + frames,
+                height + top + bottom,
+                width + left + right,
+            )
+        )
+        rows = slice(top, top + height)
+        cols = slice(left, left + width)
+        if cached:
+            out[:, :, front : front + cached, rows, cols].copy_(cache_x)
+        out[:, :, front + cached :, rows, cols].copy_(x)
+        return out
+
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and padding[4] > 0:
-            x = torch.cat([cache_x, x], dim=2)
+        use_cache = cache_x is not None and padding[4] > 0
+        if use_cache:
             padding[4] -= cache_x.shape[2]
-        return super().forward(F.pad(x, padding))
+        # With no cache and no padding the reference path clones ``x``; keep it
+        # so the conv input strides stay exactly as before.
+        if (use_cache or any(padding)) and self._can_fuse_pad(
+            x, cache_x if use_cache else None, padding
+        ):
+            padded = self._pad_with_cache(x, cache_x if use_cache else None, padding)
+        else:
+            if use_cache:
+                x = torch.cat([cache_x, x], dim=2)
+            padded = F.pad(x, padding)
+        return super().forward(padded)
 
     def forward_cached(self, x: torch.Tensor, cache: WanVAECache) -> torch.Tensor:
         index, previous = cache.next()
-        history = x[:, :, -2:].clone()
+        # ``x`` is a fresh activation that no later op modifies in place, so the
+        # cached history can be a view instead of a copy.
+        history = x[:, :, -2:]
         if history.shape[2] < 2 and previous is not None:
             history = torch.cat([previous[:, :, -1:], history], dim=2)
         output = self(x, previous)
@@ -140,10 +206,12 @@ class Resample(nn.Module):
 
         if self.mode == "downsample3d":
             index, previous = cache.next()
+            # ``x`` is the resample output and is only read afterwards (the next
+            # block never writes in place), so views are enough for the cache.
             if previous is None:
-                cache.values[index] = x.clone()
+                cache.values[index] = x
             else:
-                history = x[:, :, -1:].clone()
+                history = x[:, :, -1:]
                 x = self.time_conv(torch.cat([previous[:, :, -1:], x], dim=2))
                 cache.values[index] = history
         return x
@@ -158,7 +226,7 @@ class ResidualBlock(nn.Module):
             spatial_dims=3,
             dtype=torch.float32,
             compute_dtype=None,
-            restore_input_dtype=False,
+            restore_input_dtype=_RESTORE_L2_INPUT_DTYPE,
             device=device,
             prefix=f"{prefix}.residual.0",
         )
@@ -170,7 +238,7 @@ class ResidualBlock(nn.Module):
             spatial_dims=3,
             dtype=torch.float32,
             compute_dtype=None,
-            restore_input_dtype=False,
+            restore_input_dtype=_RESTORE_L2_INPUT_DTYPE,
             device=device,
             prefix=f"{prefix}.residual.3",
         )
@@ -201,7 +269,7 @@ class AttentionBlock(nn.Module):
             spatial_dims=2,
             dtype=torch.float32,
             compute_dtype=None,
-            restore_input_dtype=False,
+            restore_input_dtype=_RESTORE_L2_INPUT_DTYPE,
             device=device,
             prefix=f"{prefix}.norm",
         )
@@ -294,7 +362,7 @@ class Encoder3d(nn.Module):
             spatial_dims=3,
             dtype=torch.float32,
             compute_dtype=None,
-            restore_input_dtype=False,
+            restore_input_dtype=_RESTORE_L2_INPUT_DTYPE,
             device=device,
             prefix=f"{prefix}.head.0",
         )
@@ -358,7 +426,7 @@ class Decoder3d(nn.Module):
             spatial_dims=3,
             dtype=torch.float32,
             compute_dtype=None,
-            restore_input_dtype=False,
+            restore_input_dtype=_RESTORE_L2_INPUT_DTYPE,
             device=device,
             prefix=f"{prefix}.head.0",
         )

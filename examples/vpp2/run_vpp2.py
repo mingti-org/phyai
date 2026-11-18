@@ -67,6 +67,12 @@ def main() -> None:
     )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
+        "--text-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Opt in to reusing T5 output while the prompt tokens stay the same.",
+    )
+    parser.add_argument(
         "--kernel-config",
         type=Path,
         help="Kernel policy YAML; defaults to the action or video policy beside this script.",
@@ -124,6 +130,7 @@ def main() -> None:
                 cache_dir=args.cache_dir,
                 torch_compile=args.compile,
                 use_cuda_graph=args.cuda_graph,
+                cache_text_encoding=args.text_cache,
             ),
         ),
         deployment=DeploymentConfig.external(),

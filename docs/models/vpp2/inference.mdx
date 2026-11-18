@@ -89,6 +89,13 @@ reuse one `Engine`; see `examples/vpp2/run_vpp2.py` for the Python API and clean
 When constructing the engine yourself, pass the matching YAML through
 `KernelConfig(config_path=...)` in `EngineConfig.kernel`.
 
+Text encoding cache is disabled by default. For a long-lived runner with repeated
+instructions, pass `--text-cache` to reuse identical T5 outputs; use
+`--no-text-cache` to force the default path. The cache is bounded to eight entries,
+and each distinct instruction still runs T5 once. Keep the cache disabled when
+encoder weights, device, output dtype, or execution configuration changes within
+one runner lifetime.
+
 ## Performance
 
 RoboDojo measurements use one **NVIDIA H200** GPU, `240 × 416` resolution,
