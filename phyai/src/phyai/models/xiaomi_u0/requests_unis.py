@@ -10,7 +10,10 @@ import torch
 
 @dataclass(frozen=True)
 class UNISGenerationRequest:
-    """One tokenized 64-by-64 T2I request; replay is for regression only."""
+    """One tokenized image request; replay is for regression only.
+
+    Scene Gen samples the output dimensions and stops at the first image end.
+    """
 
     input_ids: torch.Tensor
     unconditional_ids: torch.Tensor
@@ -18,6 +21,7 @@ class UNISGenerationRequest:
     seed: int = 42
     replay_ids: torch.Tensor | None = None
     capture_steps: tuple[int, ...] = ()
+    scene_gen: bool = False
 
 
 @dataclass(frozen=True)

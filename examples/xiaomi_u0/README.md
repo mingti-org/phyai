@@ -1,6 +1,6 @@
-# Xiaomi U0 image generation and editing
+# Xiaomi U0 image and scene generation
 
-Generate a 1024 × 1024 image from text, or edit one reference image with a text instruction. PhyAI runs Xiaomi-Robotics-U0-4B with BF16 and FlashInfer paged attention. The native Emu3.5 encoder and decoder use the released FP32 weights.
+Generate an image from text, edit a reference image, or generate a multi-view robot scene. PhyAI runs Xiaomi-Robotics-U0-4B with BF16 and FlashInfer paged attention. The native Emu3.5 encoder and decoder use the released FP32 weights.
 
 You need one CUDA GPU, the repository runtime, and two local checkpoints:
 
@@ -70,6 +70,24 @@ Open `outputs/u0-stoneware/image.png`. The output directory also contains `refer
 | --- | --- |
 | ![Cream ceramic teapot on a wooden table](../../docs/images/models/xiaomi-u0/teapot-stoneware-reference.png) | ![Speckled stoneware teapot filling more of the square frame](../../docs/images/models/xiaomi-u0/teapot-stoneware-result.png) |
 
+## Generate a robot scene
+
+Pass `--task scene-gen` and describe the robot workspace, objects, lighting, and background. The prompt requests one RGB image with one full-size view above two half-size views. The model determines the output dimensions.
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir /path/to/Xiaomi-Robotics-U0-4B \
+  --vision-tokenizer-dir /path/to/Emu3.5-VisionTokenizer \
+  --task scene-gen \
+  --robot-arm-type "AgiBot G1" \
+  --prompt "Workspace: A wooden workbench. Objects: A red mug to the left of a blue tray. Lighting: Soft overhead light. Background: White shelves with clear storage bins." \
+  --output-dir ./outputs/u0-scene \
+  --seed 42
+```
+
+Open `outputs/u0-scene/image.png` for the composite image. In `generation.json`, `image_end` indicates that generation reached the end of the image and `image_grid_shape` gives the token grid height and width. Scene Gen defaults to an 8192-token budget. Larger grids may need a higher `--max-new-tokens` setting and more GPU memory. Use `--prepare-only` to save the two prompts as token arrays without loading the model.
+
 ## Text-to-image examples
 
 These images were generated on Thor with seed 42, using FlashInfer and the native PhyAI decoder.
@@ -96,7 +114,7 @@ To reproduce the camera or gripper, use its prompt in the generation command abo
 
 ## Supported configuration
 
-The example processes one request on one GPU with CUDA Graph disabled. It generates a fixed 64 × 64 output code grid and uses no-text classifier-free guidance at scale 3. For image editing, both guidance branches receive the reference image.
+The example processes one request on one GPU with CUDA Graph disabled. T2I and X2I generate a fixed 64 × 64 output code grid with no-text classifier-free guidance at scale 3. For image editing, both guidance branches receive the reference image. Scene Gen uses scale 2 and samples the grid dimensions.
 
 ## Validation
 

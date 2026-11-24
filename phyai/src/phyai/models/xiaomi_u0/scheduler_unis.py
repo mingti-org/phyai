@@ -48,7 +48,7 @@ def _image_sampling_scores(
 
 
 class _HeaderTokenizer:
-    """Only the tokenizer operations used by the fixed 64-by-64 processor."""
+    """Encode fixed headers and decode model-selected grid dimensions."""
 
     def __init__(self, mapping: dict[str, list[int]]) -> None:
         """Validate and copy the released fixed-grid digit and delimiter mappings."""
@@ -74,12 +74,12 @@ class _HeaderTokenizer:
         return self.mapping[text].copy()
 
     def decode(self, tokens: list[int] | torch.Tensor) -> str:
-        """Return the unique header string matching the supplied token sequence."""
+        """Decode individual digit and delimiter IDs in a dimension header."""
         values = tokens.tolist() if isinstance(tokens, torch.Tensor) else list(tokens)
-        matches = [key for key, ids in self.mapping.items() if ids == values]
-        if len(matches) != 1:
-            raise ValueError("Header tokens do not have a unique mapping.")
-        return matches[0]
+        symbols = {ids[0]: text for text, ids in self.mapping.items() if len(ids) == 1}
+        if any(token not in symbols for token in values):
+            raise ValueError("Invalid U0 dimension header token.")
+        return "".join(symbols[token] for token in values)
 
 
 def _seed_request(device: torch.device, seed: int) -> None:
@@ -169,10 +169,10 @@ class _Branch:
 
 
 class UNISGenerationScheduler(Scheduler):
-    """Own CFG branches, processing, sampling and EOS termination.
+    """Own CFG branches, processing, sampling and termination.
 
-    Supports one unpadded, tokenized T2I or X2I request,
-    a fixed 64-by-64 visual grid and no_text CFG. Image decode is separate.
+    Supports fixed-grid T2I and X2I and model-selected grids for Scene Gen.
+    Image decode is separate.
     """
 
     def __init__(
@@ -207,14 +207,15 @@ class UNISGenerationScheduler(Scheduler):
 
     @torch.inference_mode()
     def step(self, request: UNISGenerationRequest) -> UNISGenerationResult:
-        """Reset branch caches and generate one fixed-grid request until EOS or the limit.
+        """Reset branch caches and generate the requested token sequence.
 
         Sampling uses a forked CPU/CUDA RNG state seeded for this request.
         Regression replay substitutes supplied tokens for sampling and marks
         the result accordingly. Returned CPU IDs exclude the prompt; the final
         sampled or replayed token is not fed back for another model forward.
-        EOS requires the complete generated image trailer. Captured processor
-        scores remain distinct from constrained sampling scores.
+        T2I and X2I require the complete image trailer before EOS. Scene Gen
+        stops at EOI or EOS. Captured processor scores remain distinct from
+        constrained sampling scores.
         """
         if not self._ready:
             raise RuntimeError("Call setup before U0 generation.")
@@ -256,16 +257,18 @@ class UNISGenerationScheduler(Scheduler):
             runner.reset()
         device = self.runners[0].device
         conditional, unconditional = (_Branch(runner) for runner in self.runners)
+        fixed_grid = not request.scene_gen
+        grid_size = 64 if fixed_grid else None
         processor = UnbatchedClassifierFreeGuidanceLogitsForVisualTokenWithDifferentialTopKProcessor(
-            guidance_scale=3.0,
+            guidance_scale=3.0 if fixed_grid else 2.0,
             model=unconditional,
             tokenizer=self.tokenizer,
             unconditional_ids=request.unconditional_ids.to(device),
             use_cache=True,
             unconditional_type="no_text",
-            target_height=64,
-            target_width=64,
-            force_same_image_size=True,
+            target_height=grid_size,
+            target_width=grid_size,
+            force_same_image_size=fixed_grid,
             image_cfg_scale=1.0,
             use_differential_sampling=True,
             text_top_k=1024,
@@ -294,7 +297,11 @@ class UNISGenerationScheduler(Scheduler):
                     )
                 sampling_scores = None
                 if replay is None:
-                    sampling_scores = _image_sampling_scores(scores, generated)
+                    sampling_scores = (
+                        _image_sampling_scores(scores, generated)
+                        if fixed_grid
+                        else scores
+                    )
                     cutoff = sampling_scores.topk(131072, dim=-1).values[:, -1:]
                     sampling_scores = sampling_scores.masked_fill(
                         sampling_scores < cutoff, -torch.inf
@@ -329,13 +336,16 @@ class UNISGenerationScheduler(Scheduler):
                     # Teacher forcing diagnoses numerical correctness; it is not sampling.
                     query = replay[step : step + 1].to(device).reshape(1, 1)
                 token = int(query.item())
-                if token == EOS and not _image_trailer_ready(generated):
+                if fixed_grid and token == EOS and not _image_trailer_ready(generated):
                     raise ValueError(
                         "EOS requires the complete fixed-image EOI and ESS trailer."
                     )
                 generated.append(token)
                 if step % 64 == 0:
                     logger.info("U0 generation tokens=%d", len(generated))
+                if request.scene_gen and token == EOI:
+                    reason = "image_end"
+                    break
                 if token == EOS:
                     reason = "eos"
                     break
