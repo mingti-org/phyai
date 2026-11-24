@@ -95,7 +95,8 @@
                 "group": "Xiaomi U0",
                 "pages": [
                   "models/xiaomi-u0/text-to-image",
-                  "models/xiaomi-u0/image-editing"
+                  "models/xiaomi-u0/image-editing",
+                  "models/xiaomi-u0/scene-generation"
                 ]
               },
               {
@@ -219,7 +220,8 @@
                 "group": "Xiaomi U0",
                 "pages": [
                   "zh/models/xiaomi-u0/text-to-image",
-                  "zh/models/xiaomi-u0/image-editing"
+                  "zh/models/xiaomi-u0/image-editing",
+                  "zh/models/xiaomi-u0/scene-generation"
                 ]
               },
               {

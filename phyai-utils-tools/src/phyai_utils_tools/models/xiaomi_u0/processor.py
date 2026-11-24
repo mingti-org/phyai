@@ -16,6 +16,15 @@ TEMPLATE = "<|extra_203|>You are a helpful assistant for t2i task. USER: {text} 
 X2I_PREFIX = "<|extra_203|>You are a helpful assistant. USER: "
 X2I_SUFFIX = " ASSISTANT: <|extra_100|>"
 
+# Scene Gen prompt from Xiaomi-Robotics-U0's Apache-2.0 inference configs.
+SCENE_SYSTEM_PROMPT = (
+    "You are an advanced controllable image generation model specialized in synthesizing "
+    "high-quality robotic vision data. You will receive a scene description of the robot "
+    "workspace. Your task is to generate the high-quality initial observation containing "
+    "3 views with one full size view on top and two half size views side by side at the "
+    "bottom. You should keep the consistency across different views. Image Style: Real."
+)
+
 
 class U0TextProcessor:
     """Read local vocabularies without executing checkpoint Python code."""
@@ -129,11 +138,25 @@ class U0TextProcessor:
         )
 
     def header_mapping(self) -> dict[str, list[int]]:
-        """Derive the fixed-grid scheduler mapping from the real vocabulary."""
+        """Derive the scheduler's dimension-header mappings from the vocabulary."""
         return {
             text: self.encode(text)
             for text in [*(str(i) for i in range(10)), "*", "64*64"]
         }
+
+    def build_scene_gen_inputs(
+        self, prompt: str, robot_arm_type: str = "AgiBot G1"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build Scene Gen CFG prompts with a shared workspace instruction."""
+        self._validate_prompt(prompt)
+        self._validate_prompt(robot_arm_type)
+        prefix = f"<|extra_203|>{SCENE_SYSTEM_PROMPT}"
+        scene = f" Robot Arm Type: {robot_arm_type}. Scene Description: {prompt}"
+        suffix = " <|extra_100|>"
+        return (
+            torch.tensor([self.encode(prefix + scene + suffix)], dtype=torch.int64),
+            torch.tensor([self.encode(prefix + suffix)], dtype=torch.int64),
+        )
 
 
 def reference_image_pixels(path: str | Path) -> torch.Tensor:
@@ -165,13 +188,42 @@ def visual_codes(tokens: torch.Tensor) -> torch.Tensor:
         raise ValueError("Unexpected fixed-grid image header.")
     if ids[-3:].tolist() != [151853, 151747, 151850]:
         raise ValueError("Expected EOI, ESS and EOS termination.")
+    return _visual_grid(ids[7:-3], 64, 64)
+
+
+def scene_visual_codes(tokens: torch.Tensor) -> torch.Tensor:
+    """Extract the complete Scene Gen image and its model-selected grid."""
+    if tokens.ndim != 1 or tokens.dtype != torch.int64:
+        raise ValueError("Generated tokens must be a one-dimensional int64 tensor.")
+    ids = tokens.detach().cpu()
+    starts = (ids == 151852).nonzero().flatten()
+    if starts.numel() != 1 or int(ids[-1]) != 151853:
+        raise ValueError("Expected one complete Scene Gen image ending at EOI.")
+    start = int(starts[0])
+    # A released dimension header has at most three digits on either side of '*'.
+    header = ids[start + 1 : start + 9].tolist()
+    if 151851 not in header:
+        raise ValueError("Missing Scene Gen dimension header.")
+    end = header.index(151851)
+    symbols = {15 + digit: str(digit) for digit in range(10)} | {9: "*"}
+    shape = "".join(symbols.get(token, "?") for token in header[:end])
+    match = re.fullmatch(r"([1-9][0-9]{0,2})\*([1-9][0-9]{0,2})", shape)
+    if match is None:
+        raise ValueError("Invalid Scene Gen dimension header.")
+    height, width = map(int, match.groups())
+    return _visual_grid(ids[start + end + 2 : -1], height, width)
+
+
+def _visual_grid(ids: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    if ids.numel() != height * (width + 1) - 1:
+        raise ValueError("Visual token count does not match the image grid.")
     rows = []
-    for row in range(64):
-        start = 7 + row * 65
-        values = ids[start : start + 64]
+    for row in range(height):
+        start = row * (width + 1)
+        values = ids[start : start + width]
         if not ((values >= 151854) & (values < 282926)).all().item():
             raise ValueError(f"Invalid visual code at row {row}.")
-        if row < 63 and int(ids[start + 64]) != 151846:
+        if row < height - 1 and int(ids[start + width]) != 151846:
             raise ValueError(f"Missing EOL at row {row}.")
         rows.append(values - 151854)
     return torch.stack(rows)
@@ -182,8 +234,13 @@ def image_from_pixels(pixels: torch.Tensor):
     import numpy as np
     from PIL import Image
 
-    if pixels.shape != (1, 3, 1024, 1024) or not torch.isfinite(pixels).all().item():
-        raise ValueError("Expected one finite 1024-by-1024 RGB image.")
+    if (
+        pixels.ndim != 4
+        or pixels.shape[:2] != (1, 3)
+        or not pixels.numel()
+        or not torch.isfinite(pixels).all().item()
+    ):
+        raise ValueError("Expected one nonempty, finite RGB image.")
     pixels = pixels.detach().float().cpu()[0].permute(1, 2, 0)
     pixels = ((pixels + 1.0) * 127.5).clamp(0, 255)
     return Image.fromarray(pixels.numpy().astype(np.uint8))

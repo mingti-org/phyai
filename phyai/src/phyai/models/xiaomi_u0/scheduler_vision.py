@@ -23,13 +23,20 @@ class _U0VisionScheduler(Scheduler):
 
 
 class U0VisionScheduler(_U0VisionScheduler):
-    """Validate one released 64-by-64 code grid and decode it through the runner."""
+    """Validate one code grid and decode it through the runner."""
 
     @torch.inference_mode()
     def step(self, codes: torch.Tensor) -> torch.Tensor:
         """Return finite FP32 RGB pixels for a single grid of valid codebook IDs."""
-        if not isinstance(codes, torch.Tensor) or codes.shape != (1, 64, 64):
-            raise ValueError("The U0 image decoder expects a (1, 64, 64) code grid.")
+        if (
+            not isinstance(codes, torch.Tensor)
+            or codes.ndim != 3
+            or codes.shape[0] != 1
+            or not codes.numel()
+        ):
+            raise ValueError(
+                "The U0 image decoder expects a nonempty (1, H, W) code grid."
+            )
         if (
             codes.dtype != torch.int64
             or (codes < 0).any().item()
@@ -37,8 +44,10 @@ class U0VisionScheduler(_U0VisionScheduler):
         ):
             raise ValueError("Image code grids must contain int64 IDs in [0, 131072).")
         pixels = self.runner.forward(codes)
+        factor = self.runner.model.config.spatial_factor
+        height, width = codes.shape[1:]
         if (
-            pixels.shape != (1, 3, 1024, 1024)
+            pixels.shape != (1, 3, height * factor, width * factor)
             or not torch.isfinite(pixels).all().item()
         ):
             raise RuntimeError("The native image decoder returned invalid RGB pixels.")
