@@ -74,6 +74,8 @@ Open `outputs/u0-stoneware/image.png`. The output directory also contains `refer
 
 Pass `--task scene-gen` and describe the robot workspace, objects, lighting, and background. The prompt requests one RGB image with one full-size view above two half-size views. The model determines the output dimensions.
 
+See the [scene generation guide](../../docs/models/xiaomi-u0/scene-generation.mdx) for a Thor sample and the output files.
+
 ```bash
 PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
 uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \

@@ -1,0 +1,38 @@
+---
+title: "Xiaomi U0 scene generation"
+description: "Generate a multi-view robot scene from a text prompt with Xiaomi-Robotics-U0-4B in PhyAI."
+---
+
+Describe a robot workspace in text. Xiaomi-Robotics-U0-4B generates visual tokens, and PhyAI decodes them into a single RGB image containing multiple views. The model determines the output dimensions.
+
+## Generate a scene
+
+Set up the [environment and checkpoints](/models/xiaomi-u0/text-to-image#prepare-the-models), then run this command from the PhyAI repository root. Use a new or empty output directory.
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --vision-tokenizer-dir "$U0_VISION_TOKENIZER" \
+  --task scene-gen \
+  --robot-arm-type "AgiBot G1" \
+  --prompt "Workspace: A wooden workbench. Objects: A red mug to the left of a blue tray. Lighting: Soft overhead light. Background: White shelves with clear storage bins." \
+  --output-dir ./outputs/u0-scene \
+  --seed 42
+```
+
+Use `--robot-arm-type` to set the robot name in the prompt. It defaults to `AgiBot G1`. Describe the workspace, object positions, lighting, and background in `--prompt`.
+
+This example uses one CUDA GPU, a 1 GiB FlashInfer workspace, and disables CUDA Graph. Scene Gen defaults to 8192 generated tokens. Larger grids may need a higher `--max-new-tokens` value and more GPU memory.
+
+## Read the output
+
+Open `outputs/u0-scene/image.png` to view the scene. Check `generation.json` for `stop_reason=image_end`, the visual token grid in `image_grid_shape` (height, width), and the decoded `image_size` (width, height).
+
+The example also saves `generated_ids.npy`, `input_ids.npy`, `unconditional_ids.npy`, and `tokenizer_mapping.json`. To inspect the input tokens without loading the models, add `--prepare-only` and use a separate empty output directory.
+
+## Thor example
+
+On NVIDIA Jetson Thor, the prompt above reached `image_end` with FlashInfer and produced a 2048 × 512 RGB PNG using seed 42.
+
+![Three generated views of a wooden workbench with robot grippers and a red mug](/images/models/xiaomi-u0/scene-workbench.webp)
