@@ -1,0 +1,358 @@
+---
+title: "DreamZero 单卡推理"
+description: "PhyAI 如何在单张 GPU 上运行 DreamZero 推理"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="DreamZero (DROID)"
+  subtitle="World-Action-Model · 单卡推理"
+  icon="D"
+  rows={{
+    "模型类型": "WAM",
+    "权重": <a href="https://huggingface.co/GEAR-Dreams/DreamZero-DROID" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/GEAR-Dreams/DreamZero-DROID</a>,
+    "标签": ["WAM", "Wan2.1", "video-diffusion", "single-GPU"],
+    "图像输入": "3 路 RGB 相机 · 180×320",
+    "Tokenizer 长度": "512",
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">DreamZeroScheduler</code>,
+    "插件": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">dreamzero</code>,
+    "参数精度": "bf16",
+    "论文": <a href="https://arxiv.org/abs/2602.15922" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2602.15922</a>,
+  }}
+/>
+
+# 概述
+
+[DreamZero](https://arxiv.org/abs/2602.15922) 是一个世界动作模型（World Action Model，WAM）。它使用视频扩散 backbone，根据相机图像、语言指令和机器人状态，联合预测未来视频与动作。
+
+PhyAI 的 `ws1` 路径在单张 GPU 上运行文本编码器、图像编码器、VAE 和 DiT。引擎接收预处理后的 tensor，返回视频 latent 和归一化 action chunk。图像变换、tokenization、状态归一化和动作还原由引擎外部的 `DreamZeroProcessor` 完成。
+
+<Note>
+  本页使用 `GEAR-Dreams/DreamZero-DROID` checkpoint，覆盖单卡、单序列推理。模型权重、配置和 processor 使用的归一化统计应来自同一份 checkpoint。
+</Note>
+
+# 架构
+
+`dreamzero` 插件遵循 PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine 根据插件名找到 Entry。Entry 负责构建模型、加载权重、创建调度器，并将请求转交给 pipeline 和 scheduler。">引擎 + 插件契约</Tooltip>：
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/dreamzero" defaultOpen>
+    <Tree.File name="main_dreamzero.py" />
+    <Tree.File name="builder_dreamzero.py" />
+    <Tree.File name="pipeline_dreamzero.py" />
+    <Tree.File name="scheduler_dreamzero.py" />
+    <Tree.File name="model_runner_dreamzero.py" />
+    <Tree.File name="modeling_dreamzero.py" />
+    <Tree.File name="configuration_dreamzero.py" />
+  </Tree.Folder>
+  <Tree.Folder name="phyai-utils-tools/src/phyai_utils_tools/models/dreamzero" defaultOpen>
+    <Tree.File name="processor_dreamzero.py" />
+    <Tree.File name="steps_dreamzero.py" />
+  </Tree.Folder>
+</Tree>
+
+| 组件 | 职责 |
+| --- | --- |
+| `DreamZeroEntry` | 注册插件，将 engine 配置传给 builder，并转发请求 |
+| `build_dreamzero_pipeline` | 构造编码器、DiT 和 scheduler，加载并检查各模块权重 |
+| `DreamZeroPipeline` | 编码观测、建立条件、生成初始噪声并构造调度请求 |
+| `encoder runners` | 分别运行文本编码、图像特征提取和 VAE 编解码 |
+| `DreamZeroDiT` / `DiT runner` | 预测视频与动作的去噪输出，维护 attention 使用的 KV |
+| `DreamZeroScheduler` | 管理参考 KV、CFG 分支、DiT 调用和 UniPC 更新 |
+| `DreamZeroProcessor` | 观测预处理、checkpoint 统计加载和动作后处理 |
+
+一次请求先完成文本与视觉条件编码，再准备参考 KV 和视频、动作噪声。Scheduler 在去噪循环中调用 DiT，更新两路 latent，并将帧位置与缓存延续到下一次请求。CLI 的动作推理路径直接返回视频 latent，不执行 RGB 视频解码。
+
+请求路径如下：
+
+```text
+三路相机图像 + 机器人状态 + 任务指令
+  -> DreamZeroProcessor.preprocess()
+  -> 图像网格、归一化状态、正负 prompt tokens
+  -> 文本编码器 + 图像编码器 + VAE
+  -> DiT 联合预测视频与动作，scheduler 执行去噪更新
+  -> DreamZeroPipelineOutput：video latent + 归一化动作
+  -> DreamZeroProcessor.postprocess(..., obs=observation)
+  -> DROID 动作 [1, 24, 8]
+```
+
+# 运行 DreamZero
+
+<Steps>
+  <Step title="准备 checkpoint">
+    准备 [DreamZero-DROID](https://huggingface.co/GEAR-Dreams/DreamZero-DROID) 权重和 UMT5 tokenizer。模型目录需要保留配置与 `experiment_cfg/metadata.json`、`experiment_cfg/conf.yaml`，供 processor 读取归一化统计、模态与相对动作配置。
+
+    本页示例使用仓库配置的 CUDA 环境和 BF16 精度，关闭 TF32 与 CUDA Graph。
+  </Step>
+  <Step title="构造 engine">
+    使用 `dreamzero` 插件创建 engine。本页使用 dynamic DiT 的 16 步调度，kernel policy 由示例目录中的配置文件指定。
+
+    ```python
+    from pathlib import Path
+
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.kernel.config import KernelConfig
+    from phyai.models.dreamzero.main_dreamzero import DreamZeroArgs
+    from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+
+    checkpoint = Path("/path/to/DreamZero-DROID")
+
+    engine = Engine(
+        EngineArgs(
+            plugin="dreamzero",
+            plugin_args=DreamZeroArgs(
+                checkpoint_dir=checkpoint,
+                seed=1140,
+                weight_strict=True,
+                dynamic_dit=True,
+                dynamic_dit_scheduler_steps=16,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda:0", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(
+                    use_cuda_graph=False,
+                    allow_tf32=False,
+                    allow_cudnn_tf32=False,
+                ),
+                kernel=KernelConfig(config_path="examples/dreamzero/kernels.yaml"),
+            ),
+        )
+    )
+    ```
+  </Step>
+  <Step title="构造 processor">
+    Processor 与 engine 使用同一份 checkpoint，并读取已加载模型的配置。
+
+    ```python
+    from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+    config = engine.entry.bundle.config
+    processor = DreamZeroProcessor.from_pretrained(
+        checkpoint,
+        tokenizer_name="/path/to/umt5-xxl",
+        max_length=config.text_encoder.max_length,
+        max_state_dim=config.max_state_dim,
+        max_action_dim=config.max_action_dim,
+        action_horizon=config.action_horizon,
+        num_views=3,
+    )
+    ```
+  </Step>
+  <Step title="构造请求">
+    与其他模型的单次示例一样，生成合成观测来检查推理链路：三路随机 RGB 图像、全零状态和一条任务指令。全零状态是此示例的输入约定；接入机器人或仿真时，应替换为实际关节位置和夹爪状态。
+
+    ```python
+    import numpy as np
+
+    rng = np.random.default_rng(1140)
+    observation = {
+        "video": rng.integers(0, 256, size=(1, 1, 3, 180, 320, 3), dtype=np.uint8),
+        "state": torch.zeros((1, 1, 8), dtype=torch.float32),
+        "task": ["Pick up the object"],
+    }
+    processed = processor.preprocess(observation)
+    ```
+  </Step>
+  <Step title="运行一步并还原动作">
+    ```python
+    with torch.inference_mode():
+        output = engine.step(processed)
+        action = processor.postprocess(output, obs=observation).action
+    ```
+
+    DROID 后处理输出为 `(1, 24, 8)` 的 CPU FP32 tensor。保留原始 `observation`，用于 checkpoint 配置的相对动作还原。
+  </Step>
+  <Step title="关闭 engine">
+    ```python
+    engine.close()
+    ```
+
+    同一序列的后续请求需要复用 engine；结束使用后再关闭。
+  </Step>
+</Steps>
+
+# 请求格式
+
+## 原始观测
+
+本页使用 `B=1`。`T` 表示每路相机的观测历史长度，首请求为 `1`。
+
+| 字段 | Shape / 类型 | 含义 |
+| --- | --- | --- |
+| `video` | `(B, T, 3, H, W, 3)`，`np.uint8` | 相机顺序为右、左、腕部；通道顺序为 RGB，范围为 0–255 |
+| `state` | `(B, 1, 8)`，FP32 | 七个关节位置与一个夹爪位置，传入归一化之前的状态 |
+| `task` | 长度为 `B` 的字符串列表 | 当前任务的语言指令 |
+
+Processor 对各路图像进行中心裁剪，resize 到 `176 × 320`，再拼接成 `352 × 640` 的网格：腕部视角占据上半部，右、左视角分别位于下半部两侧。它还负责状态归一化、padding、具身 ID 和正负 prompt 的 tokenization。
+
+## Engine 请求与结果
+
+`engine.step()` 接收 `DreamZeroProcessedInputs`。以下形状对应 DROID 的常用配置，具体宽度以加载后的 `config` 为准。
+
+| 字段 | Shape | 说明 |
+| --- | --- | --- |
+| `processed.images` | `(B, T, 352, 640, 3)` | `uint8` 图像网格；pipeline 搬到设备并映射到 `[-1, 1]` |
+| `processed.state` | `(B, 1, 64)` | 归一化、padding 后的状态 |
+| `processed.input_ids` / `attention_mask` | `(B, L)` | 正向 prompt 的 token 与 mask；默认最大长度 `L=512` |
+| `processed.negative_input_ids` / `negative_attention_mask` | `(B, L)` | CFG 使用的负向 prompt |
+| `processed.embodiment_id` | `(B,)` | 由 processor 的 DROID 具身映射生成 |
+| `output.action` | `(B, 24, 32)` | 模型动作空间中的归一化输出 |
+| `output.video` | `(B, C_latent, T_latent, H_latent, W_latent)` | 去噪后的视频 latent，尚未解码为 RGB 视频 |
+| `processor.postprocess(...).action` | `(B, 24, 8)` | CPU FP32 的 DROID 动作 |
+
+Postprocessor 裁掉动作 padding、转为 FP32，并根据 checkpoint 统计反归一化。如果 checkpoint 配置了相对关节动作，它还会结合原始观测还原关节位置。因此应保留 `observation` 并传入 `obs=observation`。
+
+`DreamZeroPipelineOutput` 同时保留 `request` 和 `scheduler_output`，可用于检查内部噪声、调度结果和帧位置。内部 `DreamZeroRequest` 包含视频与动作 latent、编码条件及缓存控制字段，由 pipeline 构造；通常无需手动创建。
+
+# 端到端示例
+
+`examples/dreamzero/run_dreamzero.py` 默认生成三路 `180 × 320` 随机 RGB 图像、八维全零状态和任务指令 `Pick up the object`。无需连接相机或准备图片文件。激活已安装 PhyAI 依赖的环境后，在仓库根目录运行：
+
+```bash
+python examples/dreamzero/run_dreamzero.py \
+  --checkpoint /path/to/DreamZero-DROID \
+  --tokenizer /path/to/umt5-xxl
+```
+
+示例默认使用 dynamic DiT 的 16 步调度和配套 kernel policy，输出保存为 `action.npy`：
+
+```text
+Saved action shape (1, 24, 8) to action.npy
+```
+
+该示例执行新序列的首个 action chunk，用于检查预处理、模型推理和动作后处理。合成观测的预测动作不具有实际任务意义。
+
+其他可选参数见下方推理配置。
+
+
+# 连续请求
+
+同一条序列应复用同一个 engine。调用方采集和整理历史观测，pipeline 与 scheduler 保存编码条件、帧位置及 DiT KV。Processor 不会替调用方累计相机历史。
+
+| 请求情形 | 输入与行为 |
+| --- | --- |
+| 新序列 | 传入一帧观测；pipeline 创建首帧条件并初始化 KV |
+| 后续 chunk | 传入当前序列的多帧观测；已有闭环适配使用四帧历史，并由 VAE 编码参考视频以更新历史 |
+| 到达 local-attention 窗口边界 | pipeline 在重新编码条件前释放旧 KV，帧位置归零，再建立新窗口 |
+| 已有序列再次收到单帧观测 | pipeline 自动按新序列重置；持续传单帧会反复丢弃历史 |
+
+四帧历史需要按控制循环的采样节奏准备，不能靠重复当前图像替代真实历史。底层也处理特定的九帧参考输入，但多帧长度受 `num_frame_per_block` 约束，不能任意改变。
+
+开始新任务时，清空调用方的观测历史，并以一帧新观测调用 `engine.step()`。只改变任务文本不会自动建立独立会话。显式控制缓存时可使用 `engine.entry.bundle.pipeline` 的 `current_start_frame`、`reset_kv_cache` 参数；这是较低层接口，调用方还需显式传入所需的去噪配置。
+
+
+# 推理配置
+
+| CLI 参数 | 默认值 | 行为 |
+| --- | --- | --- |
+| `--steps` | `4` | 仅在 `--no-dynamic-dit` 时选择固定去噪步数 |
+| `--dynamic-dit` / `--no-dynamic-dit` | 开启 | 默认使用 16 步动态调度；关闭后才使用固定步数 |
+| `--compile-scheduler` | 关闭 | 编译 UniPC 更新，使用与官方 BF16 rounding 路径对应的计算方式 |
+| `--kernel-config` | 示例目录下的 `kernels.yaml` | 选择 attention、norm 等算子实现 |
+| `--seed` | `1140` | 控制合成图像及初始视频、动作噪声 |
+| `--device` | `cuda:0` | `CUDA_VISIBLE_DEVICES` 范围内的目标设备 |
+| `--output` | `action.npy` | 后处理动作的保存位置 |
+| `--right-image` / `--left-image` / `--wrist-image` | 不设置 | 真实观测的相机图片路径；需提供完整三路图像 |
+| `--state` / `--task` | 合成模式为全零状态 / `Pick up the object` | 设置状态或任务；真实观测必须显式提供八个实测状态值和任务指令 |
+
+## Fixed4 与 dynamic16
+
+本页示例默认采用 dynamic16 配置。使用 `--no-dynamic-dit` 可切换到固定步数。动态模式下，scheduler 根据视频预测的变化决定哪些调度步重新运行 DiT，哪些步复用已有预测。16 是调度步数，实际 DiT forward 次数可能更少；不能把 dynamic16 当作固定 16 次模型执行来计算性能。
+
+Python 接口对应 `DreamZeroArgs.num_inference_steps`、`dynamic_dit` 和 `dynamic_dit_scheduler_steps`。Entry 将这些设置传给 pipeline。
+
+## Kernel policy 与编译
+
+示例 policy 显式选择：
+
+| 算子 | 实现 |
+| --- | --- |
+| DreamZero self-attention / cross-attention | `flashinfer.attention.fa2` |
+| LayerNorm | `torch.layernorm` |
+| VAE channel L2 norm | `torch.channel_l2_norm` |
+
+其他算子遵循框架的 kernel 选择规则。VAE 的 channel L2 norm 与标准 RMSNorm 具有不同的计算语义，不应仅凭名称替换。
+
+`compile_scheduler=True` 编译的是 UniPC 更新；它与 `RuntimeConfig.use_cuda_graph` 分别控制不同机制。示例关闭 CUDA Graph，开启 scheduler 编译也不表示整条模型链已经被捕获为 CUDA Graph。编译会增加首次执行开销，应将首次请求与后续请求分别计时。
+
+精度回归应记录 checkpoint、源码版本、kernel policy、Torch/CUDA 版本以及实际的初始视频和动作噪声。相同 seed 在不同设备执行配置下不保证生成逐元素相同的噪声；开启 scheduler 编译也不足以单独证明整条链路与官方数值一致。
+
+# 当前限制
+
+- 本页覆盖单卡、`B=1`、DROID 三相机输入。模型代码中的其他并行配置不属于本页验收范围。
+- `run_dreamzero.py` 生成一个初始 action chunk；网络服务、历史帧采样、动作执行和任务成功判定需要上层适配。
+- 权重、运行中的 KV、编码临时 tensor 和编译缓存都会影响内存峰值。Jetson Thor 的统一内存还与 CPU 进程共享，不能仅按权重大小估算连续请求的内存需求。
+- 关闭 engine 会释放它持有的模型与运行状态。连续 episode 的资源峰值需要在目标部署环境单独验证。
+
+# 完整代码
+
+下面的示例与命令行入口一样使用随机图像、全零状态和默认任务指令。Processor 和 engine 使用同一份 checkpoint，并从加载后的模型配置取得 padding 宽度与 action horizon。
+
+```python
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.kernel.config import KernelConfig
+from phyai.models.dreamzero.main_dreamzero import DreamZeroArgs
+from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+checkpoint = Path("/path/to/DreamZero-DROID")
+rng = np.random.default_rng(1140)
+observation = {
+    "video": rng.integers(0, 256, size=(1, 1, 3, 180, 320, 3), dtype=np.uint8),
+    "state": torch.zeros((1, 1, 8), dtype=torch.float32),
+    "task": ["Pick up the object"],
+}
+
+engine = Engine(
+    EngineArgs(
+        plugin="dreamzero",
+        plugin_args=DreamZeroArgs(
+            checkpoint_dir=checkpoint,
+            seed=1140,
+            weight_strict=True,
+            dynamic_dit=True,
+            dynamic_dit_scheduler_steps=16,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda:0", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(
+                use_cuda_graph=False,
+                allow_tf32=False,
+                allow_cudnn_tf32=False,
+            ),
+            kernel=KernelConfig(config_path="examples/dreamzero/kernels.yaml"),
+        ),
+    )
+)
+try:
+    config = engine.entry.bundle.config
+    processor = DreamZeroProcessor.from_pretrained(
+        checkpoint,
+        tokenizer_name="/path/to/umt5-xxl",
+        max_length=config.text_encoder.max_length,
+        max_state_dim=config.max_state_dim,
+        max_action_dim=config.max_action_dim,
+        action_horizon=config.action_horizon,
+        num_views=3,
+    )
+    with torch.inference_mode():
+        processed = processor.preprocess(observation)
+        output = engine.step(processed)
+        action = processor.postprocess(output, obs=observation).action
+    assert tuple(action.shape) == (1, 24, 8)
+    assert torch.isfinite(action).all()
+    print(action.shape, action.dtype, action.device)
+finally:
+    engine.close()
+```

@@ -16,6 +16,9 @@ import pytest
 
 from phyai.engine_config import DenseParallelConfig, ParallelConfig
 from phyai.kernel.bootstrap import kernel_selector_scope
+from phyai.kernel.policy import policy_from_mapping
+from phyai.kernel.registry import build_catalog
+from phyai.kernel.selector import Selector
 from phyai.parallel.layout import build_rank_layout
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
@@ -38,6 +41,18 @@ def _kernel_selector_isolation():
     """
 
     with kernel_selector_scope():
+        yield
+
+
+@pytest.fixture
+def torch_gemm():
+    """Pin GEMM to the torch rows, for tests that compare a layer with ``F.linear`` bit for bit."""
+    catalog = build_catalog()
+    rule = {"id": "torch-gemm", "match": {"op": "gemm"}, "restrict_to": "torch.gemm.*"}
+    policy = policy_from_mapping(
+        {"schema": "phyai.kernel/v1", "rules": [rule]}, catalog
+    )
+    with kernel_selector_scope(Selector(catalog, policy, device="cuda")):
         yield
 
 

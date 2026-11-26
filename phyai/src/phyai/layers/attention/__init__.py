@@ -41,6 +41,8 @@ from phyai.layers.attention.paged import (
     PagedAttnCtx,
     PagedAttnMetadata,
     PagedAttnPlanHandle,
+    SdpaPagedBackend,
+    SdpaPagedPlan,
 )
 from phyai.layers.attention.utils import (
     get_global_fi_workspace,
@@ -78,6 +80,8 @@ __all__ = [
     "PagedAttnPlanHandle",
     "FlashInferPagedBackend",
     "FlashInferPagedPlan",
+    "SdpaPagedBackend",
+    "SdpaPagedPlan",
     # === gdn/ stack ===
     "GatedDeltaNetBackend",
     "GatedDeltaNetCtx",

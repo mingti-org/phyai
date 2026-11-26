@@ -73,18 +73,32 @@ def gemm_bf16(
     layer: torch.nn.Module,
     x: torch.Tensor,
     bias: torch.Tensor | None,
+    *,
+    out_dtype: torch.dtype | None = None,
+    backend: str = "cudnn",
 ) -> torch.Tensor:
     assert _fi_gemm is not None
     K = x.shape[-1]
     x_2d = _flatten_activations(x, K)
+    out_dtype = out_dtype or x.dtype
+    if x_2d.shape[0] == 0:
+        return x.new_empty((*x.shape[:-1], layer.weight.shape[0]), dtype=out_dtype)
+    fused_bias = (
+        bias
+        if out_dtype == x.dtype and backend in {"cudnn", "tgv", "tinygemm", "auto"}
+        else None
+    )
     # weight is (N, K) row-major; ``.t()`` is the (K, N) column-major view.
     y = _fi_gemm.mm_bf16(
         x_2d,
         layer.weight.t(),
-        bias=bias,
-        out_dtype=x.dtype,
+        bias=fused_bias,
+        out_dtype=out_dtype,
+        backend=backend,
     )
-    return y.reshape(*x.shape[:-1], -1)
+    if bias is not None and fused_bias is None:
+        y = y + bias
+    return y.reshape(*x.shape[:-1], layer.weight.shape[0])
 
 
 # ------------------------------------------------------------------

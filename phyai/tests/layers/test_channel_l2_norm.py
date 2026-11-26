@@ -39,6 +39,48 @@ def test_channel_l2_norm_channel_last_and_native_reduction():
     torch.testing.assert_close(layer(value), expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("compute_dtype", [None, torch.float32])
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize("restore_input_dtype", [False, True])
+def test_torch_channel_l2_norm_output_precision(
+    dtype, compute_dtype, autocast, restore_input_dtype
+):
+    layer = ChannelL2Norm(
+        96,
+        dtype=dtype,
+        compute_dtype=compute_dtype,
+        restore_input_dtype=restore_input_dtype,
+        bias=True,
+        backend="torch",
+    )
+    layer.gamma.normal_()
+    layer.bias.normal_()
+    value = torch.randn(2, 96, 3, 5, device="cuda", dtype=dtype)
+    with torch.autocast("cuda", dtype=dtype, enabled=autocast):
+        promoted = value if compute_dtype is None else value.to(compute_dtype)
+        normalized = F.normalize(promoted, dim=1)
+        if restore_input_dtype:
+            normalized = normalized.to(dtype)
+        expected = normalized * 96**0.5 * layer.gamma + layer.bias
+        actual = layer(value)
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_channel_l2_norm_native_promotion_selects_compatible_kernel():
+    layer = ChannelL2Norm(96, compute_dtype=None, restore_input_dtype=False)
+    value = torch.randn(2, 96, 3, 5, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        actual = layer(value)
+        expected = F.normalize(value, dim=1) * 96**0.5 * layer.gamma
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert {choice.kernel_id for choice in layer._call._memo.values()} == {
+        "torch.channel_l2_norm"
+    }
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("compute_dtype", [None, torch.float32])
 @pytest.mark.parametrize("channel_first", [False, True])

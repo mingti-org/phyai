@@ -57,3 +57,24 @@ def test_gelu_rows_preserve_exact_vs_tanh_semantics(
     gate, up = value.chunk(2, dim=-1)
     expected = F.gelu(gate, approximate=approximate) * up
     torch.testing.assert_close(selection.execute(value), expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "kernel_id"),
+    (
+        ("bf16", "phyai_kernel.activation.t5_gelu"),
+        ("fp16", "phyai_kernel.activation.t5_gelu"),
+        ("fp32", "torch.activation.t5_gelu"),
+    ),
+)
+def test_t5_gelu_selection(dtype, kernel_id):
+    selector = Selector(build_catalog(), device="cuda")
+    selection = selector.select(
+        KernelQuery.build(
+            "activation",
+            dtype={"input": dtype},
+            shape={"tokens": 512, "hidden": 10240},
+            attrs={"activation": "t5_gelu", "gated": False},
+        )
+    )
+    assert selection.kernel_id == kernel_id

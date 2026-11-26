@@ -41,8 +41,15 @@ _CUDA_SDPA_PRIORITY = [
 ]
 
 
-def _sdpa_priority_ctx(device: torch.device, enabled: bool):
+def _sdpa_priority_ctx(
+    device: torch.device, enabled: bool, *, mixed_bias_dtype: bool = False
+):
     """Kernel-priority context for CUDA SDPA; ``nullcontext`` elsewhere."""
+    if mixed_bias_dtype and device.type == "cuda":
+        # PyTorch 2.11 cuDNN SDPA can return invalid output for FP32 bias
+        # with half Q/K/V; efficient SDPA rejects that dtype combination.
+        # Math SDPA keeps the bias precision and still executes on CUDA.
+        return sdpa_kernel(SDPBackend.MATH)
     if enabled and device.type == "cuda":
         return sdpa_kernel(_CUDA_SDPA_PRIORITY, set_priority=True)
     return nullcontext()
@@ -65,6 +72,7 @@ def _sdpa_attn(
     num_heads: int,
     num_kv_heads: int,
     attn_mask: torch.Tensor | None = None,
+    attn_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Inner SDPA call with mask + soft-cap dispatch.
 
@@ -91,6 +99,23 @@ def _sdpa_attn(
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             attn_mask=attn_mask,
+            attn_bias=attn_bias,
+        )
+    if attn_bias is not None:
+        mask = attn_mask
+        if mask is None:
+            mask = causal_block_mask(
+                q.shape[-2],
+                k.shape[-2],
+                q.device,
+                causal=causal,
+                sliding_window=sliding_window,
+            )
+        combined = (
+            attn_bias if mask is None else attn_bias.masked_fill(~mask, float("-inf"))
+        )
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=combined, scale=scale, enable_gqa=enable_gqa
         )
     if attn_mask is not None:
         return F.scaled_dot_product_attention(
@@ -215,7 +240,12 @@ class SdpaAttentionBackend(AttentionBackend):
         q_h = q.transpose(1, 2)
         k_h = k.transpose(1, 2)
         v_h = v.transpose(1, 2)
-        with _sdpa_priority_ctx(q.device, self.select_kernel):
+        with _sdpa_priority_ctx(
+            q.device,
+            self.select_kernel,
+            mixed_bias_dtype=ctx.attn_bias is not None
+            and ctx.attn_bias.dtype != q.dtype,
+        ):
             out = self._sdpa_call(
                 q_h,
                 k_h,
@@ -227,6 +257,7 @@ class SdpaAttentionBackend(AttentionBackend):
                 num_heads=layer.num_heads,
                 num_kv_heads=layer.num_kv_heads,
                 attn_mask=attn_mask,
+                attn_bias=ctx.attn_bias,
             )
         return out.transpose(1, 2).contiguous()
 

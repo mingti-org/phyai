@@ -1,0 +1,118 @@
+---
+title: "Xiaomi U0 text-to-image"
+description: "Prepare Xiaomi U0 checkpoints and generate images from text with PhyAI."
+---
+
+Generate a 1024 × 1024 RGB image from a text prompt with Xiaomi-Robotics-U0-4B.
+PhyAI runs the token generation and Emu3.5 image decoding stages through the command-line example.
+
+## Prepare the models
+
+You need Linux, Python 3.12 or newer, `uv`, and an NVIDIA GPU with CUDA and BF16 support.
+Keep the repository's pinned Torch, Transformers and FlashInfer versions. Run the commands below from the PhyAI repository root:
+
+```bash
+uv lock
+uv sync --locked
+export U0_CHECKPOINT=/path/to/Xiaomi-Robotics-U0-4B
+export U0_VISION_TOKENIZER=/path/to/Emu3.5-VisionTokenizer
+```
+
+Set the variables to your downloaded model directories and keep them in the shell used for generation.
+If you already have a working environment, activate it and set the two checkpoint paths there.
+
+The U0 directory must contain the model weights, `config.json`, `unis.tiktoken` and `unis_vision_tokens.txt`.
+The [Emu3.5-VisionTokenizer](https://huggingface.co/BAAI/Emu3.5-VisionTokenizer) directory must contain its configuration and model weights.
+The text tokenizer uses `tiktoken`, which is installed with `phyai-utils-tools`.
+
+## Generate an image
+
+Check GPU availability with `nvidia-smi`, then run:
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=536870912 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --vision-tokenizer-dir "$U0_VISION_TOKENIZER" \
+  --prompt "A studio photograph of a ceramic teapot on a wooden table." \
+  --output-dir ./outputs/u0-teapot \
+  --seed 42 \
+  --max-new-tokens 4169
+```
+
+Open `outputs/u0-teapot/image.png` to view the result. To use another prompt, change `--prompt` and choose a new or empty `--output-dir`.
+
+`PHYAI_FLASHINFER_WORKSPACE_BYTES=536870912` sets a 512 MiB workspace for FlashInfer.
+The default 128 MiB workspace is too small for this full-image configuration. Budget for the workspace alongside model weights and KV caches.
+A complete image needs 4169 output tokens; keep `--max-new-tokens` at least this large.
+
+The script first generates tokens, closes the autoregressive engine, then loads the image decoder. The two models use GPU memory in separate stages.
+
+## Read the output
+
+The output directory contains:
+
+| File | Contents |
+| --- | --- |
+| `image.png` | The generated 1024 × 1024 RGB image |
+| `generated_ids.npy` | Generated token IDs, without the prompt |
+| `generation.json` | Prompt, seed, backends, stop reason, token count, image size and timings |
+| `input_ids.npy`, `unconditional_ids.npy` | Conditional and no-text input tokens |
+| `tokenizer_mapping.json` | Token mappings for the image dimensions |
+
+A completed generation reports `stop_reason: "eos"` and `generated_tokens: 4169` in `generation.json`.
+The script checks the visual-token stream before decoding it.
+
+## Check tokenization
+
+Use `--prepare-only` to inspect the prompt tokens without loading model weights:
+
+```bash
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --prompt "A studio photograph of a ceramic teapot on a wooden table." \
+  --output-dir ./outputs/u0-prepare \
+  --prepare-only
+```
+
+This writes the input token arrays, dimension mappings and preparation record. It does not need the vision checkpoint.
+View all command-line arguments with:
+
+```bash
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py --help
+```
+
+## Generated examples
+
+These examples were generated on NVIDIA Thor with seed 42 and CFG scale 3, using FlashInfer and the native PhyAI decoder.
+Use each prompt in the generation command above and choose a separate output directory.
+
+### Ceramic teapot
+
+Prompt: A studio photograph of a ceramic teapot on a wooden table.
+
+![Ceramic teapot](../../images/models/xiaomi-u0/teapot-native.png)
+
+### Inspection camera
+
+Prompt: A compact industrial inspection camera on a brushed steel workbench, precise studio lighting.
+
+![Inspection camera](../../images/models/xiaomi-u0/camera-native.png)
+
+### Robotic gripper
+
+Prompt: A robotic gripper holding a small metal component on an assembly line, realistic industrial photography.
+
+![Robotic gripper](../../images/models/xiaomi-u0/gripper-native.png)
+
+## Supported configuration
+
+The example handles one prompt on one GPU and generates a fixed 64 × 64 visual code grid for a 1024 × 1024 image.
+Token generation uses BF16, FlashInfer paged attention and no-text classifier-free guidance at scale 3. The native decoder uses the released FP32 weights.
+Run with CUDA Graph disabled. Concurrent requests, other image sizes and video are outside the example's supported configuration.
+
+## Validation
+
+On NVIDIA Thor, all three prompts above completed with FlashInfer and the native PhyAI decoder, returning EOS, 4169 output tokens and a 1024 × 1024 RGB image.
+A short fixed-history AR replay and a decoder comparison using one saved code grid passed their respective approximation checks.
+See [PR #71](https://github.com/mingti-org/phyai/pull/71) for the comparison methods and numerical results.

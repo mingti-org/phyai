@@ -10,7 +10,7 @@ forward-time cost.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
@@ -73,6 +73,39 @@ def sharded(
     return load
 
 
+def packed_sharded(
+    *, sizes: Sequence[int], group: str = "dense_tp", mesh: Mesh
+) -> WeightLoader:
+    """Shard each output partition of an already-packed checkpoint tensor.
+
+    A ``[Q; K; V]`` source becomes ``[Q_rank; K_rank; V_rank]`` locally.
+    Weight matrices and bias vectors share the same output-axis layout.
+    """
+    world = mesh.group_size(group)
+    rank = mesh.group_rank(group)
+    sizes = tuple(sizes)
+    if not sizes or any(size <= 0 or size % world for size in sizes):
+        raise ValueError(
+            "packed output sizes must be positive and divisible by TP size."
+        )
+
+    def load(param: torch.nn.Parameter, loaded: torch.Tensor, _shard_id=None) -> None:
+        if loaded.shape[0] != sum(sizes) or param.shape[0] != sum(sizes) // world:
+            raise ValueError(
+                "packed weight shape does not match its output partitions."
+            )
+        source_offset = destination_offset = 0
+        for size in sizes:
+            local_size = size // world
+            source = loaded.narrow(0, source_offset + rank * local_size, local_size)
+            destination = param.data.narrow(0, destination_offset, local_size)
+            _copy_exact(destination, source)
+            source_offset += size
+            destination_offset += local_size
+
+    return load
+
+
 @dataclass(frozen=True)
 class _Leg:
     """One leg of a fused-param load.
@@ -104,6 +137,13 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
 
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
         leg = legs[shard_id]
+        world = mesh.group_size(leg.group) // leg.replication_factor
+        expected_size = leg.size * world
+        if loaded.shape[leg.dim] != expected_size:
+            raise ValueError(
+                f"fused weight {shard_id!r} dimension {leg.dim} must be "
+                f"{expected_size}, got {loaded.shape[leg.dim]}."
+            )
         rank = mesh.group_rank(leg.group) // leg.replication_factor
         src = loaded.narrow(leg.dim, rank * leg.size, leg.size)
         _copy_exact(param.data.narrow(fuse_dim, leg.offset, leg.size), src)
@@ -175,6 +215,7 @@ __all__ = [
     "fused",
     "replicated",
     "sharded",
+    "packed_sharded",
     "vocab",
     "weight_norm_fold",
 ]

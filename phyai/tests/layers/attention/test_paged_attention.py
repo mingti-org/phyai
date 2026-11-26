@@ -1,8 +1,7 @@
 """Construction contract of the unified paged-KV attention layer.
 
-The paged stack is flashinfer-only (GPU); construction validates the backend
-name against the kernel catalog without instantiating it, so these tests
-trigger no flashinfer import. Forward numerics live in ``test_flashinfer_paged.py``.
+Construction validates backend names without instantiating them. Numerical
+coverage lives in the backend-specific test modules.
 """
 
 from __future__ import annotations
@@ -34,10 +33,6 @@ def test_construction_records_traits_and_causality_per_layer():
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        (
-            {"backend": "sdpa"},
-            "unknown backend",
-        ),  # only registered in the no-cache stack
         ({"backend": "eager"}, "unknown backend"),
         ({"backend": "not-a-backend"}, "unknown backend"),
         ({"num_kv_heads": 3}, "must be a positive multiple"),

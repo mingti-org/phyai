@@ -1,3 +1,5 @@
-"""CUDA JIT kernels — register kernels here using `@phyai_kernel.jit(...)`."""
+"""CUDA kernels compiled on first use through TVM-FFI."""
 
-__all__: list[str] = []
+from phyai_kernel.cuda.jit.t5_gelu import t5_gelu
+
+__all__ = ["t5_gelu"]

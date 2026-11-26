@@ -1,0 +1,124 @@
+---
+title: "MOSS-Image"
+description: "使用 PhyAI 运行 MOSS-Image-SFT，启动 Gradio 页面，配置 CUDA Graph bucket 和多卡 serving。"
+---
+
+使用 [OpenMOSS-Team/MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) 从文字描述生成图片。
+PhyAI 提供命令行生成脚本，以及连接本地 PhyAI server 的 Gradio 页面。
+
+## 准备模型
+
+你需要 Python 3.12 或更高版本、`uv`，以及支持 CUDA 和 BF16 的 NVIDIA GPU。
+在 PhyAI 仓库根目录运行：
+
+```bash
+uv sync
+export MOSS_CHECKPOINT=.cache/models/MOSS-Image-SFT
+hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir "$MOSS_CHECKPOINT"
+```
+
+如果已经下载模型，将 `MOSS_CHECKPOINT` 设为已有目录，跳过下载命令。
+请使用完整的 checkpoint，包括 tokenizer 和各组件的配置文件。
+在设置了该变量的终端中启动模型。先用 `nvidia-smi` 查看可用 GPU，再调整示例中的 `CUDA_VISIBLE_DEVICES`。
+
+## 一键启动 server 和 UI
+
+使用 `launch` 在同一个终端启动两个进程：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile
+```
+
+模型加载完成后，打开 [http://127.0.0.1:7860](http://127.0.0.1:7860)，输入 prompt 并生成图片。
+在终端按 Ctrl+C 会同时停止 server 和 UI。
+通过 `--port` 修改 UI 端口，通过 `--server-port` 修改本地 gRPC 端口，后者默认 `50063`。
+
+`--cpu-offload` 在需要时将文本编码器和 VAE 移到 GPU。启用 CUDA Graph 时，transformer 会常驻 GPU，
+因此仍需为 transformer 和当前使用的组件留出显存。
+`--torch-compile` 编译 transformer 中的部分运算；首次启动或请求可能需要等待编译和图捕获完成。
+
+## 预热 CUDA Graph bucket
+
+CUDA Graph 默认开启。可以在接收请求前预热常用尺寸：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile \
+  --graph-bucket 512 512 128 \
+  --graph-bucket 1024 1024 256 \
+  --graph-cache-size 4
+```
+
+`--graph-bucket HEIGHT WIDTH TEXT_TOKENS` 的前两个参数是图片高、宽，单位为像素，必须是 16 的倍数。
+文本容量向上归一化到 `64、128、256、512、1024、2048、4096`，例如 `100` 会使用 `128`。
+重复添加参数可预热多个 bucket。每个归一化后的不同 bucket 至少预留两个缓存条目，用于默认 guidance 分支，因此这两个 bucket 至少需要四个缓存条目。
+每个模型副本的默认缓存容量为 `4`。
+
+相同图片尺寸和计算路径下，不同实际文本长度可以复用同一个容量的图，例如 18、31、64 token 共用一个图。
+如果已有更大的 bucket，且相对请求首选 bucket 增加的计算行数不超过 25%，也会直接复用。
+图按单个样本捕获，可以跨不同 batch 组成复用；attention 中的 padding 与有效 token 隔离。
+
+这些参数指定启动时预热哪些图，不限制请求尺寸。其他请求会尝试复用已有图，必要时按需捕获。
+缓存淘汰较旧的条目，并保护当前请求正在使用的图；如果所有条目都在使用，剩余形状直接执行，不捕获新图。
+关闭 CUDA Graph 时，添加 `--no-cuda-graph` 并去掉 `--graph-bucket`。
+
+## 多卡 serving
+
+每张 GPU 启动一个模型副本，处理并发请求：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 1 --concurrency 2 --cpu-offload --torch-compile \
+  --graph-bucket 1024 1024 256
+```
+
+`--devices` 使用 `CUDA_VISIBLE_DEVICES` 范围内的逻辑编号。
+上面的命令启动两个独立模型副本，各自维护图缓存。每个请求在一张 GPU 上执行，增加副本可提高请求并发数。
+`launch` 默认将 UI 并发数设为副本数。
+
+## UI 连接已有 server
+
+在设置了 `MOSS_CHECKPOINT` 的终端中启动 server：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py serve \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile \
+  --host 127.0.0.1 --port 50063
+```
+
+在第二个终端中进入仓库根目录，启动 UI：
+
+```bash
+uv run python examples/moss_image/gradio_moss_image.py ui \
+  --server-address 127.0.0.1:50063 \
+  --host 127.0.0.1 --port 7860
+```
+
+独立 UI 默认同时处理一个请求。连接两个副本的 server 时，可添加 `--concurrency 2`。
+
+## 命令行生成图片
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/run_moss_image.py \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --prompt 'A red apple on a wooden table.' \
+  --height 1024 --width 1024 --steps 50 --guidance-scale 3 --seed 42 \
+  --cpu-offload --torch-compile \
+  --out .cache/moss_image.png
+```
+
+打开 `.cache/moss_image.png` 查看结果。输出图片的高、宽必须为正数且是 16 的倍数。
+默认设置为 50 步、guidance scale 3、seed 42、空 negative prompt，负分支跳过索引为 22 的层（索引从 0 开始）。
+可以通过 `--negative-prompt` 指定负面提示词。生成脚本也支持上面的图配置参数。
+
+查看完整参数：
+
+```bash
+python examples/moss_image/gradio_moss_image.py launch --help
+python examples/moss_image/run_moss_image.py --help
+```

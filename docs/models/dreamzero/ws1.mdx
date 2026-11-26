@@ -1,0 +1,355 @@
+---
+title: "Single-GPU inference for DreamZero"
+description: "How PhyAI runs DreamZero inference on a single GPU"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="DreamZero (DROID)"
+  subtitle="World-Action-Model · Single-GPU Inference"
+  icon="D"
+  rows={{
+    "Model Type": "WAM",
+    "Weights": <a href="https://huggingface.co/GEAR-Dreams/DreamZero-DROID" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/GEAR-Dreams/DreamZero-DROID</a>,
+    "Tags": ["WAM", "Wan2.1", "video-diffusion", "single-GPU"],
+    "Inputs": "3 RGB cameras · 180×320",
+    "Tokenizer Length": "512",
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">DreamZeroScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">dreamzero</code>,
+    "Param Precision": "bf16",
+    "Paper": <a href="https://arxiv.org/abs/2602.15922" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2602.15922</a>,
+  }}
+/>
+# Overview
+
+[DreamZero](https://arxiv.org/abs/2602.15922) is a World Action Model (WAM). It uses a video diffusion backbone to jointly predict future video and actions from camera images, language instructions, and robot state.
+
+PhyAI's `ws1` path runs the text encoder, image encoder, VAE, and DiT on a single GPU. The engine accepts preprocessed tensors and returns video latents and a normalized action chunk. Image transforms, tokenization, state normalization, and action reconstruction are handled outside the engine by `DreamZeroProcessor`.
+
+<Note>
+  This page uses the `GEAR-Dreams/DreamZero-DROID` checkpoint and covers single-GPU, single-sequence inference. Model weights, configuration, and the normalization statistics used by the processor should come from the same checkpoint.
+</Note>
+
+# Architecture
+
+The `dreamzero` plugin follows PhyAI's <Tooltip headline="Engine + plugin" tip="The Engine resolves an Entry by plugin name. The Entry builds the model, loads weights, creates the scheduler, and forwards requests to the pipeline and scheduler.">engine + plugin contract</Tooltip>:
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/dreamzero" defaultOpen>
+    <Tree.File name="main_dreamzero.py" />
+    <Tree.File name="builder_dreamzero.py" />
+    <Tree.File name="pipeline_dreamzero.py" />
+    <Tree.File name="scheduler_dreamzero.py" />
+    <Tree.File name="model_runner_dreamzero.py" />
+    <Tree.File name="modeling_dreamzero.py" />
+    <Tree.File name="configuration_dreamzero.py" />
+  </Tree.Folder>
+  <Tree.Folder name="phyai-utils-tools/src/phyai_utils_tools/models/dreamzero" defaultOpen>
+    <Tree.File name="processor_dreamzero.py" />
+    <Tree.File name="steps_dreamzero.py" />
+  </Tree.Folder>
+</Tree>
+
+| Component | Responsibility |
+| --- | --- |
+| `DreamZeroEntry` | Registers the plugin, passes engine configuration to the builder, and forwards requests |
+| `build_dreamzero_pipeline` | Builds the encoders, DiT, and scheduler; loads and validates module weights |
+| `DreamZeroPipeline` | Encodes observations, establishes conditioning, generates initial noise, and builds scheduler requests |
+| `encoder runners` | Run text encoding, image feature extraction, and VAE encoding/decoding |
+| `DreamZeroDiT` / `DiT runner` | Predicts denoised video and action outputs and maintains attention KV |
+| `DreamZeroScheduler` | Manages reference KV, CFG branches, DiT calls, and UniPC updates |
+| `DreamZeroProcessor` | Preprocesses observations, loads checkpoint statistics, and postprocesses actions |
+
+Each request first encodes text and visual conditioning, then prepares reference KV and video/action noise. The scheduler calls DiT in the denoising loop, updates both latent streams, and carries frame positions and caches into the next request. The CLI action inference path returns video latents directly without decoding RGB video.
+
+The request path is:
+
+```text
+Three camera views + robot state + task instruction
+  -> DreamZeroProcessor.preprocess()
+  -> Image grid, normalized state, positive/negative prompt tokens
+  -> Text encoder + image encoder + VAE
+  -> DiT jointly predicts video and actions; scheduler performs denoising updates
+  -> DreamZeroPipelineOutput: video latents + normalized actions
+  -> DreamZeroProcessor.postprocess(..., obs=observation)
+  -> DROID actions [1, 24, 8]
+```
+
+# Run DreamZero
+
+<Steps>
+  <Step title="Prepare the checkpoint">
+    Prepare the [DreamZero-DROID](https://huggingface.co/GEAR-Dreams/DreamZero-DROID) weights and UMT5 tokenizer. Keep the configuration, `experiment_cfg/metadata.json`, and `experiment_cfg/conf.yaml` in the model directory so the processor can read normalization statistics, modalities, and relative-action settings.
+
+    The examples use the repository's CUDA environment and BF16 precision, with TF32 and CUDA Graph disabled.
+  </Step>
+  <Step title="Build the engine">
+    Create an engine with the `dreamzero` plugin. This page uses the 16-step dynamic DiT schedule and the kernel policy in the example directory.
+
+    ```python
+    from pathlib import Path
+
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.kernel.config import KernelConfig
+    from phyai.models.dreamzero.main_dreamzero import DreamZeroArgs
+    from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+
+    checkpoint = Path("/path/to/DreamZero-DROID")
+
+    engine = Engine(
+        EngineArgs(
+            plugin="dreamzero",
+            plugin_args=DreamZeroArgs(
+                checkpoint_dir=checkpoint,
+                seed=1140,
+                weight_strict=True,
+                dynamic_dit=True,
+                dynamic_dit_scheduler_steps=16,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda:0", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(
+                    use_cuda_graph=False,
+                    allow_tf32=False,
+                    allow_cudnn_tf32=False,
+                ),
+                kernel=KernelConfig(config_path="examples/dreamzero/kernels.yaml"),
+            ),
+        )
+    )
+    ```
+  </Step>
+  <Step title="Build the processor">
+    The processor uses the same checkpoint as the engine and reads the loaded model configuration.
+
+    ```python
+    from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+    config = engine.entry.bundle.config
+    processor = DreamZeroProcessor.from_pretrained(
+        checkpoint,
+        tokenizer_name="/path/to/umt5-xxl",
+        max_length=config.text_encoder.max_length,
+        max_state_dim=config.max_state_dim,
+        max_action_dim=config.max_action_dim,
+        action_horizon=config.action_horizon,
+        num_views=3,
+    )
+    ```
+  </Step>
+  <Step title="Build a request">
+    Like the other models' single-request examples, generate synthetic observations to check the inference path: three random RGB images, zero state, and a task instruction. Zero state is a convention for this example; replace it with actual joint positions and gripper state when connecting a robot or simulator.
+
+    ```python
+    import numpy as np
+
+    rng = np.random.default_rng(1140)
+    observation = {
+        "video": rng.integers(0, 256, size=(1, 1, 3, 180, 320, 3), dtype=np.uint8),
+        "state": torch.zeros((1, 1, 8), dtype=torch.float32),
+        "task": ["Pick up the object"],
+    }
+    processed = processor.preprocess(observation)
+    ```
+  </Step>
+  <Step title="Run a step and reconstruct actions">
+    ```python
+    with torch.inference_mode():
+        output = engine.step(processed)
+        action = processor.postprocess(output, obs=observation).action
+    ```
+
+    DROID postprocessing returns a CPU FP32 tensor of shape `(1, 24, 8)`. Retain the original `observation` for relative-action reconstruction configured by the checkpoint.
+  </Step>
+  <Step title="Close the engine">
+    ```python
+    engine.close()
+    ```
+
+    Reuse the engine for subsequent requests in the same sequence, and close it when finished.
+  </Step>
+</Steps>
+
+# Request format
+
+## Raw observations
+
+This page uses `B=1`. `T` is the observation history length for each camera; it is `1` for the first request.
+
+| Field | Shape / type | Meaning |
+| --- | --- | --- |
+| `video` | `(B, T, 3, H, W, 3)`, `np.uint8` | Camera order: right, left, wrist; RGB channels in the range 0–255 |
+| `state` | `(B, 1, 8)`, FP32 | Seven joint positions and one gripper position, before normalization |
+| `task` | List of `B` strings | Language instruction for the current task |
+
+The processor center-crops each camera view, resizes it to `176 × 320`, and combines the views into a `352 × 640` grid. The wrist view occupies the upper half, and the right and left views occupy the two sides of the lower half. It also handles state normalization, padding, embodiment IDs, and tokenization of positive and negative prompts.
+
+## Engine requests and outputs
+
+`engine.step()` accepts `DreamZeroProcessedInputs`. The following shapes correspond to the common DROID configuration; use the loaded `config` for the actual widths.
+
+| Field | Shape | Description |
+| --- | --- | --- |
+| `processed.images` | `(B, T, 352, 640, 3)` | `uint8` image grid; the pipeline moves it to the device and maps it to `[-1, 1]` |
+| `processed.state` | `(B, 1, 64)` | Normalized and padded state |
+| `processed.input_ids` / `attention_mask` | `(B, L)` | Positive prompt tokens and mask; default maximum length `L=512` |
+| `processed.negative_input_ids` / `negative_attention_mask` | `(B, L)` | Negative prompt for CFG |
+| `processed.embodiment_id` | `(B,)` | Generated from the processor's DROID embodiment mapping |
+| `output.action` | `(B, 24, 32)` | Normalized output in the model's action space |
+| `output.video` | `(B, C_latent, T_latent, H_latent, W_latent)` | Denoised video latents, not yet decoded into RGB video |
+| `processor.postprocess(...).action` | `(B, 24, 8)` | CPU FP32 DROID actions |
+
+The postprocessor removes action padding, converts to FP32, and denormalizes using checkpoint statistics. If the checkpoint configures relative joint actions, it also reconstructs joint positions using the original observation. Keep `observation` and pass it as `obs=observation`.
+
+`DreamZeroPipelineOutput` also retains `request` and `scheduler_output` for inspecting internal noise, scheduling results, and frame positions. The internal `DreamZeroRequest` contains video and action latents, encoded conditioning, and cache control fields. The pipeline constructs it, so callers usually do not need to create it manually.
+
+# End-to-end example
+
+By default, `examples/dreamzero/run_dreamzero.py` generates three random `180 × 320` RGB images, an eight-dimensional zero state, and the task instruction `Pick up the object`. No camera connection or image files are required. Activate an environment with PhyAI dependencies installed, then run from the repository root:
+
+```bash
+python examples/dreamzero/run_dreamzero.py \
+  --checkpoint /path/to/DreamZero-DROID \
+  --tokenizer /path/to/umt5-xxl
+```
+
+The example defaults to the 16-step dynamic DiT schedule and its accompanying kernel policy, saving the output to `action.npy`:
+
+```text
+Saved action shape (1, 24, 8) to action.npy
+```
+
+This example runs the first action chunk of a new sequence to check preprocessing, model inference, and action postprocessing. Predictions from synthetic observations have no task-level meaning.
+
+See the inference configuration below for other optional arguments.
+
+# Sequential requests
+
+Reuse the same engine for a sequence. The caller collects and arranges historical observations, while the pipeline and scheduler retain encoded conditioning, frame positions, and DiT KV. The processor does not accumulate camera history for the caller.
+
+| Request scenario | Input and behavior |
+| --- | --- |
+| New sequence | Provide one observation frame; the pipeline creates first-frame conditioning and initializes KV |
+| Subsequent chunk | Provide multiple observation frames from the current sequence; the existing closed-loop adapter uses four historical frames, with the VAE encoding reference video to update history |
+| Local-attention window boundary | The pipeline releases old KV before re-encoding conditioning, resets the frame position, and starts a new window |
+| A single-frame observation arrives in an existing sequence | The pipeline automatically resets as a new sequence; continuously sending single frames repeatedly discards history |
+
+Prepare the four historical frames at the control loop's sampling cadence; repeating the current image cannot replace actual history. The underlying implementation also handles specific nine-frame reference inputs, but multi-frame lengths are constrained by `num_frame_per_block` and cannot be changed arbitrarily.
+
+To start a new task, clear the caller's observation history and call `engine.step()` with one new observation frame. Changing only the task text does not automatically create an independent session. For explicit cache control, use the `current_start_frame` and `reset_kv_cache` parameters of `engine.entry.bundle.pipeline`. This is a lower-level interface, and callers must also explicitly provide the required denoising configuration.
+
+# Inference configuration
+
+| CLI argument | Default | Behavior |
+| --- | --- | --- |
+| `--steps` | `4` | Selects fixed denoising steps only when `--no-dynamic-dit` is set |
+| `--dynamic-dit` / `--no-dynamic-dit` | Enabled | Uses the 16-step dynamic schedule by default; fixed steps apply only when disabled |
+| `--compile-scheduler` | Disabled | Compiles UniPC updates to follow the official BF16 rounding path |
+| `--kernel-config` | `kernels.yaml` in the example directory | Selects implementations for attention, normalization, and other operators |
+| `--seed` | `1140` | Controls synthetic images and initial video/action noise |
+| `--device` | `cuda:0` | Target device within `CUDA_VISIBLE_DEVICES` |
+| `--output` | `action.npy` | Save path for postprocessed actions |
+| `--right-image` / `--left-image` / `--wrist-image` | Unset | Camera image paths for real observations; all three views are required |
+| `--state` / `--task` | Zero state / `Pick up the object` in synthetic mode | Sets state or task; real observations require eight measured state values and an explicit task instruction |
+
+## Fixed4 and dynamic16
+
+The examples default to dynamic16. Use `--no-dynamic-dit` to switch to fixed steps. In dynamic mode, the scheduler uses changes in video predictions to decide which schedule steps run DiT again and which reuse previous predictions. The number 16 refers to schedule steps; the actual number of DiT forwards may be smaller. Do not treat dynamic16 as 16 fixed model executions when measuring performance.
+
+The corresponding Python settings are `DreamZeroArgs.num_inference_steps`, `dynamic_dit`, and `dynamic_dit_scheduler_steps`. The Entry passes them to the pipeline.
+
+## Kernel policy and compilation
+
+The example policy explicitly selects:
+
+| Operator | Implementation |
+| --- | --- |
+| DreamZero self-attention / cross-attention | `flashinfer.attention.fa2` |
+| LayerNorm | `torch.layernorm` |
+| VAE channel L2 norm | `torch.channel_l2_norm` |
+
+Other operators follow the framework's kernel selection rules. VAE channel L2 norm has different computational semantics from standard RMSNorm and should not be replaced based on its name alone.
+
+`compile_scheduler=True` compiles UniPC updates; it controls a different mechanism from `RuntimeConfig.use_cuda_graph`. The example disables CUDA Graph, and enabling scheduler compilation does not mean the entire model path has been captured as a CUDA Graph. Compilation adds overhead to the first execution, so time the first request separately from subsequent requests.
+
+Accuracy regression reports should record the checkpoint, source revision, kernel policy, Torch/CUDA versions, and actual initial video/action noise. The same seed does not guarantee elementwise-identical noise across device execution configurations. Enabling scheduler compilation alone also does not establish numerical parity with the official implementation across the full path.
+
+# Current limitations
+
+- This page covers a single GPU, `B=1`, and DROID three-camera inputs. Other parallel configurations in the model code are outside this page's validation scope.
+- `run_dreamzero.py` generates one initial action chunk. Network serving, historical-frame sampling, action execution, and task success evaluation require a higher-level adapter.
+- Weights, live KV, temporary encoding tensors, and compilation caches all affect peak memory. Jetson Thor's unified memory is also shared with CPU processes, so weight size alone is insufficient to estimate memory requirements for sequential requests.
+- Closing the engine releases the model and runtime state it holds. Resource peaks across successive episodes require separate validation in the target deployment environment.
+
+# Complete code
+
+Like the CLI entry point, this example uses random images, zero state, and a default task instruction. The processor and engine share a checkpoint, and padding widths and the action horizon come from the loaded model configuration.
+
+```python
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.kernel.config import KernelConfig
+from phyai.models.dreamzero.main_dreamzero import DreamZeroArgs
+from phyai_utils_tools.models.dreamzero import DreamZeroProcessor
+
+checkpoint = Path("/path/to/DreamZero-DROID")
+rng = np.random.default_rng(1140)
+observation = {
+    "video": rng.integers(0, 256, size=(1, 1, 3, 180, 320, 3), dtype=np.uint8),
+    "state": torch.zeros((1, 1, 8), dtype=torch.float32),
+    "task": ["Pick up the object"],
+}
+
+engine = Engine(
+    EngineArgs(
+        plugin="dreamzero",
+        plugin_args=DreamZeroArgs(
+            checkpoint_dir=checkpoint,
+            seed=1140,
+            weight_strict=True,
+            dynamic_dit=True,
+            dynamic_dit_scheduler_steps=16,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda:0", params_dtype=torch.bfloat16),
+            runtime=RuntimeConfig(
+                use_cuda_graph=False,
+                allow_tf32=False,
+                allow_cudnn_tf32=False,
+            ),
+            kernel=KernelConfig(config_path="examples/dreamzero/kernels.yaml"),
+        ),
+    )
+)
+try:
+    config = engine.entry.bundle.config
+    processor = DreamZeroProcessor.from_pretrained(
+        checkpoint,
+        tokenizer_name="/path/to/umt5-xxl",
+        max_length=config.text_encoder.max_length,
+        max_state_dim=config.max_state_dim,
+        max_action_dim=config.max_action_dim,
+        action_horizon=config.action_horizon,
+        num_views=3,
+    )
+    with torch.inference_mode():
+        processed = processor.preprocess(observation)
+        output = engine.step(processed)
+        action = processor.postprocess(output, obs=observation).action
+    assert tuple(action.shape) == (1, 24, 8)
+    assert torch.isfinite(action).all()
+    print(action.shape, action.dtype, action.device)
+finally:
+    engine.close()
+```

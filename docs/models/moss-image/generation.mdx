@@ -1,0 +1,136 @@
+---
+title: "MOSS-Image"
+description: "Run MOSS-Image-SFT with PhyAI, launch the Gradio UI, and configure CUDA Graph buckets and multi-GPU serving."
+---
+
+Generate images from text with [OpenMOSS-Team/MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT).
+PhyAI provides a command-line generator and a Gradio UI backed by a local PhyAI server.
+
+## Prepare the model
+
+You need Python 3.12 or newer, `uv`, and an NVIDIA GPU with CUDA and BF16 support.
+Run these commands from the PhyAI repository root:
+
+```bash
+uv sync
+export MOSS_CHECKPOINT=.cache/models/MOSS-Image-SFT
+hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir "$MOSS_CHECKPOINT"
+```
+
+For an existing download, set `MOSS_CHECKPOINT` to that directory and skip the download.
+Use the complete checkpoint, including its tokenizer and component configuration files.
+Keep the variable set in the shell where you launch the model. Check available GPUs
+with `nvidia-smi` and adjust `CUDA_VISIBLE_DEVICES` in the examples.
+
+## Start the server and UI
+
+The `launch` command starts both processes in one terminal:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile
+```
+
+After model loading, open [http://127.0.0.1:7860](http://127.0.0.1:7860), enter a
+prompt, and generate an image. Press Ctrl+C in the terminal to stop both processes.
+Use `--port` to change the UI port and `--server-port` to change the local gRPC port
+(default `50063`).
+
+`--cpu-offload` moves the text encoder and VAE to the GPU when needed. CUDA Graphs
+keep the transformer resident, so this mode still needs memory for the transformer
+and the active component. `--torch-compile` compiles selected transformer operations;
+the first startup or request can take longer while compilation and capture finish.
+
+## Prewarm CUDA Graph buckets
+
+CUDA Graphs are enabled by default. Prewarm common image sizes before accepting requests:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile \
+  --graph-bucket 512 512 128 \
+  --graph-bucket 1024 1024 256 \
+  --graph-cache-size 4
+```
+
+`--graph-bucket HEIGHT WIDTH TEXT_TOKENS` uses image dimensions in pixels, each
+divisible by 16. Text capacity rounds up to one of `64, 128, 256, 512, 1024, 2048, 4096`.
+For example, `100` rounds up to `128`. Repeat the option to prewarm multiple buckets.
+Reserve two cache entries per unique normalized bucket for the default guidance
+branches, so these two buckets require at least four entries. The default cache
+size is `4` per model replica.
+
+Graphs reuse capacity across actual text lengths: for the same image size and
+compute path, 18, 31, and 64 tokens can share one graph. A request can also reuse
+an existing larger bucket when it adds at most 25% more rows than the request's
+preferred bucket. Graphs are captured per sample and reused across batch compositions.
+Padding stays separate from valid tokens in attention.
+
+These options specify startup warmup, not a list of allowed request sizes. Other
+requests try existing graphs and capture on demand when needed. The cache evicts
+older entries while protecting graphs used by the current request; if all entries
+are in use, remaining shapes run without capture. To disable CUDA Graphs, add
+`--no-cuda-graph` and omit `--graph-bucket`.
+
+## Serve on multiple GPUs
+
+Use one model replica per GPU to handle concurrent requests:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python examples/moss_image/gradio_moss_image.py launch \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 1 --concurrency 2 --cpu-offload --torch-compile \
+  --graph-bucket 1024 1024 256
+```
+
+`--devices` refers to logical indices within `CUDA_VISIBLE_DEVICES`. The command
+above creates two independent model replicas, each with its own graph cache.
+Each request runs on one GPU; adding replicas increases request concurrency.
+`launch` defaults its UI concurrency to the replica count.
+
+## Connect a UI to an existing server
+
+Start the server in a terminal where `MOSS_CHECKPOINT` is set:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/gradio_moss_image.py serve \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --devices 0 --cpu-offload --torch-compile \
+  --host 127.0.0.1 --port 50063
+```
+
+In a second terminal at the repository root, start the UI:
+
+```bash
+python examples/moss_image/gradio_moss_image.py ui \
+  --server-address 127.0.0.1:50063 \
+  --host 127.0.0.1 --port 7860
+```
+
+The standalone UI defaults to one concurrent request. Add `--concurrency 2` when
+connecting it to a server with two replicas.
+
+## Generate an image from the command line
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/moss_image/run_moss_image.py \
+  --checkpoint "$MOSS_CHECKPOINT" \
+  --prompt 'A red apple on a wooden table.' \
+  --height 1024 --width 1024 --steps 50 --guidance-scale 3 --seed 42 \
+  --cpu-offload --torch-compile \
+  --out .cache/moss_image.png
+```
+
+Open `.cache/moss_image.png` to view the result. Output dimensions must be positive
+multiples of 16. The defaults are 50 steps, guidance scale 3, seed 42, an empty
+negative prompt, and skipping layer 22 in the negative branch. Use `--negative-prompt`
+to supply a negative prompt. The generator also accepts the graph options above.
+
+View all arguments:
+
+```bash
+python examples/moss_image/gradio_moss_image.py launch --help
+python examples/moss_image/run_moss_image.py --help
+```

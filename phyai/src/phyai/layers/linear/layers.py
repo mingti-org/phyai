@@ -28,7 +28,7 @@ from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.active import get_active_plan
 from phyai.layers.quant.materialize import materialize
 from phyai.parallel.state import resolve_mesh
-from phyai.weights.shards import _Leg, fused, replicated, sharded
+from phyai.weights.shards import _Leg, fused, packed_sharded, replicated, sharded
 
 
 def _M_of(x: torch.Tensor) -> int:
@@ -67,7 +67,7 @@ def _resolve_linear_kernel(
         device=x.device,
         dtype={
             "input": x.dtype,
-            "output": layer.params_dtype,
+            "output": getattr(layer, "out_dtype", layer.params_dtype),
             "weight": layer.weight.dtype,
         },
         quant=layer.spec.physical_signature,
@@ -182,6 +182,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         spec: object | None = None,
         scheme: object | None = None,
         device: torch.device | str | None = None,
@@ -200,6 +201,14 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
             kernel_role=kernel_role,
         )
+        self.out_dtype = out_dtype or self.params_dtype
+        if (
+            self.out_dtype != self.params_dtype
+            and self.spec.physical_signature.format not in {"bf16", "fp16"}
+        ):
+            raise ValueError(
+                "out_dtype is only supported for unquantized linear layers"
+            )
         self.spec.allocate(
             self,
             AllocationRequest(
@@ -252,6 +261,8 @@ class ColumnParallelLinear(LinearBase):
 
     With ``sequence_parallel=True``, the forward first all-gathers tokens
     along the same TP group (dim=0 by convention).
+    ``output_sizes`` describes a packed checkpoint such as ``[Q; K; V]``;
+    each partition is sharded independently on load.
     """
 
     def __init__(
@@ -336,15 +347,19 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-        # Non-fused column-parallel: subclasses (Merged / QKV) override
-        # by re-attaching after super().__init__ returns.
-        if prefix and len(per_rank_sizes) == 1:
-            weight_loader = sharded(dim=0, group=group, mesh=mesh_obj)
+        # Merged / QKV subclasses replace this single-source plan with their
+        # separate checkpoint legs after construction.
+        if prefix:
+            weight_loader = (
+                sharded(dim=0, group=group, mesh=mesh_obj)
+                if len(per_rank_sizes) == 1
+                else packed_sharded(sizes=global_sizes, group=group, mesh=mesh_obj)
+            )
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
-                self.bias.weight_loader = sharded(dim=0, group=group, mesh=mesh_obj)
+                self.bias.weight_loader = weight_loader
             self._attach_optional_scales(self, prefix)
 
     def forward(

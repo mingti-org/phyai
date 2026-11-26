@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from phyai.kernel.facts import lib, attrs, dtype, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
 from phyai.kernel.registry import Catalog
@@ -39,6 +41,17 @@ def _flashinfer(function_name: str):
     return prepare
 
 
+def _aiter(function_name: str):
+    """Prepare one named aiter gated activation."""
+
+    def prepare(facts, params):
+        from phyai_kernel.aiter import activation as module
+
+        return getattr(module, function_name)
+
+    return prepare
+
+
 def _torch(name: str, *, gated: bool):
     """Prepare one exact Torch activation topology."""
 
@@ -46,10 +59,21 @@ def _torch(name: str, *, gated: bool):
         import torch
 
         activations = {
+            "situ": lambda value: 4.0 * torch.tanh(value / 4.0) * torch.sigmoid(value),
             "silu": torch.nn.functional.silu,
             "gelu": lambda value: torch.nn.functional.gelu(value, approximate="none"),
             "gelu_tanh": lambda value: torch.nn.functional.gelu(
                 value, approximate="tanh"
+            ),
+            "t5_gelu": lambda value: (
+                0.5
+                * value
+                * (
+                    1.0
+                    + torch.tanh(
+                        math.sqrt(2.0 / math.pi) * (value + 0.044715 * value.pow(3.0))
+                    )
+                )
             ),
         }
         activate = activations[name]
@@ -58,11 +82,25 @@ def _torch(name: str, *, gated: bool):
             if not gated:
                 return activate(value)
             lhs, rhs = value.chunk(2, dim=-1)
+            if name == "situ":
+                rhs = 25.0 * torch.tanh(rhs / 25.0)
             return activate(lhs) * rhs
 
         return execute
 
     return prepare
+
+
+def _t5_gelu(facts, params):
+    from phyai_kernel import t5_gelu
+
+    return t5_gelu
+
+
+def _triton_situ(facts, params):
+    from phyai_kernel import situ_and_mul
+
+    return situ_and_mul
 
 
 FLASHINFER_KERNELS = (
@@ -72,9 +110,11 @@ FLASHINFER_KERNELS = (
 )
 
 TORCH_KERNELS = (
+    ("situ", True, "situ_and_mul"),
     ("silu", False, "silu"),
     ("gelu", False, "gelu"),
     ("gelu_tanh", False, "gelu_tanh"),
+    ("t5_gelu", False, "t5_gelu"),
     ("silu", True, "silu_and_mul"),
     ("gelu", True, "gelu_and_mul"),
     ("gelu_tanh", True, "gelu_tanh_and_mul"),
@@ -98,6 +138,63 @@ def register(catalog: Catalog) -> None:
                 },
             )
             for activation, function_name in FLASHINFER_KERNELS
+        )
+        + tuple(
+            Impl(
+                kernel_id=f"aiter.activation.{function_name}",
+                op="activation",
+                priority=Priority.OPTIMIZED + 2,
+                when=all_of(
+                    device.vendor == "amd",
+                    lib.has("phyai_kernel"),
+                    lib.has("aiter"),
+                    attrs.gated,
+                    dtype.input.in_({"bf16", "fp16"}),
+                    attrs.activation == activation,
+                ),
+                prepare=_aiter(function_name),
+                metadata={"package": "aiter", "activation": activation, "gated": True},
+            )
+            for activation, function_name in FLASHINFER_KERNELS
+        )
+        + (
+            Impl(
+                kernel_id="phyai_kernel.activation.t5_gelu",
+                op="activation",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    lib.has("phyai_kernel"),
+                    lib.has("flashinfer"),
+                    device.vendor == "nvidia",
+                    dtype.input.in_({"bf16", "fp16"}),
+                    attrs.activation == "t5_gelu",
+                    attrs.gated == False,
+                ),
+                prepare=_t5_gelu,
+                metadata={
+                    "package": "phyai_kernel",
+                    "activation": "t5_gelu",
+                    "gated": False,
+                },
+            ),
+            Impl(
+                kernel_id="phyai_kernel.activation.situ_and_mul",
+                op="activation",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    lib.has("phyai_kernel"),
+                    device.vendor == "nvidia",
+                    dtype.input.in_({"bf16", "fp16", "fp32"}),
+                    attrs.activation == "situ",
+                    attrs.gated,
+                ),
+                prepare=_triton_situ,
+                metadata={
+                    "package": "phyai-kernel",
+                    "activation": "situ",
+                    "gated": True,
+                },
+            ),
         )
         + tuple(
             Impl(

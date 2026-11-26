@@ -93,6 +93,9 @@ class FlashInferAttentionBackend(AttentionBackend):
         # means the row was FlashInfer's general entry point, whose own
         # heuristic is spelled "auto".
         self._prefill_backend = prefill_backend or "auto"
+        # The single-sequence API exposes only auto, FA2, and FA3. Other
+        # selected kernels use the batch wrapper even for a single sequence.
+        self._use_single_prefill = self._prefill_backend in {"auto", "fa2", "fa3"}
         if fi_workspace is not None:
             # In graph mode the fixed batch size may only be known when the
             # first metadata packet arrives, so defer wrapper construction
@@ -167,7 +170,9 @@ class FlashInferAttentionBackend(AttentionBackend):
                     "FlashInferAttentionBackend does not lower "
                     "AttnMask.segments; use the sdpa/eager backends."
                 )
-        elif meta.mode == AttnMode.IDLE or meta.batch_size <= 1:
+        elif meta.mode == AttnMode.IDLE or (
+            meta.batch_size <= 1 and self._use_single_prefill
+        ):
             return FlashInferAttentionPlan(wrapper=None)
         if meta.mode == AttnMode.IDLE:
             return FlashInferAttentionPlan(wrapper=None)
@@ -227,6 +232,10 @@ class FlashInferAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         if ctx.mode.is_idle():
             return q.new_zeros(q.shape)
+        if ctx.attn_bias is not None:
+            raise ValueError(
+                "FlashInfer no-cache attention does not support additive logit bias"
+            )
         if ctx.layout.is_padded():
             return self._forward_padded(layer, q, k, v, ctx)
         return self._forward_ragged(layer, q, k, v, ctx)
@@ -243,7 +252,7 @@ class FlashInferAttentionBackend(AttentionBackend):
         S_kv = k.shape[1]
         if ctx.mask is not None:
             return self._forward_padded_masked(layer, q, k, v, ctx)
-        if B == 1:
+        if B == 1 and self._use_single_prefill:
             return self._single(layer, q[0], k[0], v[0]).unsqueeze(0)
         plan = ctx.plan
         if not isinstance(plan, FlashInferAttentionPlan) or plan.wrapper is None:
@@ -325,7 +334,7 @@ class FlashInferAttentionBackend(AttentionBackend):
                 "FlashInferAttentionBackend ragged forward requires ctx.cu_seqlens_q."
             )
         B = ctx.cu_seqlens_q.numel() - 1
-        if B == 1:
+        if B == 1 and self._use_single_prefill:
             return self._single(layer, q, k, v)
         plan = ctx.plan
         if not isinstance(plan, FlashInferAttentionPlan) or plan.wrapper is None:
@@ -353,6 +362,7 @@ class FlashInferAttentionBackend(AttentionBackend):
             sm_scale=layer.scale,
             window_left=_fi_window_left(layer.sliding_window),
             logits_soft_cap=layer.logits_soft_cap,
+            backend=self._prefill_backend,
         )
 
 

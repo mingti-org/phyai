@@ -1,0 +1,15 @@
+schema: phyai.kernel/v1
+profile: static
+overrides:
+  - id: dreamzero-self-attention
+    match: {op: attention, role: dreamzero.self_attention}
+    use: flashinfer.attention.fa2
+  - id: dreamzero-cross-attention
+    match: {op: attention, role: dreamzero.cross_attention}
+    use: flashinfer.attention.fa2
+  - id: dreamzero-layernorm
+    match: {op: layernorm}
+    use: torch.layernorm
+  - id: dreamzero-vae-norm
+    match: {op: channel_l2_norm}
+    use: torch.channel_l2_norm

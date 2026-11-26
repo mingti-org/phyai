@@ -1,0 +1,95 @@
+name: build phyai packages
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version shared by all six workspace packages
+        required: true
+        type: string
+      source-ref:
+        description: Commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-ext:
+    name: build phyai-ext (manylinux_2_28)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          fetch-depth: 0
+
+      # The older glibc keeps the compiled plugin compatible with manylinux_2_28.
+      - name: Build and repair phyai-ext wheel in manylinux container
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" \
+            pytorch/manylinux2_28-builder:cpu bash -ceu '
+              export PATH=/opt/python/cp312-cp312/bin:$PATH
+              python -m pip install -U uv auditwheel cmake ninja
+              rm -rf /io/ext-raw /io/dist-ext
+              uv build --package phyai-ext -o /io/ext-raw
+              # apache-tvm-ffi provides libtvm_ffi.so at runtime.
+              auditwheel repair --exclude libtvm_ffi.so \
+                --plat manylinux_2_28_x86_64 \
+                /io/ext-raw/*.whl -w /io/dist-ext
+              cp /io/ext-raw/*.tar.gz /io/dist-ext/
+            '
+          ls -lh dist-ext
+
+      - name: Upload phyai-ext artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-ext
+          path: dist-ext/*
+          if-no-files-found: error
+
+  build-pure:
+    name: build pure packages and collect distributions
+    needs: build-ext
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build pure-Python packages
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          for pkg in phyai phyai-gateway phyai-kernel phyai-model-optimizer phyai-utils-tools; do
+            uv build --package "$pkg" --out-dir dist
+          done
+
+      - name: Download phyai-ext (manylinux) artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-ext
+          path: dist
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+
+      - name: Upload all distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error

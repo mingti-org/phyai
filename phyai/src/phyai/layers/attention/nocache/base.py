@@ -67,6 +67,9 @@ class AttnMetadata(BaseAttnMetadata):
     mask:
         Declarative :class:`~phyai.layers.attention.mask.AttnMask` for
         this step (padded layout only); backends lower it their way.
+    attn_bias:
+        Additive logit bias broadcastable to ``(B, H, S_q, S_kv)``. Padded
+        layout only; applied after logit scaling and before the structural mask.
     """
 
     cu_seqlens_q: torch.Tensor | None = None
@@ -77,6 +80,7 @@ class AttnMetadata(BaseAttnMetadata):
     q_dtype: torch.dtype | None = None
     kv_dtype: torch.dtype | None = None
     mask: AttnMask | None = None
+    attn_bias: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -108,6 +112,7 @@ class AttnCtx:
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_kv: torch.Tensor | None = None
     mask: AttnMask | None = None
+    attn_bias: torch.Tensor | None = None
 
 
 @runtime_checkable

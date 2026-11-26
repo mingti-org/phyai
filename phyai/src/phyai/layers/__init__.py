@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from phyai.layers.activation import SiLU, Snake1d
-from phyai.layers.modulation import AffineModulation
+from phyai.layers.activation import SiLU, Snake1d, T5GELU
+from phyai.layers.modulation import AffineModulation, LayerNormModulation
+from phyai.layers.qk_rmsnorm_rotary import QKRMSNormRotary
 from phyai.layers.layer_norm import (
     AdaRMSNorm,
     GatedRMSNorm,
@@ -28,10 +29,13 @@ __all__ = [
     "GatedRMSNorm",
     "GemmaRMSNorm",
     "LayerNorm",
+    "LayerNormModulation",
     "TransformerBlock",
     "RMSNorm",
+    "QKRMSNormRotary",
     "SiLU",
     "Snake1d",
+    "T5GELU",
     "ROPE_INV_FREQ_FNS",
     "InterleavedMRotaryEmbedding",
     "RotaryEmbedding",

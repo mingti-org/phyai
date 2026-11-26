@@ -30,6 +30,26 @@ class SiLU(nn.Module):
         return selection.execute(x)
 
 
+class T5GELU(nn.Module):
+    """T5's tanh GELU with rounding after each half-precision operation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_site = CallSite(
+            "activation",
+            role="activation",
+            attrs={"activation": "t5_gelu", "gated": False},
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        selection = self.call_site.select(
+            device=x.device,
+            dtype={"input": x.dtype, "output": x.dtype},
+            dims=token_shape(x, hidden=x.shape[-1] if x.ndim else 1),
+        )
+        return selection.execute(x)
+
+
 class Snake1d(nn.Module):
     """Learnable 1-D Snake activation: ``x + (exp(beta)+eps)^-1 * sin(exp(alpha)·x)^2``."""
 
@@ -85,4 +105,4 @@ class Snake1d(nn.Module):
         return x.reshape(shape)
 
 
-__all__ = ["SiLU", "Snake1d"]
+__all__ = ["SiLU", "Snake1d", "T5GELU"]

@@ -1,0 +1,118 @@
+---
+title: "Xiaomi U0 文生图"
+description: "准备 Xiaomi U0 权重，通过 PhyAI 从文本生成图片。"
+---
+
+使用 Xiaomi-Robotics-U0-4B，根据文字描述生成一张 1024 × 1024 的 RGB 图片。
+示例通过命令行运行，文本到视觉 token 的生成和 Emu3.5 图像解码都由 PhyAI 完成。
+
+## 准备模型
+
+你需要 Linux、Python 3.12 或更高版本、`uv`，以及支持 CUDA 和 BF16 的 NVIDIA GPU。
+安装时保留仓库对 Torch、Transformers 和 FlashInfer 的版本约束。在 PhyAI 仓库根目录执行：
+
+```bash
+uv lock
+uv sync --locked
+export U0_CHECKPOINT=/path/to/Xiaomi-Robotics-U0-4B
+export U0_VISION_TOKENIZER=/path/to/Emu3.5-VisionTokenizer
+```
+
+将两个变量设为已下载的模型目录，后续生成命令在同一个终端运行。
+如果已有配好的环境，激活该环境，再设置这两个权重路径。
+
+U0 目录需要包含模型权重、`config.json`、`unis.tiktoken` 和 `unis_vision_tokens.txt`。
+[Emu3.5-VisionTokenizer](https://huggingface.co/BAAI/Emu3.5-VisionTokenizer) 目录需要包含配置和模型权重。
+文本分词使用的 `tiktoken` 随 `phyai-utils-tools` 一起安装。
+
+## 生成图片
+
+先用 `nvidia-smi` 查看 GPU 是否空闲，再运行：
+
+```bash
+PHYAI_FLASHINFER_WORKSPACE_BYTES=536870912 \
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --vision-tokenizer-dir "$U0_VISION_TOKENIZER" \
+  --prompt "A studio photograph of a ceramic teapot on a wooden table." \
+  --output-dir ./outputs/u0-teapot \
+  --seed 42 \
+  --max-new-tokens 4169
+```
+
+打开 `outputs/u0-teapot/image.png` 查看结果。换一个提示词时，修改 `--prompt`，并为 `--output-dir` 指定新目录或空目录。
+
+`PHYAI_FLASHINFER_WORKSPACE_BYTES=536870912` 将 FlashInfer 工作区设为 512 MiB。
+默认的 128 MiB 不足以运行这个完整图像配置，估算显存时还要计入模型权重和 KV 缓存。
+一张完整图片需要输出 4169 个 token，`--max-new-tokens` 至少设为这个值。
+
+程序先生成 token 并关闭自回归引擎，再加载图像解码器，两个模型分阶段使用显存。
+
+## 查看输出
+
+输出目录包含以下文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `image.png` | 生成的 1024 × 1024 RGB 图片 |
+| `generated_ids.npy` | 输出 token，不包含提示词 |
+| `generation.json` | 提示词、种子、后端、停止原因、token 数、图片尺寸和计时 |
+| `input_ids.npy`、`unconditional_ids.npy` | 有条件和无文本输入的 token |
+| `tokenizer_mapping.json` | 图片尺寸对应的 token 映射 |
+
+正常完成时，`generation.json` 中的 `stop_reason` 为 `"eos"`，`generated_tokens` 为 `4169`。
+程序会检查视觉 token 流，再进行图像解码。
+
+## 检查文本分词
+
+如果只想查看提示词的 token，可以加上 `--prepare-only`，不加载模型权重：
+
+```bash
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
+  --checkpoint-dir "$U0_CHECKPOINT" \
+  --prompt "A studio photograph of a ceramic teapot on a wooden table." \
+  --output-dir ./outputs/u0-prepare \
+  --prepare-only
+```
+
+这个命令保存输入 token 数组、尺寸映射和准备记录，不需要图像解码器的权重。
+查看完整命令行参数：
+
+```bash
+uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py --help
+```
+
+## 生成样例
+
+以下图片在 NVIDIA Thor 上生成，使用 seed 42、CFG scale 3、FlashInfer 和 PhyAI 原生解码器。
+将上面生成命令中的提示词换成对应内容，并分别指定输出目录，即可运行这些样例。
+
+### 陶瓷茶壶
+
+提示词：A studio photograph of a ceramic teapot on a wooden table.
+
+![陶瓷茶壶](../../../images/models/xiaomi-u0/teapot-native.png)
+
+### 工业相机
+
+提示词：A compact industrial inspection camera on a brushed steel workbench, precise studio lighting.
+
+![工业相机](../../../images/models/xiaomi-u0/camera-native.png)
+
+### 机械夹爪
+
+提示词：A robotic gripper holding a small metal component on an assembly line, realistic industrial photography.
+
+![机械夹爪](../../../images/models/xiaomi-u0/gripper-native.png)
+
+## 支持的配置
+
+示例在单张 GPU 上处理一个提示词，生成固定的 64 × 64 视觉码网格，再解码为 1024 × 1024 图片。
+token 生成使用 BF16、FlashInfer 分页注意力和无文本条件的 CFG，scale 为 3；原生解码器使用模型发布的 FP32 权重。
+运行时关闭 CUDA Graph。当前示例不支持并发请求、其他图片尺寸或视频。
+
+## 验证结果
+
+上面的三个提示词均在 NVIDIA Thor 上通过 FlashInfer 和 PhyAI 原生解码器完成生成，返回 EOS、完整的 4169 个 token 和 1024 × 1024 RGB 图片。
+固定历史的自回归短回放通过近似精度检查；原生解码器对一组保存的视觉码完成了参考对照，输出误差在测试容差内。
+详细的比较方法和指标见 [PR #71](https://github.com/mingti-org/phyai/pull/71)。

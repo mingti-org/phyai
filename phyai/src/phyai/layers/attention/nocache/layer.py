@@ -46,7 +46,7 @@ class Attention(nn.Module):
         If set, apply ``cap * tanh(logits / cap)`` to attention logits
         before softmax (Gemma2 / Grok / Gemini style).
     backend:
-        ``"flashinfer"`` (default), ``"sdpa"``, or ``"eager"``. Resolved
+        ``"flashinfer"`` (default), ``"sdpa"``, or ``"eager"``.
         A preference, not a decision: the kernel selector filters by what each
         backend declares it can execute, then orders by policy. Validated
         against the catalog, so a typo raises.
@@ -156,7 +156,15 @@ class Attention(nn.Module):
         cu_seqlens_q: torch.Tensor | None = None,
         cu_seqlens_kv: torch.Tensor | None = None,
         mask: AttnMask | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attn_bias is not None and ctx is not None:
+            raise ValueError(
+                "pass attn_bias through AttnCtx when providing an explicit ctx"
+            )
+        bias = attn_bias if ctx is None else ctx.attn_bias
+        if bias is not None:
+            self._check_attn_bias(q, k, bias)
         if mask is not None:
             if ctx is not None:
                 raise ValueError(
@@ -193,7 +201,14 @@ class Attention(nn.Module):
 
         if ctx is None:
             ctx = self._build_default_ctx(
-                q, k, v, layout, cu_seqlens_q, cu_seqlens_kv, mask=mask
+                q,
+                k,
+                v,
+                layout,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                mask=mask,
+                attn_bias=attn_bias,
             )
         return ctx.backend.forward(self, q, k, v, ctx)
 
@@ -212,6 +227,7 @@ class Attention(nn.Module):
         *,
         mask: AttnMask | None = None,
         mode: KernelMode | str | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> AttnCtx:
         backend = self._ensure_backend(
             q,
@@ -220,6 +236,7 @@ class Attention(nn.Module):
             dtypes={"input": q.dtype, "key": k.dtype, "value": v.dtype},
             mask=mask,
             mode=mode,
+            attn_bias=attn_bias,
         )
         if layout.is_padded():
             B, S_q = q.shape[0], q.shape[1]
@@ -265,6 +282,7 @@ class Attention(nn.Module):
             q_dtype=q.dtype,
             kv_dtype=k.dtype,
             mask=mask,
+            attn_bias=attn_bias,
         )
         plan = backend.init_forward_metadata(meta)
         return AttnCtx(
@@ -275,6 +293,7 @@ class Attention(nn.Module):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             mask=mask,
+            attn_bias=attn_bias,
         )
 
     def _ensure_backend(
@@ -285,6 +304,7 @@ class Attention(nn.Module):
         dtypes: dict[str, object] | None = None,
         mask: AttnMask | None = None,
         mode: KernelMode | str | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> AttentionBackend:
         # Callers that only need the backend's metadata/lifecycle methods may
         # ask before any tensor exists. Selection then runs on the layer's
@@ -311,6 +331,7 @@ class Attention(nn.Module):
                 # catalog rows can require; "segments" routes away from
                 # backends that cannot lower it.
                 "mask_kind": None if mask is None else mask.kind,
+                "has_attn_bias": attn_bias is not None,
             },
             mode=mode,
         )
@@ -329,6 +350,27 @@ class Attention(nn.Module):
     # ------------------------------------------------------------------ #
     # Shape validation                                                   #
     # ------------------------------------------------------------------ #
+
+    def _check_attn_bias(
+        self, q: torch.Tensor, k: torch.Tensor, bias: torch.Tensor
+    ) -> None:
+        if q.ndim != 4 or bias.ndim not in (2, 3, 4):
+            raise ValueError(
+                "attn_bias requires padded attention and a 2-D, 3-D, or 4-D tensor"
+            )
+        if bias.device != q.device or bias.dtype not in (q.dtype, torch.float32):
+            raise ValueError(
+                "attn_bias must share q's device and use q's dtype or float32"
+            )
+        shape = (1,) * (4 - bias.ndim) + tuple(bias.shape)
+        target = (q.shape[0], self.num_heads, q.shape[1], k.shape[1])
+        if any(
+            size not in (1, expected)
+            for size, expected in zip(shape, target, strict=True)
+        ):
+            raise ValueError(
+                f"attn_bias shape {tuple(bias.shape)} cannot broadcast to {target}"
+            )
 
     def _check_padded(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.shape != v.shape:

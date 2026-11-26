@@ -51,8 +51,7 @@ class PagedAttention(nn.Module):
         Softmax scale, defaults to ``1 / sqrt(head_dim)``.
     backend:
         Canonical name of the backend the runner will resolve for
-        this stack (``"flashinfer"`` for GPU paged-KV — the only
-        backend; the paged stack is flashinfer-only).
+        this stack (``"flashinfer"`` or ``"sdpa"``).
         Validated against the kernel catalog at construction; the
         layer itself does not instantiate the backend.
     kernel_role:

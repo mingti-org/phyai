@@ -33,6 +33,7 @@ def eager_attn(
     sliding_window: int | None,
     logits_soft_cap: float | None,
     attn_mask: torch.Tensor | None = None,
+    attn_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference matmul + masked softmax. Inputs are ``(*, H, S, D)``.
 
@@ -47,6 +48,8 @@ def eager_attn(
     if logits_soft_cap is not None:
         cap = logits_soft_cap
         attn = cap * torch.tanh(attn / cap)
+    if attn_bias is not None:
+        attn = attn + attn_bias
     mask = (
         attn_mask
         if attn_mask is not None
@@ -59,7 +62,7 @@ def eager_attn(
     attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
     # Fully masked rows produce NaN after softmax(-inf); zero is the
     # subsystem-wide convention for rows with nothing to attend.
-    if mask is not None:
+    if mask is not None or attn_bias is not None:
         attn = torch.nan_to_num(attn, nan=0.0)
     return torch.matmul(attn, v)
 

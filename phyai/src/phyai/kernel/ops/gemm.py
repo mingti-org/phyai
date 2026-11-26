@@ -69,9 +69,16 @@ TORCH_FP8_BLOCK = all_of(
 
 
 def _flashinfer_bf16(facts, params):
+    from functools import partial
+
+    from phyai.kernel.call import torch_dtype
     from phyai.layers.linear.backends.flashinfer import gemm_bf16
 
-    return gemm_bf16
+    return partial(
+        gemm_bf16,
+        out_dtype=torch_dtype(str(facts.lookup("dtype.output"))),
+        **params,
+    )
 
 
 def _flashinfer_fp8_block(facts, params):
@@ -84,6 +91,17 @@ def _flashinfer_nvfp4(facts, params):
     from phyai.layers.linear.backends.flashinfer import gemm_nvfp4
 
     return gemm_nvfp4
+
+
+def _aiter_bf16(facts, params):
+    from phyai_kernel.aiter.gemm import ensure_tuned_config, mm
+
+    ensure_tuned_config()
+
+    def gemm(layer, x, bias):
+        return mm(x, layer.weight, bias)
+
+    return gemm
 
 
 def _torch_fp8_per_tensor(facts, params):
@@ -113,10 +131,27 @@ def _torch_nvfp4_reference(facts, params):
 def _torch_dense(facts, params):
     """Prepare the unquantized torch linear implementation."""
 
+    import torch
     import torch.nn.functional as F
 
+    from phyai.kernel.call import torch_dtype
+
+    out_dtype = torch_dtype(str(facts.lookup("dtype.output")))
+
     def dense(layer, x, bias):
-        return F.linear(x, layer.weight, bias)
+        if x.dtype == out_dtype:
+            return F.linear(x, layer.weight, bias)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            if x.is_cuda:
+                output = torch.mm(
+                    x.reshape(-1, x.shape[-1]),
+                    layer.weight.t(),
+                    out_dtype=out_dtype,
+                ).reshape(*x.shape[:-1], layer.weight.shape[0])
+            else:
+                # torch.mm's independent output dtype is CUDA-only.
+                output = F.linear(x.to(out_dtype), layer.weight.to(out_dtype))
+            return output if bias is None else output + bias
 
     return dense
 
@@ -153,11 +188,7 @@ def _register_humming(catalog: Catalog) -> None:
         ("w4a16", quant.format == "int4", a16),
         ("w8a16", quant.format == "int8", a16),
         ("fp8_a16", quant.format.in_({"fp8_e4m3", "fp8_e5m2"}), a16),
-        (
-            "mxfp4_a16",
-            quant.format == "mxfp4",
-            all_of(a16, dtype.output == "bf16"),
-        ),
+        ("mxfp4_a16", quant.format == "mxfp4", a16),
         ("nvfp4_a16", quant.format == "nvfp4", a16),
         (
             "fp8_a8",
@@ -216,6 +247,8 @@ def register(catalog: Catalog) -> None:
                 quant.format == "bf16",
                 device.arch.at_least("sm80"),
                 dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output.in_({"bf16", "fp32"}),
             ),
             prepare=_flashinfer_bf16,
             metadata={"package": "flashinfer", "note": "mm_bf16"},
@@ -249,13 +282,40 @@ def register(catalog: Catalog) -> None:
             prepare=_flashinfer_nvfp4,
             metadata={"package": "flashinfer"},
         ),
+        # aiter.
+        Impl(
+            kernel_id="aiter.gemm.bf16",
+            op="gemm",
+            priority=Priority.OPTIMIZED,
+            when=all_of(
+                device.vendor == "amd",
+                lib.has("phyai_kernel"),
+                lib.has("aiter"),
+                quant.format == "bf16",
+                dtype.input == "bf16",
+                dtype.weight == "bf16",
+                dtype.output == "bf16",
+            ),
+            prepare=_aiter_bf16,
+            metadata={"package": "aiter", "note": "tgemm with tuned shapes"},
+        ),
         # Torch.
         Impl(
             kernel_id="torch.gemm.bf16",
             op="gemm",
             priority=Priority.REFERENCE,
             reference=True,
-            when=quant.format.in_({"bf16", "fp16"}),
+            when=all_of(
+                quant.format.in_({"bf16", "fp16"}),
+                dtype.input == dtype.weight,
+                any_of(
+                    dtype.output == dtype.input,
+                    all_of(
+                        dtype.input.in_({"bf16", "fp16"}),
+                        dtype.output == "fp32",
+                    ),
+                ),
+            ),
             prepare=_torch_dense,
             metadata={"package": "torch", "note": "F.linear"},
         ),

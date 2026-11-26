@@ -32,6 +32,7 @@ ATTENTION = OpSpec(
         "mask_kind",
         "masked",
         "kv_tokens",
+        "has_attn_bias",
     ),
     signature="(runner=None, **kwargs) -> AttentionBackend",
     returns=returns_instance(object, constructed_with=("runner",)),
@@ -46,7 +47,6 @@ ATTENTION_PAGED = OpSpec(
     optional_attributes=("layer_id", "runner"),
     signature="(runner) -> PagedAttentionBackend",
     returns=returns_instance(object, constructed_with=("runner",)),
-    requires_reference=False,
     doc="Paged-KV attention (LM prefix, action experts, AR decode).",
 )
 
@@ -74,6 +74,7 @@ FLASHINFER_ATTENTION = all_of(
     dtype.input.in_(HALF_FLOATS),
     dtype.key.in_(HALF_FLOATS),
     dtype.value.in_(HALF_FLOATS),
+    attrs.has_attn_bias != True,
     attrs.mask_kind != "segments",
     # Spelled as an implication, not a negated conjunction: mask_kind is an
     # optional fact, and a missing optional evaluates vacuously true — under
@@ -89,6 +90,16 @@ FLASHINFER_ATTENTION = all_of(
 # a raise cannot drive a fallback.
 FLASHINFER_PAGED = all_of(
     NVIDIA_FLASHINFER,
+    shape.head_dim.in_({64, 128, 256}),
+    dtype.input.in_(HALF_FLOATS),
+)
+
+# aiter's CK batch prefill reads the same paged layout (indptr, page indices,
+# last-page lengths) as FlashInfer.
+AITER_PAGED = all_of(
+    device.vendor == "amd",
+    lib.has("phyai_kernel"),
+    lib.has("aiter"),
     shape.head_dim.in_({64, 128, 256}),
     dtype.input.in_(HALF_FLOATS),
 )
@@ -151,6 +162,14 @@ ATTENTION_EAGER_CLS = (
 PAGED_FLASHINFER_CLS = (
     "phyai.layers.attention.paged.backends.flashinfer",
     "FlashInferPagedBackend",
+)
+PAGED_AITER_CLS = (
+    "phyai.layers.attention.paged.backends.aiter",
+    "AiterPagedBackend",
+)
+PAGED_SDPA_CLS = (
+    "phyai.layers.attention.paged.backends.sdpa",
+    "SdpaPagedBackend",
 )
 GDN_FLASHINFER_CLS = (
     "phyai.layers.attention.gdn.backends.flashinfer",
@@ -336,6 +355,26 @@ def register(catalog: Catalog) -> None:
                 when=FLASHINFER_PAGED,
                 prepare=_backend_prepare(PAGED_FLASHINFER_CLS),
                 metadata={"package": "flashinfer"},
+            ),
+            Impl(
+                kernel_id="aiter.attention_paged",
+                op="attention_paged",
+                priority=Priority.OPTIMIZED + 2,
+                when=AITER_PAGED,
+                prepare=_backend_prepare(PAGED_AITER_CLS),
+                metadata={"package": "aiter"},
+            ),
+            Impl(
+                kernel_id="sdpa.attention_paged",
+                op="attention_paged",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    attrs.layout == "paged",
+                    dtype.input.in_({"bf16", "fp16", "fp32"}),
+                ),
+                prepare=_backend_prepare(PAGED_SDPA_CLS),
+                metadata={"package": "torch"},
             ),
             # Gated DeltaNet attention.
             Impl(

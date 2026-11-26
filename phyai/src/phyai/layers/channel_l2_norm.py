@@ -14,8 +14,9 @@ class ChannelL2Norm(nn.Module):
     """Compute ``normalize(x) * sqrt(channels) * gamma + bias``.
 
     ``eps`` clamps the L2 norm before division. ``compute_dtype`` controls the
-    reduction precision; normalized values return to the input dtype before
-    applying the scale and affine parameters.
+    reduction precision. ``restore_input_dtype`` casts normalized values back
+    before the affine operations; disable it to retain PyTorch's native dtype
+    promotion, including CUDA autocast.
     """
 
     def __init__(
@@ -29,6 +30,7 @@ class ChannelL2Norm(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str | None = None,
         compute_dtype: torch.dtype | None = torch.float32,
+        restore_input_dtype: bool = True,
         prefix: str = "",
         backend: str | None = None,
     ) -> None:
@@ -43,12 +45,17 @@ class ChannelL2Norm(nn.Module):
         self.eps = eps
         self.scale = channels**0.5
         self.compute_dtype = compute_dtype
+        self.restore_input_dtype = restore_input_dtype
         self._call = CallSite(
             "channel_l2_norm",
             role="norm.channel_l2",
             prefer=backend_preference("channel_l2_norm", backend),
             dims={"hidden": channels},
-            attrs={"channel_first": channel_first, "bias": bias},
+            attrs={
+                "channel_first": channel_first,
+                "bias": bias,
+                "restore_input_dtype": restore_input_dtype,
+            },
         )
         if device is None:
             device = get_engine_config().device.target
@@ -72,7 +79,8 @@ class ChannelL2Norm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         fused_compatible = (
-            x.ndim >= 2
+            self.restore_input_dtype
+            and x.ndim >= 2
             and x.shape[1 if self.channel_first else -1] == self.channels
             and (not self.channel_first or x.ndim == self.spatial_dims + 2)
             and x.is_contiguous()

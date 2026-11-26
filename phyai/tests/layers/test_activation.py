@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from phyai.layers import SiLU
+from phyai.layers import SiLU, T5GELU
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -49,3 +51,31 @@ def test_silu_cuda_graph_replays_changed_input():
         value.fill_(fill)
         graph.replay()
         torch.testing.assert_close(output, F.silu(value), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_t5_gelu_cuda_view_and_graph(dtype):
+    layer = T5GELU()
+    value = torch.randn(17, 258, device="cuda", dtype=dtype)[:, 1::2]
+
+    def reference():
+        return (
+            0.5
+            * value
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi) * (value + 0.044715 * value.pow(3.0))
+                )
+            )
+        )
+
+    torch.testing.assert_close(layer(value), reference(), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = layer(value)
+    value.normal_()
+    graph.replay()
+    torch.testing.assert_close(output, reference(), rtol=0, atol=0)
+    assert not layer.state_dict()

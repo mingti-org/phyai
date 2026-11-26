@@ -3,8 +3,7 @@
 Gated on CUDA + flashinfer-python. Exercises the 4-hook lifecycle
 (:meth:`init_cuda_graph_state` -> :meth:`init_capture_metadata` ->
 :meth:`replay_metadata` -> :meth:`forward`) and numerical agreement
-with a reference path. The paged stack is flashinfer-only, so the
-reference is the no-cache :class:`Attention` layer's eager backend on
+with the no-cache :class:`Attention` layer's eager reference backend on
 CPU fp32 (a single full-sample contiguous-slot paged read reduces to
 the same softmax as a ragged no-cache prefill).
 """

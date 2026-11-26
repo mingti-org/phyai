@@ -52,6 +52,8 @@ class EagerAttentionBackend(AttentionBackend):
             return q.new_zeros(q.shape)
         if ctx.layout.is_padded():
             return self._forward_padded(layer, q, k, v, ctx)
+        if ctx.attn_bias is not None:
+            raise ValueError("additive attention bias requires the padded layout")
         return self._forward_ragged(layer, q, k, v, ctx)
 
     def _forward_padded(
@@ -84,6 +86,7 @@ class EagerAttentionBackend(AttentionBackend):
             sliding_window=layer.sliding_window,
             logits_soft_cap=layer.logits_soft_cap,
             attn_mask=attn_mask,
+            attn_bias=ctx.attn_bias,
         )
         return out.transpose(1, 2).contiguous()
 

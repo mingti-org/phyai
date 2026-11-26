@@ -48,6 +48,24 @@
                 ]
               },
               {
+                "group": "DreamZero",
+                "pages": [
+                  "models/dreamzero/ws1"
+                ]
+              },
+              {
+                "group": "VPP2",
+                "pages": [
+                  "models/vpp2/inference"
+                ]
+              },
+              {
+                "group": "HumanWAM-Goal",
+                "pages": [
+                  "models/humanwam-goal/inference"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "models/molmoact2/inference"
@@ -66,7 +84,27 @@
                 "pages": [
                   "models/qwen-image/generation"
                 ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "models/moss-image/generation"
+                ]
+              },
+              {
+                "group": "Xiaomi U0",
+                "pages": [
+                  "models/xiaomi-u0/text-to-image",
+                  "models/xiaomi-u0/image-editing"
+                ]
+              },
+              {
+                "group": "LingBot V2",
+                "pages": [
+                  "models/lingbot_v2/inference"
+                ]
               }
+
             ]
           },
           {
@@ -79,7 +117,8 @@
             "group": "Deployment",
             "pages": [
               "deployment/server-gateway",
-              "deployment/parallel-serving"
+              "deployment/parallel-serving",
+              "deployment/amd-rocm"
             ]
           },
           {
@@ -134,6 +173,24 @@
                 ]
               },
               {
+                "group": "DreamZero",
+                "pages": [
+                  "zh/models/dreamzero/ws1"
+                ]
+              },
+              {
+                "group": "VPP2",
+                "pages": [
+                  "zh/models/vpp2/inference"
+                ]
+              },
+              {
+                "group": "HumanWAM-Goal",
+                "pages": [
+                  "zh/models/humanwam-goal/inference"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "zh/models/molmoact2/inference"
@@ -152,6 +209,25 @@
                 "pages": [
                   "zh/models/qwen-image/generation"
                 ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "zh/models/moss-image/generation"
+                ]
+              },
+              {
+                "group": "Xiaomi U0",
+                "pages": [
+                  "zh/models/xiaomi-u0/text-to-image",
+                  "zh/models/xiaomi-u0/image-editing"
+                ]
+              },
+              {
+                "group": "LingBot V2",
+                "pages": [
+                  "zh/models/lingbot_v2/inference"
+                ]
               }
             ]
           },
@@ -166,7 +242,8 @@
             "pages": [
               "zh/deployment/server-gateway",
               "zh/deployment/parallel-serving",
-              "zh/deployment/training-time-rtc"
+              "zh/deployment/training-time-rtc",
+              "zh/deployment/amd-rocm"
             ]
           },
           {

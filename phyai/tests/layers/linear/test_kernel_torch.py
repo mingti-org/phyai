@@ -8,22 +8,23 @@ block-scale expansion).
 
 from __future__ import annotations
 
-import pytest
 import torch
-import torch.nn as nn
+import pytest
 import torch.nn.functional as F
-
+from torch import nn
+from phyai.kernel.facts import Facts
+from phyai.kernel.ops.gemm import _torch_dense
+from phyai.layers.quant import AllocationRequest
+from phyai.layers.linear.spec import Fp8Spec, Bf16Spec, Nvfp4Spec
 from phyai.layers.linear.backend import Granularity
 from phyai.layers.linear.backends.torch import (
-    _expand_block_scale,
     _unpack_e2m1,
     gemm_fp8_block,
-    gemm_fp8_per_channel,
+    _expand_block_scale,
     gemm_fp8_per_tensor,
+    gemm_fp8_per_channel,
     gemm_nvfp4_reference,
 )
-from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, Nvfp4Spec
-from phyai.layers.quant import AllocationRequest
 
 
 def _sm() -> int:
@@ -72,8 +73,8 @@ def _build_layer(spec, *, N, K, device, dtype=torch.bfloat16, bias=False):
 def _gemm_eligible(signature: dict, *, device: str, N: int = 128, K: int = 128):
     """Kernel ids the catalog considers eligible for one GEMM call."""
 
-    from phyai.kernel.bootstrap import get_kernel_selector
     from phyai.kernel.types import KernelQuery, PhysicalSignature
+    from phyai.kernel.bootstrap import get_kernel_selector
 
     selector = get_kernel_selector()
     spec = selector.catalog.op("gemm")
@@ -110,6 +111,28 @@ NVFP4_128X4 = {**NVFP4_LINEAR, "layout": "128x4"}
 def test_torch_serves_bf16_on_any_device():
     assert "torch.gemm.bf16" in _gemm_eligible(BF16, device="cpu")
     assert "torch.gemm.bf16" in _gemm_eligible(BF16, device="nvidia:SM100")
+
+
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp32"])
+def test_dense_rows_require_bf16_operands_for_fp32_output(input_dtype):
+    from phyai.kernel.types import KernelQuery, PhysicalSignature
+    from phyai.kernel.bootstrap import get_kernel_selector
+
+    selector = get_kernel_selector()
+    query = selector.normalize(
+        KernelQuery.build(
+            "gemm",
+            device="nvidia:SM110",
+            dtype={"input": input_dtype, "output": "fp32", "weight": "bf16"},
+            quant=PhysicalSignature(format="bf16"),
+            shape={"M": 50, "N": 37, "K": 64},
+        )
+    )
+    facts = selector.facts_for(query, selector.catalog.op("gemm"))
+    eligible, _ = selector.assess(selector.catalog.op("gemm"), facts, query.mode)
+    kernel_ids = {item.kernel_id for item in eligible}
+    for kernel_id in ("torch.gemm.bf16", "flashinfer.gemm.bf16"):
+        assert (kernel_id in kernel_ids) == (input_dtype == "bf16")
 
 
 def test_torch_fp8_needs_sm89():
@@ -183,7 +206,8 @@ def test_torch_bf16_matches_F_linear():
     torch.nn.init.normal_(layer.bias, std=0.02)
 
     x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda")
-    y = F.linear(x, layer.weight, layer.bias)
+    kernel = _torch_dense(Facts({"dtype.input": "bf16", "dtype.output": "bf16"}), {})
+    y = kernel(layer, x, layer.bias)
     ref = F.linear(x, layer.weight, layer.bias)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
 
@@ -193,7 +217,8 @@ def test_torch_bf16_preserves_batch_dims():
     layer = _build_layer(Bf16Spec(), N=N, K=K, device="cuda")
     torch.nn.init.normal_(layer.weight, std=0.02)
     x = torch.randn(2, 3, K, dtype=torch.bfloat16, device="cuda")
-    y = F.linear(x, layer.weight, None)
+    kernel = _torch_dense(Facts({"dtype.input": "bf16", "dtype.output": "bf16"}), {})
+    y = kernel(layer, x, None)
     assert y.shape == (2, 3, N)
 
 

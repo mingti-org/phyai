@@ -29,10 +29,16 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
+- [2026/11] With the support of the AMD AIG Team, PhyAI supports inference on [AMD Instinct MI300X](https://phyai.mintlify.app/deployment/amd-rocm) (experimental).
+- [2026/11] Support [VPP2](https://phyai.mintlify.app/models/vpp2/inference) action and video inference with TP and video CFG parallelism.
+- [2026/11] 🤗 Support [HumanWAM-Goal](https://phyai.mintlify.app/models/humanwam-goal/inference), [arxiv](https://arxiv.org/pdf/2611.06817).
+- [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
+- [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
+- [2026/10] Support [Xiaomi Robotics U0](https://phyai.mintlify.app/models/xiaomi-u0/text-to-image) text-to-image generation.
 - [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
 - [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
 - [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
-- [2026/09] 🤗 Support PI0.5 RL rollout for PPO. RLinf integration is in progress via [RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587).
+- [2026/09] 🤗 Support PI0.5 RL rollout for PPO ([RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587)).
 - [2026/07] 🚀 Day 0 support for MiniCPM-Robotic [blog](https://mingti-org.github.io/phyai-blog/blogs/260719-day-0-minicpm-robotic/).
 - [2026/07] 👏 Introducing PhyAI, a latency-first serving engine for Physical AI. [Read the Blog](https://mingti-org.github.io/phyai-blog/blogs/260718-phyai/).
 - [2026/07] Support [PI0](https://phyai.mintlify.app/models/pi0/ws1).
@@ -58,13 +64,17 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
         <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>,
         <a href="https://phyai.mintlify.app/models/gr00t/ws1"><strong>GR00T N1.7</strong></a>,
         <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>,
-        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>
+        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>,
+        <a href="https://phyai.mintlify.app/models/lingbot_v2/inference"><strong>LingBot V2</strong></a>
       </td>
     </tr>
     <tr>
       <th align="center" width="22%">WAM</th>
       <td align="center">
-        <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel)
+        <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
+        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>,
+        <a href="docs/models/humanwam-goal/inference.mdx"><strong>HumanWAM-Goal</strong></a>,
+        <a href="https://phyai.mintlify.app/models/vpp2/inference"><strong>VPP2</strong></a>
       </td>
     </tr>
     <tr>
@@ -74,7 +84,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
         <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
-        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>
+        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>,
+        <a href="https://phyai.mintlify.app/models/xiaomi-u0/text-to-image"><strong>Xiaomi Robotics U0</strong></a> (T2I, X2I)
       </td>
     </tr>
   </tbody>
@@ -109,6 +120,8 @@ uv pip install phyai phyai-ext \
   --extra-index-url https://mingti-org.github.io/phyai/simple/ \
   --prerelease=allow
 ```
+
+**AMD ROCm (experimental):** see the [AMD ROCm guide](https://phyai.mintlify.app/deployment/amd-rocm).
 
 ## Quantization
 
@@ -176,18 +189,24 @@ We thank the contributors below and welcome more developers to join us in buildi
 
 ## Sponsors & Adoption
 
-PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti and ModelBest.
+PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti, ModelBest, RLInf and AMD.
 
 We are actively seeking partnerships with compute providers, chip vendors, and robotics companies. If you are interested in working with us, please [contact us](#contact).
 
 <table align="center" width="80%">
   <tbody>
     <tr>
-      <td align="center" width="50%">
+      <td align="center" width="25%">
         <img src="assets/mingti-new.png" alt="Mingti" width="240">
       </td>
-      <td align="center" width="50%">
+      <td align="center" width="25%">
         <img src="assets/modelbest.svg" alt="ModelBest" width="240">
+      </td>
+      <td align="center" width="25%">
+        <img src="assets/logo_white.svg" alt="RLInf" width="240">
+      </td>
+      <td align="center" width="25%">
+        <img src="assets/amd.svg" alt="AMD" width="240">
       </td>
     </tr>
   </tbody>
@@ -195,14 +214,17 @@ We are actively seeking partnerships with compute providers, chip vendors, and r
 
 ## Citation
 
-If you use PhyAI in research or production work, please cite the project:
+If you use PhyAI in research or production work, please cite the paper:
 
 ```bibtex
-@software{phyai2026,
-  title = {PhyAI: Latency-First Serving Engine for Physical AI},
-  author = {{PhyAI Team}},
-  year = {2026},
-  url = {https://github.com/mingti-org/phyai}
+@misc{wang2026phyairealtimephysicalai,
+  title={PhyAI: Real-Time Physical AI at the Edge, Scalable Rollouts in the Cloud},
+  author={Chenghua Wang and Daliang Xu and Dongqi Cai and Duojin Sun and Hao Zhang and Haoze Qian and Huaiyuan Zhang and Jinshuo Cui and Junbo Cui and Kezhao Zhao and Longxi Gao and Mengwei Xu and Rongjie Yi and Ruixin Liu and Shangguang Wang and Tam Sikyuen and Tianyue Zhang and Weikai Xie and Xuanzhe Liu and Yingying Qin and Yiwen Lu and Yuan Yao and Yuezhi Zu and Yunhan Guo and Yuxin Zheng and Ziqi Guo},
+  year={2026},
+  eprint={2608.03682},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2608.03682},
 }
 ```
 
