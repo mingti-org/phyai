@@ -26,6 +26,7 @@ class RegisteredModelServer:
     healthy: bool = True
     health_failures: int = 0
     removed: bool = False
+    max_batch_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class ModelRegistryService(model_inference_pb2_grpc.ModelRegistryServicer):
                 if managed and not server.managed:
                     server.managed = True
                     server.healthy = False
+                    server.max_batch_size = None
             result = self._describe(server, now)
 
         logger.info(
@@ -177,23 +179,29 @@ class ModelRegistryService(model_inference_pb2_grpc.ModelRegistryServicer):
                     server.server_id, server.endpoint, server.model_name
                 )
                 for server in self._servers.values()
-                if server.managed and not server.removed
+                if not server.removed
             ]
 
-    def record_health(self, server_id, healthy, *, failure_threshold=3):
+    def record_health(
+        self, server_id, healthy, *, max_batch_size=None, failure_threshold=3
+    ):
         with self._lock:
             server = self._servers.get(server_id)
-            if server is None or server.removed or not server.managed:
+            if server is None or server.removed:
                 return
             was_healthy = server.healthy
             if healthy:
-                server.health_failures = 0
-                server.healthy = True
+                server.max_batch_size = max_batch_size
+                if server.managed:
+                    server.health_failures = 0
+                    server.healthy = True
             else:
-                server.health_failures += 1
-                if server.health_failures >= failure_threshold:
-                    server.healthy = False
-            if was_healthy != server.healthy:
+                server.max_batch_size = None
+                if server.managed:
+                    server.health_failures += 1
+                    if server.health_failures >= failure_threshold:
+                        server.healthy = False
+            if server.managed and was_healthy != server.healthy:
                 logger.info(
                     "Backend %s model=%s healthy=%s",
                     server.endpoint,
@@ -279,4 +287,5 @@ class ModelRegistryService(model_inference_pb2_grpc.ModelRegistryServicer):
             "endpoint": server.endpoint,
             "healthy": self._healthy(server, now),
             "in_flight_requests": server.in_flight_requests,
+            "max_batch_size": server.max_batch_size,
         }

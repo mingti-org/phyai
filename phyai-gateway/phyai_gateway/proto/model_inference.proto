@@ -16,6 +16,8 @@ message HealthRequest {
 message HealthResponse {
   // True when the backend is ready to accept inference requests.
   bool healthy = 1;
+  // Model-defined health metadata, including max_batch_size when limited.
+  string extensions_json = 2;
 }
 
 // Optional backend-initiated registration with renewable leases.

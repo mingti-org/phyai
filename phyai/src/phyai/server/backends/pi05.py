@@ -110,6 +110,10 @@ class PI05Backend:
     def healthy(self):
         return self.runtime.healthy
 
+    @property
+    def max_batch_size(self):
+        return self.runtime.max_batch_size
+
     def infer(self, request, context):
         # The processor stores per-request state used by postprocess.
         with self._lock:

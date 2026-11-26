@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent import futures
 from functools import partial
 import importlib
+import json
 import os
 import signal
 import threading
@@ -46,8 +47,19 @@ class ModelInferenceServicer(rpc.ModelInferenceServicer):
         route_matches = (
             not request.model_name or request.model_name.strip() == self.model_name
         )
+        healthy = route_matches and not self.stopping and self.backend.healthy
+        max_batch_size = getattr(self.backend, "max_batch_size", None)
+        if max_batch_size is not None and (
+            type(max_batch_size) is not int or max_batch_size < 1
+        ):
+            raise ValueError("backend max_batch_size must be a positive integer")
         return pb.HealthResponse(
-            healthy=route_matches and not self.stopping and self.backend.healthy
+            healthy=healthy,
+            extensions_json=(
+                json.dumps({"max_batch_size": max_batch_size})
+                if healthy and max_batch_size is not None
+                else ""
+            ),
         )
 
     def Infer(self, request, context):

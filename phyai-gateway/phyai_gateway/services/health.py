@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import threading
@@ -72,12 +73,29 @@ class BackendHealthMonitor:
             if self._stop.is_set():
                 response.cancel()
                 continue
+            max_batch_size = None
             try:
-                healthy = response.result().healthy
+                result = response.result()
+                healthy = result.healthy
+                if healthy:
+                    metadata = json.loads(result.extensions_json or "{}")
+                    if not isinstance(metadata, dict):
+                        raise ValueError("health extensions_json must be a JSON object")
+                    max_batch_size = metadata.get("max_batch_size")
+                    if "max_batch_size" in metadata and (
+                        type(max_batch_size) is not int or max_batch_size < 1
+                    ):
+                        raise ValueError("health max_batch_size must be a positive integer")
             except grpc.RpcError:
                 healthy = False
+            except ValueError as error:
+                logger.warning("Invalid backend health metadata: %s", error)
+                healthy = False
             self._registry.record_health(
-                server_id, healthy, failure_threshold=self._failure_threshold
+                server_id,
+                healthy,
+                max_batch_size=max_batch_size,
+                failure_threshold=self._failure_threshold,
             )
 
     def close(self):
