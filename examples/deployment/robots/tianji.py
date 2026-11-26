@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 from functools import partial
 from dataclasses import field, dataclass
+from collections.abc import Mapping
 
 import numpy as np
 from phyai_robot import (
@@ -35,6 +36,7 @@ from phyai_robot import (
     CompositeRobot,
 )
 from phyai_robot.images import resize, resize_with_pad
+from phyai_robot.adapters import ACTION_PREFIX_KEY, PREFIX_LENGTH_KEY
 from phyai_robot.remote import PolicySpec, Embodiment
 from phyai_robot.backends.ros2 import (
     RosCommand,
@@ -295,7 +297,12 @@ def observation_schema(config: TianjiConfig, image_size: int) -> dict[str, Featu
     return schema
 
 
-def make_adapter(config: TianjiConfig, observations: dict[str, FeatureSpec]):
+def make_adapter(
+    config: TianjiConfig,
+    observations: dict[str, FeatureSpec],
+    *,
+    max_prefix_len: int = 0,
+):
     """Construct a VectorAdapter binding Tianji physical joints and calibrated grippers."""
     limits = tuple(config.gripper_limits_rad)
     return VectorAdapter(
@@ -318,7 +325,35 @@ def make_adapter(config: TianjiConfig, observations: dict[str, FeatureSpec]):
                 CommandSlot(f"gripper_{side}", clip=(0.0, 1.0)),
             )
         ],
+        max_prefix_len=max_prefix_len,
     )
+
+
+def rtc_max_prefix_len(spec: PolicySpec) -> int:
+    """Validate RTC metadata against the wire schema before constructing ROS resources."""
+    rtc = spec.metadata.get("rtc")
+    prefix = spec.inputs.get(ACTION_PREFIX_KEY)
+    length = spec.inputs.get(PREFIX_LENGTH_KEY)
+    if rtc is None:
+        if prefix is not None or length is not None:
+            raise ValueError("RTC input fields require rtc metadata")
+        return 0
+    if not isinstance(rtc, Mapping):
+        raise ValueError("rtc metadata must be a mapping")
+    maximum = rtc.get("max_prefix_len")
+    action_dim = sum(value.shape[0] for value in ACTION_SCHEMA.values())
+    if type(maximum) is not int or maximum < 1:
+        raise ValueError("rtc.max_prefix_len must be a positive integer")
+    if (
+        prefix is None
+        or prefix.shape != (maximum, action_dim)
+        or np.dtype(prefix.dtype) != np.dtype("float32")
+        or length is None
+        or length.shape != (1,)
+        or np.dtype(length.dtype) != np.dtype("int64")
+    ):
+        raise ValueError("RTC metadata and Tianji input schema do not match")
+    return maximum
 
 
 def check_gripper_range(action: Action) -> None:
@@ -374,6 +409,7 @@ class TianjiController:
 
 def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
     """Construct Tianji CompositeRobot, VectorAdapter, and controller activation hook."""
+    max_prefix_len = rtc_max_prefix_len(spec)
     from std_msgs.msg import Float32, Float32MultiArray
     from marvin_msgs.msg import JointcmdArm, Jointfeedback
     from sensor_msgs.msg import Image, CompressedImage
@@ -470,4 +506,8 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
         backends=[*cameras, controller.backend],
         action_guard=check_gripper_range,
     )
-    return Embodiment(robot, make_adapter(config, schema), controller.activate)
+    return Embodiment(
+        robot,
+        make_adapter(config, schema, max_prefix_len=max_prefix_len),
+        controller.activate,
+    )

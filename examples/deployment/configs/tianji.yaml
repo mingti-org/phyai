@@ -145,6 +145,7 @@ schedule:
   # Trajectory execution scheduling strategy:
   #   "stop_and_refill": Executes an action chunk prefix, pauses actuation, acquires a fresh
   #                      observation snapshot, queries inference, and resumes execution.
+  #   "rtc": Requires an RTC-trained model; keeps a committed trajectory during inference.
   strategy: stop_and_refill
 
   # Rate (in Hz) at which predicted source action targets are consumed from the chunk.
@@ -153,4 +154,11 @@ schedule:
 
   # Number of leading actions from each predicted chunk to execute before triggering a refill.
   # With action_hz=25.0 and execution_horizon=20, each chunk executes for exactly 20 / 25 = 0.8 seconds.
+  # In RTC this is the interval between inference anchors, measured in action periods.
   execution_horizon: 20
+
+  # RTC only: committed targets including the current interpolated target.
+  # Inference must finish before (prefix_steps - 1) / action_hz seconds.
+  # Requires 2 <= prefix_steps <= execution_horizon, prefix_steps <= trained K,
+  # and execution_horizon + prefix_steps <= model horizon.
+  prefix_steps: 8

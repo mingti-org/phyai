@@ -18,7 +18,13 @@ from omegaconf import MISSING
 from phyai_robot import FeatureSpec
 from numpy.typing import NDArray
 from phyai_robot.remote import PolicySpec
-from phyai_robot.adapters import STATE_KEY, ACTIONS_KEY, IMAGE_PREFIX
+from phyai_robot.adapters import (
+    STATE_KEY,
+    ACTIONS_KEY,
+    IMAGE_PREFIX,
+    ACTION_PREFIX_KEY,
+    PREFIX_LENGTH_KEY,
+)
 
 from .configuration import repository_path
 
@@ -36,6 +42,9 @@ class Pi05PolicyConfig:
             Set to null to use the checkpoint's native default (e.g. 5 steps for Tianji, 10 for AgileX).
         use_cuda_graph: Enable CUDA graph capture and replay for minimized execution jitter.
         num_threads: Number of CPU worker threads allocated to the PhyAI engine runtime.
+        vision_params_dtype: Optional vision tower precision; null keeps the engine default.
+        enable_rlt: Opt in to trained RL-token inference; false preserves action-only output.
+        enable_rtc: Opt in to trained action-prefix conditioning; false keeps ordinary Pi05.
     """
 
     checkpoint: str = MISSING
@@ -44,13 +53,22 @@ class Pi05PolicyConfig:
     num_inference_steps: int | None = None
     use_cuda_graph: bool = True
     num_threads: int = 16
+    vision_params_dtype: str | None = None
+    enable_rlt: bool = False
+    enable_rtc: bool = False
 
     def validate(self) -> None:
         """Validate configuration paths and parameters without allocating GPU memory."""
+        if type(self.enable_rlt) is not bool or type(self.enable_rtc) is not bool:
+            raise ValueError("policy.enable_rlt and policy.enable_rtc must be booleans")
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
             raise ValueError("policy.num_inference_steps must be positive or null")
         if self.num_threads < 1:
             raise ValueError("policy.num_threads must be positive")
+        if self.vision_params_dtype not in (None, "float32", "bfloat16"):
+            raise ValueError(
+                "policy.vision_params_dtype must be float32, bfloat16 or null"
+            )
         if not 0 <= self.seed < 2**64:
             raise ValueError("policy.seed must be in [0, 2**64)")
         if not self.checkpoint.strip() or not repository_path(self.checkpoint).is_dir():
@@ -157,6 +175,30 @@ class Pi05Processing:
             raise ValueError("model produced non-finite actions")
         return values
 
+    def encode_action_prefix(
+        self,
+        action_prefix: NDArray[np.float32],
+        state: NDArray[np.float32],
+        *,
+        max_action_dim: int,
+    ) -> Any:
+        """Map physical targets into normalized [1, P, max_action_dim] actions.
+
+        Factories that change action decoding must override this hook as well.
+        """
+        if (
+            getattr(self.postprocess, "__func__", None)
+            is not Pi05Processing.postprocess
+        ):
+            raise ValueError(
+                "custom postprocess requires an RTC encode_action_prefix override"
+            )
+        return self._processor.encode_action_prefix(
+            self._torch.from_numpy(np.array(action_prefix)).unsqueeze(0),
+            self._torch.from_numpy(np.array(state)).unsqueeze(0),
+            max_action_dim=max_action_dim,
+        ).float()
+
 
 class Pi05Policy:
     """Manages the resident PhyAI Pi0.5 inference engine and reproducible noise stream."""
@@ -169,7 +211,10 @@ class Pi05Policy:
         from phyai.kernel.config import KernelConfig
         from phyai.models.pi05.main_pi05 import PI05Args
         from phyai.models.pi05.scheduler_pi05 import PI05Request
-        from phyai.models.pi05.configuration_pi05 import PI05Config
+        from phyai.models.pi05.configuration_pi05 import (
+            PI05Config,
+            resolve_inference_config,
+        )
         from phyai import Engine, EngineArgs
 
         checkpoint = repository_path(config.checkpoint)
@@ -180,22 +225,64 @@ class Pi05Policy:
                 model_config, num_inference_steps=config.num_inference_steps
             )
 
+        checkpoint_config = model_config
+        model_config = resolve_inference_config(
+            checkpoint_config,
+            enable_rlt=config.enable_rlt,
+            enable_rtc=config.enable_rtc,
+        )
         self.processing = processing
         self.num_inference_steps = int(model_config.num_inference_steps)
         self.horizon = int(model_config.chunk_size)
+        self.max_prefix_len = model_config.max_prefix_len
+        self.rlt_mode = model_config.rlt_mode
+        self.rlt_token_dim = (
+            int(model_config.text.hidden_size) if self.rlt_mode != "off" else 0
+        )
+        if (
+            type(self.max_prefix_len) is not int
+            or not 0 <= self.max_prefix_len < self.horizon
+        ):
+            raise ValueError("max_prefix_len must be an integer in [0, chunk_size)")
 
         self._torch = torch
         self._request_type = PI05Request
         self._max_action_dim = int(model_config.max_action_dim)
         self._seed = config.seed
         self._generator = torch.Generator().manual_seed(config.seed)
+        if self.max_prefix_len:
+            # Reject unsupported processing before allocating engine resources.
+            self._rtc_request(
+                {
+                    ACTION_PREFIX_KEY: np.zeros(
+                        (self.max_prefix_len, processing.action_dim), np.float32
+                    ),
+                    PREFIX_LENGTH_KEY: np.zeros(1, np.int64),
+                    STATE_KEY: np.zeros(
+                        processing.input_schema()[STATE_KEY].shape, np.float32
+                    ),
+                }
+            )
 
         # Initialize the high-performance PhyAI CUDA inference engine.
         self._engine = Engine(
             EngineArgs(
                 plugin="pi05",
                 plugin_args=PI05Args(
-                    checkpoint_dir=checkpoint, config=model_config, max_batch_size=1
+                    checkpoint_dir=checkpoint,
+                    config=checkpoint_config,
+                    enable_rlt=config.enable_rlt,
+                    enable_rtc=config.enable_rtc,
+                    max_batch_size=1,
+                    inputs_image_shape=[
+                        processing.input_schema()[IMAGE_PREFIX + name].shape
+                        for name in processing.camera_names
+                    ],
+                    vision_params_dtype=(
+                        getattr(torch, config.vision_params_dtype)
+                        if config.vision_params_dtype is not None
+                        else None
+                    ),
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
@@ -216,13 +303,35 @@ class Pi05Policy:
     def spec(self, metadata: Mapping[str, Any]) -> PolicySpec:
         """Assemble the complete PolicySpec describing model inputs, outputs, and metadata."""
         processing = self.processing
+        inputs = processing.input_schema()
+        outputs = {
+            ACTIONS_KEY: FeatureSpec(
+                (self.horizon, processing.action_dim), processing.action_dtype
+            )
+        }
+        rtc = {}
+        if self.max_prefix_len:
+            inputs = {
+                **inputs,
+                ACTION_PREFIX_KEY: FeatureSpec(
+                    (self.max_prefix_len, processing.action_dim), "float32"
+                ),
+                PREFIX_LENGTH_KEY: FeatureSpec((1,), "int64"),
+            }
+            rtc = {"rtc": {"max_prefix_len": self.max_prefix_len}}
+        rlt = {}
+        if self.rlt_mode != "off":
+            outputs["rl_token"] = FeatureSpec((1, self.rlt_token_dim), "float32")
+            rlt = {
+                "rlt": {
+                    "mode": self.rlt_mode,
+                    "token_dim": self.rlt_token_dim,
+                    "source": "final_vlm_visual_hidden_states",
+                }
+            }
         return PolicySpec(
-            inputs=processing.input_schema(),
-            outputs={
-                ACTIONS_KEY: FeatureSpec(
-                    (self.horizon, processing.action_dim), processing.action_dtype
-                )
-            },
+            inputs=inputs,
+            outputs=outputs,
             metadata=dict(
                 metadata,
                 horizon=self.horizon,
@@ -230,8 +339,49 @@ class Pi05Policy:
                 camera_names=processing.camera_names,
                 action_dim=processing.action_dim,
                 num_inference_steps=self.num_inference_steps,
+                **rtc,
+                **rlt,
             ),
         )
+
+    def _rtc_request(self, inputs: Mapping[str, NDArray[Any]]) -> dict[str, Any]:
+        if not self.max_prefix_len:
+            return {}
+        prefix = np.asarray(inputs[ACTION_PREFIX_KEY])
+        lengths = np.asarray(inputs[PREFIX_LENGTH_KEY])
+        if (
+            prefix.shape != (self.max_prefix_len, self.processing.action_dim)
+            or prefix.dtype != np.float32
+            or not np.isfinite(prefix).all()
+        ):
+            raise ValueError(
+                "action_prefix must match the finite float32 RTC input schema"
+            )
+        if (
+            lengths.shape != (1,)
+            or lengths.dtype != np.int64
+            or not 0 <= lengths[0] <= self.max_prefix_len
+        ):
+            raise ValueError("prefix_length must be int64[1] in [0, max_prefix_len]")
+        encoded = self.processing.encode_action_prefix(
+            prefix, inputs[STATE_KEY], max_action_dim=self._max_action_dim
+        )
+        torch = self._torch
+        if (
+            not isinstance(encoded, torch.Tensor)
+            or encoded.shape != (1, self.max_prefix_len, self._max_action_dim)
+            or encoded.dtype != torch.float32
+            or not torch.isfinite(encoded).all()
+        ):
+            raise ValueError(
+                "encode_action_prefix must return finite float32[1, K, max_action_dim]"
+            )
+        encoded = encoded.clone()
+        encoded[:, int(lengths[0]) :] = 0
+        return {
+            "action_prefix": encoded,
+            "prefix_lengths": torch.from_numpy(lengths.copy()),
+        }
 
     def predict(self, inputs: Mapping[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
         """Synchronously execute preprocessing, Euler denoising, and postprocessing.
@@ -244,6 +394,7 @@ class Pi05Policy:
             if self._close_requested.is_set():
                 raise RuntimeError("Pi05Policy is closed")
             try:
+                rtc_request = self._rtc_request(inputs)
                 processed = self.processing.preprocess(inputs)
                 # Sample initial Gaussian noise (shape: (1, horizon, max_action_dim)).
                 noise = torch.randn(
@@ -254,21 +405,32 @@ class Pi05Policy:
                     dtype=torch.float32,
                 )
                 with torch.inference_mode():
-                    normalized = (
-                        self._engine.step(
-                            self._request_type(
-                                pixel_values=processed.pixel_values,
-                                input_ids=processed.input_ids,
-                                lang_lens=processed.lang_lens,
-                                noise=noise,
-                            )
+                    result = self._engine.step(
+                        self._request_type(
+                            pixel_values=processed.pixel_values,
+                            input_ids=processed.input_ids,
+                            lang_lens=processed.lang_lens,
+                            noise=noise,
+                            **rtc_request,
                         )
-                        .detach()
-                        .float()
-                        .cpu()
                     )
+                    normalized = result.actions if self.rlt_mode != "off" else result
+                    normalized = normalized.detach().float().cpu()
+                    if self.rlt_mode != "off":
+                        token = result.rl_token.detach().float().cpu().numpy()
+                        if (
+                            token.shape != (1, 1, self.rlt_token_dim)
+                            or not np.isfinite(token).all()
+                        ):
+                            raise ValueError(
+                                "model must produce a finite rl_token with shape "
+                                f"(1, 1, {self.rlt_token_dim})"
+                            )
                 actions = self.processing.postprocess(normalized, inputs[STATE_KEY])
-                return {ACTIONS_KEY: actions}
+                outputs = {ACTIONS_KEY: actions}
+                if self.rlt_mode != "off":
+                    outputs["rl_token"] = token[0]
+                return outputs
             finally:
                 if self._close_requested.is_set():
                     self._close_engine()

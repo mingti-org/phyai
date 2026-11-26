@@ -16,7 +16,7 @@ from phyai.engine import Engine, EngineArgs, EngineUnavailableError
 from phyai.engine_config import EngineConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Output, PI05Request
 from phyai.server.deployment import DeploymentConfig
 from phyai.utils import get_logger, load_config
 from phyai_gateway.bindings import model_inference_pb2
@@ -221,6 +221,8 @@ class PI05Runtime:
         state = torch.zeros(1, self.state_shape[0], dtype=torch.float32)
         request = self._make_request(images, state, ["warm up"])
         actions = self.engine.step(request)
+        if isinstance(actions, PI05Output):
+            actions = actions.actions
         self.processor.postprocess(actions[..., : self.action_dim])
         torch.cuda.synchronize(self.device)
 
@@ -230,6 +232,8 @@ class PI05Runtime:
         start_ns = time.perf_counter_ns()
         try:
             actions = self.engine.step(request)
+            if isinstance(actions, PI05Output):
+                actions = actions.actions
         except EngineUnavailableError:
             self._ready = False
             raise

@@ -14,7 +14,7 @@ from .types import (
 )
 from .policy import Policy, EnginePolicy, PolicyAdapter
 from .adapters import StateSlot, CommandSlot, VectorAdapter
-from .scheduling import Scheduler, StopAndRefill, InferenceContext
+from .scheduling import Scheduler, StopAndRefill, InferenceContext, RealTimeChunking
 from .deployment import RobotDeployment, DeploymentOptions
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "ObservationSchema",
     "Policy",
     "PolicyAdapter",
+    "RealTimeChunking",
     "Robot",
     "RobotDeployment",
     "Sample",

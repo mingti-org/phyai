@@ -41,6 +41,8 @@ from .validation import validate_schema
 IMAGE_PREFIX = "image."  # Prefix for camera image inputs (e.g. "image.front").
 STATE_KEY = "state"  # Key for the concatenated 1D state vector.
 ACTIONS_KEY = "actions"  # Key for the 2D predicted action trajectory matrix (horizon, action_dim).
+ACTION_PREFIX_KEY = "action_prefix"
+PREFIX_LENGTH_KEY = "prefix_length"
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,7 @@ class VectorAdapter:
         ],  # Mapping: model camera identifier -> observation field name.
         state: Sequence[StateSlot],  # Ordered sequence of StateSlot extractors.
         commands: Sequence[CommandSlot],  # Ordered sequence of CommandSlot unpackers.
+        max_prefix_len: int = 0,
     ) -> None:
         """Construct and validate a VectorAdapter against robot schemas.
 
@@ -134,6 +137,9 @@ class VectorAdapter:
         """
         validate_schema(observation_schema)
         validate_schema(action_schema)
+        if type(max_prefix_len) is not int or max_prefix_len < 0:
+            raise ValueError("max_prefix_len must be a nonnegative integer")
+        self.max_prefix_len = max_prefix_len
 
         if not cameras:
             raise ValueError("at least one camera is required")
@@ -190,6 +196,16 @@ class VectorAdapter:
                     for name, field in cameras.items()
                 },
                 STATE_KEY: FeatureSpec((self.state_dim,), "float32"),
+                **(
+                    {
+                        ACTION_PREFIX_KEY: FeatureSpec(
+                            (max_prefix_len, self.action_dim), "float32"
+                        ),
+                        PREFIX_LENGTH_KEY: FeatureSpec((1,), "int64"),
+                    }
+                    if max_prefix_len
+                    else {}
+                ),
             }
         )
 
@@ -224,13 +240,43 @@ class VectorAdapter:
 
         Images are referenced directly without copying.
         """
-        return {
+        if context.pending and not self.max_prefix_len:
+            raise ValueError("pending actions require an RTC-enabled adapter")
+        request = {
             **{
                 IMAGE_PREFIX + name: observation.samples[field].value
                 for name, field in self._cameras.items()
             },
             STATE_KEY: self.state_vector(observation),
         }
+        if self.max_prefix_len:
+            length = len(context.pending)
+            if length > self.max_prefix_len:
+                raise ValueError("pending actions exceed max_prefix_len")
+            prefix = np.zeros((self.max_prefix_len, self.action_dim), np.float32)
+            for row, action in enumerate(context.pending):
+                for field, part, spec, _ in self._commands:
+                    value = np.asarray(action[field])
+                    if (
+                        value.shape != spec.shape
+                        or value.dtype != np.dtype(spec.dtype)
+                        or not np.isfinite(value).all()
+                    ):
+                        raise ValueError(f"invalid pending action field {field!r}")
+                    # These are the physical targets after command-slot clipping.
+                    prefix[row, part] = value
+                    if value.dtype.kind in "biu" and any(
+                        int(source) != int(encoded)
+                        for source, encoded in zip(value, prefix[row, part])
+                    ):
+                        raise ValueError(
+                            "discrete pending actions must be exactly representable as float32"
+                        )
+            if not np.isfinite(prefix).all():
+                raise ValueError("pending actions are not representable as float32")
+            request[ACTION_PREFIX_KEY] = prefix
+            request[PREFIX_LENGTH_KEY] = np.array([length], dtype=np.int64)
+        return request
 
     def to_actions(
         self, result: Mapping[str, NDArray[Any]], observation: Observation

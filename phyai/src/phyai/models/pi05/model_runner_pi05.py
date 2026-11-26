@@ -26,7 +26,9 @@ from phyai.models.pi05.modeling_pi05 import (
     ActionTimeHeads,
     PI05ExpertStack,
     PI05VisionTower,
+    ExpertLayerModulation,
     ExpertModulationTables,
+    ExpertStepModulation,
     PaliGemmaLanguageModel,
     PI05ValueHead,
     value_from_suffix,
@@ -463,6 +465,7 @@ class PI05ExpertRunner(ModelRunner):
         max_action_dim: int,
         params_dtype: torch.dtype,
         device: torch.device | str,
+        max_prefix_len: int = 0,
         suffix_value_head: PI05ValueHead | None = None,
         critic_action_chunk: int | None = None,
         use_cuda_graph: bool = True,
@@ -476,6 +479,7 @@ class PI05ExpertRunner(ModelRunner):
         self.batch_size = int(batch_size)
         self.chunk_size = int(chunk_size)
         self.max_action_dim = int(max_action_dim)
+        self.max_prefix_len = max_prefix_len
         self.expert_hidden = int(heads.expert_hidden)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
@@ -546,6 +550,47 @@ class PI05ExpertRunner(ModelRunner):
         # hands it to the (stateless) norms, so the ``dense`` projections stay
         # out of the captured graph. ``None`` until the schedule is bound.
         self._mod_tables: ExpertModulationTables | None = None
+        self.action_prefix_buf: torch.Tensor | None = None
+        self.action_prefix_mask: torch.Tensor | None = None
+        if self.max_prefix_len:
+            self.action_prefix_buf = torch.zeros(
+                self.batch_size,
+                self.chunk_size,
+                self.max_action_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.action_prefix_mask = torch.zeros(
+                self.batch_size,
+                self.chunk_size,
+                1,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+    def set_action_prefix(
+        self,
+        action_prefix: torch.Tensor | None,
+        prefix_lengths: torch.Tensor | None,
+    ) -> None:
+        """Stage a validated prefix without changing captured buffer addresses."""
+        assert self.action_prefix_buf is not None
+        assert self.action_prefix_mask is not None
+        self.action_prefix_buf.zero_()
+        self.action_prefix_mask.zero_()
+        if action_prefix is None:
+            return
+        batch_size, prefix_size, _ = action_prefix.shape
+        self.action_prefix_buf[:batch_size, :prefix_size].copy_(
+            action_prefix.to(device=self.device, dtype=torch.float32)
+        )
+        if prefix_lengths is None:
+            self.action_prefix_mask[:batch_size, :prefix_size] = True
+        else:
+            self.action_prefix_mask[:batch_size, :prefix_size, 0] = (
+                torch.arange(prefix_size, device=self.device)[None, :]
+                < prefix_lengths.to(device=self.device)[:, None]
+            )
 
     def set_write_indices(self, write_indices_suffix: torch.Tensor) -> None:
         """Bind the suffix-slab slot indices once at scheduler setup."""
@@ -572,11 +617,14 @@ class PI05ExpertRunner(ModelRunner):
         :meth:`_build_modulation_tables`); the captured loop then selects each
         step's modulation by index instead of re-running the projection,
         keeping those GEMMs out of the graph.
+
+        With RTC enabled, the table has one extra final row for clean time 0.
         """
-        if time_emb_table.shape[0] != num_steps:
+        expected_rows = num_steps + int(self.max_prefix_len > 0)
+        if time_emb_table.shape[0] != expected_rows:
             raise ValueError(
                 f"time_emb_table has {time_emb_table.shape[0]} rows but "
-                f"num_steps={num_steps}."
+                f"expected {expected_rows} for num_steps={num_steps}."
             )
         self._time_emb_table = time_emb_table
         self._timesteps = torch.linspace(
@@ -778,6 +826,8 @@ class PI05ExpertRunner(ModelRunner):
         self,
         x_t: torch.Tensor,
         step: int,
+        *,
+        use_action_prefix: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one expert step and return velocity plus raw suffix features.
 
@@ -787,6 +837,25 @@ class PI05ExpertRunner(ModelRunner):
         in-graph.
         """
         assert self._mod_tables is not None  # built in bind_euler_schedule()
+        modulation = self._mod_tables.step(step)
+        if use_action_prefix:
+            assert self.action_prefix_mask is not None
+            mask = self.action_prefix_mask.view(-1, 1)
+            clean = self._mod_tables.step(self._num_steps)
+            modulation = ExpertStepModulation(
+                layers=tuple(
+                    ExpertLayerModulation(
+                        torch.where(mask, clean_layer.input_ln, layer.input_ln),
+                        torch.where(
+                            mask,
+                            clean_layer.post_attention_ln,
+                            layer.post_attention_ln,
+                        ),
+                    )
+                    for layer, clean_layer in zip(modulation.layers, clean.layers)
+                ),
+                final=torch.where(mask, clean.final, modulation.final),
+            )
         # RLinf keeps the Euler state in fp32 and casts only the model input to
         # the embedding dtype. This avoids repeated bf16 update error.
         action_emb = self.heads.embed_action(x_t.to(self.params_dtype))
@@ -805,7 +874,7 @@ class PI05ExpertRunner(ModelRunner):
             None,
             self.rope,
             ctx,
-            modulation=self._mod_tables.step(step),
+            modulation=modulation,
         )
         suffix_out_3d = suffix_out.view(self.batch_size, self.chunk_size, -1)
         return self.heads.project_action(suffix_out_3d), suffix_out_3d
@@ -835,8 +904,14 @@ class PI05ExpertRunner(ModelRunner):
         assert self._time_emb_table is not None  # bound in setup()
         x_t = noise
         for step in range(self._num_steps):
-            v_t, _ = self._one_step(x_t, step)
+            if self.max_prefix_len:
+                x_t = torch.where(self.action_prefix_mask, self.action_prefix_buf, x_t)
+                v_t, _ = self._one_step(x_t, step, use_action_prefix=True)
+            else:
+                v_t, _ = self._one_step(x_t, step)
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
+        if self.max_prefix_len:
+            x_t = torch.where(self.action_prefix_mask, self.action_prefix_buf, x_t)
         return x_t
 
     def _fwd_rollout_loop(

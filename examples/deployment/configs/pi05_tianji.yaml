@@ -24,6 +24,10 @@ endpoint: tcp://127.0.0.1:5555
 lease_timeout_s: 60.0
 
 policy:
+  # Explicit opt-in; checkpoint metadata describes training capability only.
+  enable_rlt: false
+  enable_rtc: false
+
   # Path to the converted Tianji Pi0.5 checkpoint directory.
   checkpoint: ???
 

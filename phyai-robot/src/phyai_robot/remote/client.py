@@ -28,13 +28,15 @@ from __future__ import annotations
 import time
 from typing import Any, NamedTuple
 from contextlib import ExitStack
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+
+import numpy as np
 
 from ..robot import Robot, wait_for_observation
 from ..policy import PolicyAdapter
 from ._wire import PolicySpec, schema_to_json
 from .policy import RemotePolicy
-from ..scheduling import Scheduler, InferenceContext
+from ..scheduling import Scheduler, InferenceContext, RealTimeChunking
 from ..deployment import RobotDeployment, DeploymentOptions
 
 
@@ -87,6 +89,29 @@ def run_remote(
 
         # Step 1: Query model server specifications (no run reservation).
         spec = policy.info()
+        if isinstance(scheduler, RealTimeChunking):
+            rtc = spec.metadata.get("rtc")
+            scheduler.configure_model(
+                horizon=spec.metadata.get("horizon"),
+                max_prefix_len=rtc.get("max_prefix_len")
+                if isinstance(rtc, Mapping)
+                else None,
+            )
+            prefix = spec.inputs.get("action_prefix")
+            length = spec.inputs.get("prefix_length")
+            actions = spec.outputs.get("actions")
+            if (
+                prefix is None
+                or length is None
+                or actions is None
+                or len(actions.shape) != 2
+                or actions.shape[0] != spec.metadata["horizon"]
+                or prefix.shape != (rtc["max_prefix_len"], actions.shape[1])
+                or np.dtype(prefix.dtype) != np.dtype("float32")
+                or length.shape != (1,)
+                or np.dtype(length.dtype) != np.dtype("int64")
+            ):
+                raise ValueError("RTC model prefix schemas do not match its capability")
 
         # Step 2: Build robot and adapter based on model image_size and horizons.
         embodiment = build(spec)

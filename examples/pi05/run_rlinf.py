@@ -21,7 +21,7 @@ from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.kernel.config import KernelConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Output, PI05Request
 from phyai.utils import get_logger, load_config
 from phyai_utils_tools.models.pi05 import PI05Processor
 from phyai_utils_tools.processing.steps import NormalizerStep, UnnormalizerStep
@@ -86,13 +86,21 @@ def absolute_actions(
 
 
 def make_engine(
-    checkpoint: Path, *, use_cuda_graph: bool = True, max_batch_size: int = 1
+    checkpoint: Path,
+    *,
+    use_cuda_graph: bool = True,
+    max_batch_size: int = 1,
+    enable_rlt: bool = False,
+    enable_rtc: bool = False,
 ) -> Engine:
     return Engine(
         EngineArgs(
             plugin="pi05",
             plugin_args=PI05Args(
-                checkpoint_dir=checkpoint, max_batch_size=max_batch_size
+                checkpoint_dir=checkpoint,
+                max_batch_size=max_batch_size,
+                enable_rlt=enable_rlt,
+                enable_rtc=enable_rtc,
             ),
             config=EngineConfig(
                 device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
@@ -114,6 +122,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-cuda-graph", action="store_true")
+    parser.add_argument("--enable-rlt", action="store_true")
+    parser.add_argument("--enable-rtc", action="store_true")
     args = parser.parse_args()
     processor, metadata = load_processor(args.checkpoint)
     config = load_config(args.checkpoint, PI05Config)
@@ -131,7 +141,12 @@ def main() -> None:
                 dtype=torch.float32,
             )
         )
-    engine = make_engine(args.checkpoint, use_cuda_graph=not args.no_cuda_graph)
+    engine = make_engine(
+        args.checkpoint,
+        use_cuda_graph=not args.no_cuda_graph,
+        enable_rlt=args.enable_rlt,
+        enable_rtc=args.enable_rtc,
+    )
     try:
         with torch.inference_mode():
             normalized = engine.step(
@@ -142,12 +157,17 @@ def main() -> None:
                     noise=noise,
                 )
             )
+        extra = {}
+        if isinstance(normalized, PI05Output):
+            extra["rl_token"] = normalized.rl_token.float().cpu().numpy()
+            normalized = normalized.actions
         actions = absolute_actions(processor, metadata, normalized, state)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             args.output,
             actions=actions.numpy(),
             normalized_actions=normalized.float().cpu().numpy(),
+            **extra,
         )
         logger.info_rank0(
             "Saved absolute joint targets %s to %s", tuple(actions.shape), args.output

@@ -121,7 +121,8 @@
                 "group": "PI0.5",
                 "pages": [
                   "zh/models/pi05/ws1",
-                  "zh/models/pi05/processors"
+                  "zh/models/pi05/processors",
+                  "zh/models/pi05/rl-token"
                 ]
               },
               {
@@ -164,7 +165,8 @@
             "group": "部署",
             "pages": [
               "zh/deployment/server-gateway",
-              "zh/deployment/parallel-serving"
+              "zh/deployment/parallel-serving",
+              "zh/deployment/training-time-rtc"
             ]
           },
           {

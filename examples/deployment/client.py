@@ -23,7 +23,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 
-from phyai_robot import StopAndRefill, DeploymentOptions
+from phyai_robot import Scheduler, StopAndRefill, RealTimeChunking, DeploymentOptions
 from phyai_robot.remote import PolicySpec, Embodiment, RemotePolicy, run_remote
 
 from .configuration import parse_config
@@ -97,15 +97,24 @@ class ScheduleConfig:
         strategy: Scheduling algorithm identifier (default: "stop_and_refill").
         action_hz: Rate (in Hz) at which predicted trajectory targets are consumed (e.g. 25.0 Hz).
         execution_horizon: Number of leading targets executed per chunk before requesting a refill.
-            The chunk motion duration is computed as `execution_horizon / action_hz` seconds.
+            In RTC, the interval between inference anchors is execution_horizon / action_hz.
+        prefix_steps: RTC committed targets, including the snapshot-time target. Inference
+            must finish in less than (prefix_steps - 1) / action_hz seconds.
     """
 
     strategy: str = "stop_and_refill"
     action_hz: float = 25.0
     execution_horizon: int | None = 20
+    prefix_steps: int = 8
 
-    def create(self) -> StopAndRefill:
+    def create(self) -> Scheduler:
         """Instantiate the configured trajectory Scheduler."""
+        if self.strategy == "rtc":
+            return RealTimeChunking(
+                action_hz=self.action_hz,
+                execution_horizon=self.execution_horizon,
+                prefix_steps=self.prefix_steps,
+            )
         if self.strategy != "stop_and_refill":
             raise ValueError(f"unknown schedule.strategy: {self.strategy!r}")
         return StopAndRefill(

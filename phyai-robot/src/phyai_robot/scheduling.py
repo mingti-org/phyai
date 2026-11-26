@@ -11,7 +11,7 @@ Architecture:
     All methods on `Scheduler` are invoked exclusively while `RobotDeployment` holds its
     internal synchronization Condition lock. Consequently:
     - Schedulers do not need internal locks or thread-synchronization primitives.
-    - Schedulers must execute synchronously in constant time (O(1)) without I/O.
+    - Schedulers must perform bounded synchronous CPU work without I/O.
 
 Available Schedulers:
     - `StopAndRefill` (Default): Traditional chunk-by-chunk execution. The robot executes
@@ -33,6 +33,7 @@ from collections.abc import Iterable
 import numpy as np
 
 from .types import Action, ActionChunk, ActionSchema
+from .validation import freeze_values
 
 
 @dataclass(frozen=True)
@@ -43,8 +44,8 @@ class InferenceContext:
         pending: Ordered tuple of single-tick physical actions that are currently scheduled
             to execute on hardware while the background model prediction is running.
             - In `StopAndRefill`, motion is paused during inference, so `pending` is empty.
-            - In Real-Time Chunking (RTC), `pending` contains the unexecuted tail of the
-              current chunk, allowing guided diffusion models to condition on future motion.
+            - In Real-Time Chunking (RTC), `pending` samples the committed trajectory
+              from the observation timestamp at action_hz, including its current target.
     """
 
     pending: tuple[Action, ...] = ()
@@ -265,3 +266,165 @@ class StopAndRefill:
         left = self._chunk[index]
         right = self._chunk[min(index + 1, len(self._chunk) - 1)]
         return interpolate(left, right, position - index, self._keys)
+
+
+class RealTimeChunking(StopAndRefill):
+    """Overlap inference with a fixed, committed prefix of the current trajectory.
+
+    ``execution_horizon`` is the number of action periods between inference anchors.
+    The initial anchor starts on the first control tick. Later anchors are observation
+    timestamps, never prediction arrival times. For P prefix targets, inference must
+    finish strictly before anchor + (P - 1) / action_hz. The old interpolation remains
+    intact until that endpoint; only the predicted suffix is then used.
+
+    This bounded implementation keeps one current and one future chunk. It requires
+    2 <= P <= execution_horizon and execution_horizon + P <= the model horizon.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_hz: float,
+        prefix_steps: int,
+        execution_horizon: int,
+        interpolate_keys: Iterable[str] | None = None,
+    ) -> None:
+        super().__init__(
+            action_hz=action_hz,
+            execution_horizon=execution_horizon,
+            interpolate_keys=interpolate_keys,
+        )
+        if type(prefix_steps) is not int or prefix_steps < 2:
+            raise ValueError("RTC prefix_steps must be an integer of at least 2")
+        if type(execution_horizon) is not int or execution_horizon < prefix_steps:
+            raise ValueError("RTC requires prefix_steps <= execution_horizon")
+        if action_hz > 1e9:
+            raise ValueError("RTC action period must be at least one nanosecond")
+        self.prefix_steps = prefix_steps
+        self._period_ns = 1e9 / self.action_hz
+        self._horizon: int | None = None
+        self._inflight: InferenceContext | None = None
+        self._anchor_ns: int | None = None
+        self._request_at_ns: float | None = None
+        self._handoff_ns: float | None = None
+        self._replacement: tuple[Action, ...] | None = None
+        self._last_tick_ns: int | None = None
+
+    def configure_model(self, *, horizon: int, max_prefix_len: int) -> None:
+        """Validate advertised training support before reserving a run or opening hardware."""
+        if type(horizon) is not int or horizon < 1:
+            raise ValueError("RTC requires a positive integer model horizon")
+        if (
+            type(max_prefix_len) is not int
+            or not self.prefix_steps <= max_prefix_len < horizon
+        ):
+            raise ValueError(
+                "RTC requires trained max_prefix_len >= prefix_steps and < horizon"
+            )
+        if self.execution_horizon + self.prefix_steps > horizon:
+            raise ValueError("RTC requires execution_horizon + prefix_steps <= horizon")
+        if self._inflight is not None or self._chunk is not None:
+            raise RuntimeError("cannot configure RTC after inference has started")
+        self._horizon = horizon
+
+    def check(self, chunk: ActionChunk) -> None:
+        """Require the complete model horizon, including its known prefix."""
+        if self._horizon is None:
+            raise ValueError("RTC model capability has not been negotiated")
+        if len(chunk.actions) != self._horizon:
+            raise ValueError(
+                f"RTC chunk has {len(chunk.actions)} targets; "
+                f"model horizon is {self._horizon}"
+            )
+
+    def wants_inference(self) -> bool:
+        if self._inflight is not None or self._replacement is not None:
+            return False
+        return self._chunk is None or (
+            self._request_at_ns is not None
+            and self._last_tick_ns is not None
+            and self._last_tick_ns >= self._request_at_ns
+        )
+
+    def begin_inference(self, now_ns: int) -> InferenceContext:
+        """Freeze the trajectory at the snapshot timestamp under the robot I/O lock."""
+        if self._horizon is None:
+            raise ValueError("RTC model capability has not been negotiated")
+        if not self.wants_inference():
+            raise RuntimeError("RTC inference is already pending or not due")
+        if self._last_tick_ns is not None and now_ns < self._last_tick_ns:
+            raise ValueError("RTC observation timestamp precedes the control timeline")
+
+        pending: tuple[Action, ...] = ()
+        if self._chunk is not None:
+            handoff_ns = now_ns + (self.prefix_steps - 1) * self._period_ns
+            if handoff_ns >= self._start_ns + len(self._chunk) * self._period_ns:
+                raise TimeoutError(
+                    "RTC has insufficient remaining overlap for inference"
+                )
+            pending = tuple(
+                freeze_values(self._sample(now_ns + step * self._period_ns))
+                for step in range(self.prefix_steps)
+            )
+            self._handoff_ns = handoff_ns
+        context = InferenceContext(pending=pending)
+        self._inflight = context
+        self._anchor_ns = now_ns
+        return context
+
+    def add_chunk(
+        self, chunk: ActionChunk, context: InferenceContext, now_ns: int
+    ) -> None:
+        if context is not self._inflight or context is None:
+            raise ValueError("RTC received a stale or foreign inference context")
+        self.check(chunk)
+        if now_ns < self._anchor_ns or (
+            self._last_tick_ns is not None and now_ns < self._last_tick_ns
+        ):
+            raise ValueError("RTC prediction timestamp precedes the active timeline")
+        if not context.pending:
+            self._chunk = chunk.actions
+        else:
+            if now_ns >= self._handoff_ns:
+                raise TimeoutError(
+                    "RTC prediction missed the committed-prefix deadline"
+                )
+            # Keep the actual endpoint, avoiding round-trip drift in the model prefix.
+            self._replacement = (
+                context.pending[-1],
+                *chunk.actions[self.prefix_steps :],
+            )
+        self._inflight = None
+
+    def _sample(self, tick_ns: float) -> Action:
+        assert self._chunk is not None and self._start_ns is not None
+        position = (tick_ns - self._start_ns) / self._period_ns
+        if position < 0:
+            raise ValueError("RTC timestamp precedes the active trajectory")
+        if position >= len(self._chunk):
+            raise TimeoutError("RTC trajectory underrun")
+        index = math.floor(position)
+        left = self._chunk[index]
+        right = self._chunk[min(index + 1, len(self._chunk) - 1)]
+        return interpolate(left, right, position - index, self._keys)
+
+    def action_at(self, tick_ns: int) -> Action | None:
+        if self._chunk is None:
+            return None
+        if self._last_tick_ns is not None and tick_ns < self._last_tick_ns:
+            raise ValueError("RTC control timestamps must be monotonic")
+        self._last_tick_ns = tick_ns
+        if self._start_ns is None:
+            self._start_ns = tick_ns
+            self._request_at_ns = tick_ns + self.execution_horizon * self._period_ns
+        if self._handoff_ns is not None and tick_ns >= self._handoff_ns:
+            if self._replacement is None:
+                raise TimeoutError("RTC inference missed the committed-prefix deadline")
+            self._chunk = self._replacement
+            self._start_ns = self._handoff_ns
+            self._request_at_ns = (
+                self._anchor_ns + self.execution_horizon * self._period_ns
+            )
+            self._replacement = None
+            self._handoff_ns = None
+        return self._sample(tick_ns)

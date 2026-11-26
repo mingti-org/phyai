@@ -32,6 +32,7 @@ from phyai.models.pi05.configuration_pi05 import (
     PaliGemmaTextConfig,
     PI05Config,
     SiglipVisionConfig,
+    resolve_inference_config,
 )
 from phyai.weights.shards import replicated
 
@@ -186,7 +187,7 @@ class SiglipVisionEncoder(nn.Module):
                     attn_out_bias=True,
                     rope=None,
                     mlp_gated=False,
-                    mlp_activation="gelu",
+                    mlp_activation=config.hidden_activation,
                     mlp_bias=True,
                     norm_type="layernorm",
                     norm_eps=config.layer_norm_eps,
@@ -479,7 +480,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_activation,
             gated=True,
             bias=False,
             params_dtype=params_dtype,
@@ -715,7 +716,7 @@ class PI05ExpertLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_activation,
             gated=True,
             bias=False,
             params_dtype=params_dtype,
@@ -1098,8 +1099,14 @@ class PI05Model(nn.Module):
         norm_backend: str | None = None,
         rope_backend: str | None = None,
         device: torch.device | str | None = None,
+        enable_rlt: bool = False,
+        enable_rtc: bool = False,
     ) -> None:
         super().__init__()
+        self.checkpoint_config = config
+        config = resolve_inference_config(
+            config, enable_rlt=enable_rlt, enable_rtc=enable_rtc
+        )
         params_dtype = resolve_params_dtype(params_dtype)
         # The vision tower may run at a different (typically higher) precision
         # than the rest of the model — openpi / lerobot keep SigLIP + projector
@@ -1173,6 +1180,19 @@ class PI05Model(nn.Module):
             attn_backend=attn_backend,
             norm_backend=norm_backend,
         )
+
+        self.rlt_token = None
+        if config.rlt_mode != "off":
+            from phyai.models.pi05.modeling_rlt_pi05 import PI05RLTTokenAutoencoder
+
+            # LoongForge stores the learned sidecar in FP32 independently of Pi05.
+            self.rlt_token = PI05RLTTokenAutoencoder(
+                input_dim=config.text.hidden_size,
+                embed_dim=config.text.hidden_size,
+                max_visual_tokens=config.rlt_max_visual_tokens,
+                params_dtype=torch.float32,
+                device=device,
+            )
 
         # Shared RoPE — held at the model level (not per-layer) so the
         # 8 MiB cos/sin cache is allocated once, not 18x. Layers take

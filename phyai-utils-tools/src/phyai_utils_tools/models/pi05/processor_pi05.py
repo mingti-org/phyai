@@ -31,6 +31,7 @@ from phyai_utils_tools.processing.base_processor import BaseModelProcessor
 from phyai_utils_tools.processing.pipeline import ProcessorPipeline
 from phyai_utils_tools.processing.steps import (
     DeviceStep,
+    DeltaActionStep,
     FeatureType,
     NormalizationMode,
     NormalizeImageStep,
@@ -45,6 +46,7 @@ from phyai_utils_tools.processing.transition import (
     INPUT_IDS,
     LANG_LENS,
     PIXEL_VALUES,
+    STATE,
     Transition,
 )
 from phyai_utils_tools.tokenizer import get_tokenizer
@@ -164,6 +166,96 @@ class PI05Processor(BaseModelProcessor):
     @staticmethod
     def _transition_to_action(transition: Transition) -> torch.Tensor:
         return transition[ACTION]
+
+    def encode_action_prefix(
+        self,
+        action_prefix: torch.Tensor,
+        state: torch.Tensor,
+        *,
+        max_action_dim: int,
+    ) -> torch.Tensor:
+        """Encode absolute [B, P, D] targets in the checkpoint's action space.
+
+        Only native invertible action steps are supported. Discarded model
+        dimensions are zeroed after normalization, as in training.
+        """
+        action = torch.as_tensor(action_prefix, device=self.device)
+        state = torch.as_tensor(state, device=self.device)
+        if (
+            action.ndim != 3
+            or action.shape[-1] < 1
+            or not action.is_floating_point()
+            or not torch.isfinite(action).all()
+            or type(max_action_dim) is not int
+            or max_action_dim < action.shape[-1]
+        ):
+            raise ValueError(
+                "action_prefix must be finite [B, P, D] within max_action_dim"
+            )
+        if (
+            state.ndim != 2
+            or state.shape[0] != action.shape[0]
+            or not state.is_floating_point()
+            or not torch.isfinite(state).all()
+        ):
+            raise ValueError(
+                "state must be finite [B, D] matching the action_prefix batch"
+            )
+        if (
+            self.postprocessor.to_transition is not PI05Processor._action_to_transition
+            or self.postprocessor.to_output is not PI05Processor._transition_to_action
+        ):
+            raise ValueError("RTC cannot invert custom postprocessor adapters")
+
+        probe = torch.empty(
+            (action.shape[0], 0, max_action_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        transition = {ACTION: probe, STATE: state}
+        layout = []
+        for step in self.postprocessor.steps:
+            if type(step) not in (
+                DeltaActionStep,
+                SliceActionStep,
+                UnnormalizerStep,
+                DeviceStep,
+            ):
+                raise ValueError(
+                    f"RTC cannot invert postprocessor step {type(step).__name__}"
+                )
+            layout.append(
+                (step, probe.shape[-1], probe.dtype, probe.device, transition[STATE])
+            )
+            if isinstance(step, SliceActionStep) and step.action_dim is not None:
+                if step.action_dim < 1:
+                    raise ValueError("RTC requires a positive action slice dimension")
+            # Empty time axes retain native dtype and width rules without a rollout.
+            transition = step(transition)
+            probe = transition[ACTION]
+        if probe.shape[-1] != action.shape[-1]:
+            raise ValueError(
+                "action_prefix width does not match the postprocessor output"
+            )
+
+        action = action.to(device=probe.device, dtype=probe.dtype)
+        for step, input_width, input_dtype, input_device, anchor in reversed(layout):
+            if isinstance(step, DeltaActionStep):
+                action = step({ACTION: action, STATE: -anchor})[ACTION]
+            elif isinstance(step, SliceActionStep):
+                action = torch.nn.functional.pad(
+                    action, (0, input_width - action.shape[-1])
+                )
+            elif isinstance(step, UnnormalizerStep):
+                normalizer = NormalizerStep(**step.get_config(), device=step.device)
+                normalizer.load_state_dict(step.state_dict())
+                # Raw state is an anchor and must never enter normalization.
+                action = normalizer({ACTION: action.to(device=step.device)})[ACTION]
+            action = action.to(device=input_device, dtype=input_dtype)
+        action[..., action_prefix.shape[-1] :] = 0
+        if not torch.isfinite(action).all():
+            raise ValueError("normalized action_prefix contains non-finite values")
+        return action
 
     # -- vision glue (phyai-only; not in the lerobot json) -------------- #
 

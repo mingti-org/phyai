@@ -137,7 +137,12 @@ def observation_schema(config: AgilexConfig, image_size: int) -> dict[str, Featu
     }
 
 
-def make_adapter(config: AgilexConfig, observations: dict[str, FeatureSpec]):
+def make_adapter(
+    config: AgilexConfig,
+    observations: dict[str, FeatureSpec],
+    *,
+    max_prefix_len: int = 0,
+):
     """Construct a VectorAdapter binding AgileX 14-DoF joints and gripper travel."""
     fields = [
         key for side in SIDES for key in (f"joint_position_{side}", f"gripper_{side}")
@@ -148,6 +153,7 @@ def make_adapter(config: AgilexConfig, observations: dict[str, FeatureSpec]):
         cameras=config.model_cameras,
         state=[StateSlot(key) for key in fields],
         commands=[CommandSlot(key) for key in fields],
+        max_prefix_len=max_prefix_len,
     )
 
 
@@ -199,4 +205,11 @@ def build(config: AgilexConfig, spec: PolicySpec) -> Embodiment:
         action_schema=ACTION_SCHEMA,
         backends=[*cameras, joints],
     )
-    return Embodiment(robot, make_adapter(config, schema))
+    return Embodiment(
+        robot,
+        make_adapter(
+            config,
+            schema,
+            max_prefix_len=spec.metadata.get("rtc", {}).get("max_prefix_len", 0),
+        ),
+    )

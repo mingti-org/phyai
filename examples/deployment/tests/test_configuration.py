@@ -39,7 +39,7 @@ def test_overrides_reach_nested_robot_settings():
 
 
 @pytest.mark.parametrize(
-    "override", ["schedule.strategy=rtc", "robot.mode=2", "control.control_hz=0"]
+    "override", ["schedule.strategy=unknown", "robot.mode=2", "control.control_hz=0"]
 )
 def test_invalid_client_settings_exit_before_any_io(override):
     with pytest.raises(SystemExit):

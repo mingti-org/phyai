@@ -38,7 +38,7 @@ from .robot import Robot, wait_for_observation
 from .types import ActionChunk
 from .policy import Policy, PolicyAdapter
 from ._compat import BaseExceptionGroup
-from .scheduling import Scheduler
+from .scheduling import Scheduler, InferenceContext
 from .validation import freeze_values, validate_values
 
 
@@ -190,6 +190,17 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                     if self._stop_event.is_set():
                         return
 
+                context: InferenceContext | None = None
+
+                def capture_context() -> None:
+                    nonlocal context
+                    # Keep snapshot and timeline capture ordered against sends.
+                    with self._condition:
+                        if not self._stop_event.is_set():
+                            context = self.scheduler.begin_inference(
+                                time.monotonic_ns()
+                            )
+
                 # Acquire a fresh sensor observation snapshot under the I/O lock.
                 observation = wait_for_observation(
                     self.robot,
@@ -197,12 +208,10 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                     max_age_s=self.options.max_sample_age_s,
                     lock=self._io_lock,
                     stop_event=self._stop_event,
+                    on_snapshot=capture_context,
                 )
-                if observation is None:
+                if observation is None or context is None:
                     return
-
-                with self._condition:
-                    context = self.scheduler.begin_inference(time.monotonic_ns())
 
                 # Prepare model request via adapter.
                 request = self.adapter.to_request(observation, context)

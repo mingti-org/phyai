@@ -345,6 +345,7 @@ def wait_for_observation(
     max_age_s: float,
     lock: AbstractContextManager[object] | None = None,
     stop_event: threading.Event | None = None,
+    on_snapshot: Callable[[], None] | None = None,
 ) -> Observation | None:
     """Poll take_snapshot until all sensors report fresh samples, or timeout occurs.
 
@@ -360,6 +361,8 @@ def wait_for_observation(
         max_age_s: Maximum permitted sensor sample age in seconds.
         lock: Optional context manager (e.g. deployment._io_lock) acquired during read.
         stop_event: Optional threading.Event signaling early cancellation.
+        on_snapshot: Optional bounded callback under the read lock after a fresh
+            snapshot, used to capture its action timeline before another send.
 
     Returns:
         Fresh Observation snapshot, or None if stop_event was signaled.
@@ -374,9 +377,13 @@ def wait_for_observation(
             if stop_event is not None and stop_event.is_set():
                 return None
             try:
-                return take_snapshot(robot, max_age_s=max_age_s)
+                observation = take_snapshot(robot, max_age_s=max_age_s)
             except ObservationNotReady as error:
                 reason = error
+            else:
+                if on_snapshot is not None:
+                    on_snapshot()
+                return observation
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"timed out waiting for a complete, fresh observation: {reason}"

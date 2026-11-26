@@ -30,6 +30,8 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 ![PI0.5 模型执行流程](/images/models/pi05/inference_pipeline.svg)
 
+`PI05Args(enable_rlt=False, enable_rtc=False)` 保留原有同步动作推理。两个开关可独立启用，但 checkpoint 必须包含对应训练能力和权重；详见 [RL Token](/zh/models/pi05/rl-token) 和 [训练式 RTC](/zh/deployment/training-time-rtc)。
+
 # 架构
 
 PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine.__init__ 按固定顺序跑(config、CUDA、dist、parallel、linear),然后按名字解析插件并调用其 setup()。每个插件声明一个 Entry 子类 + 一个 EntryArgs 子类。">引擎 + 插件契约</Tooltip>把 pi0.5 推理拆成四块协作组件:
