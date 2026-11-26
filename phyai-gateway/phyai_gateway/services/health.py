@@ -85,7 +85,9 @@ class BackendHealthMonitor:
                     if "max_batch_size" in metadata and (
                         type(max_batch_size) is not int or max_batch_size < 1
                     ):
-                        raise ValueError("health max_batch_size must be a positive integer")
+                        raise ValueError(
+                            "health max_batch_size must be a positive integer"
+                        )
             except grpc.RpcError:
                 healthy = False
             except ValueError as error:
