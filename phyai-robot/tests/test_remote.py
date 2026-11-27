@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 import socket
+import subprocess
+from pathlib import Path
 from threading import Event, Thread
 from contextlib import contextmanager
 
@@ -407,3 +411,45 @@ def test_server_rejects_outputs_that_do_not_match_its_spec():
         with pytest.raises(RemotePolicyError, match="dtype"):
             client.warmup(STATE)
         client.close()
+
+
+@pytest.mark.parametrize("failure", ["endpoint", "setup"])
+def test_failed_socket_setup_can_close_with_traceback_alive(failure):
+    # A subprocess timeout also bounds Context.term() if a regression leaks a socket.
+    script = """
+import sys
+import zmq
+from unittest.mock import patch
+from contextlib import nullcontext
+from phyai_robot.remote import RemotePolicy
+
+client = RemotePolicy("invalid-transport://endpoint")
+setup = (
+    patch.object(zmq.Socket, "setsockopt", side_effect=zmq.ZMQError(zmq.EINVAL))
+    if sys.argv[1] == "setup" else nullcontext()
+)
+with setup:
+    try:
+        client.info()
+    except zmq.ZMQError as error:
+        assert error.__traceback__ is not None
+        client.close()
+        assert client._socket is None
+        assert client._context is None
+    else:
+        raise AssertionError("Expected socket initialization to fail")
+client.close()
+"""
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", script, failure],
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join([source, os.environ.get("PYTHONPATH", "")]),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

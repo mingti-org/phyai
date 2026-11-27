@@ -157,7 +157,7 @@ class SiglipVisionEncoder(nn.Module):
 
     SigLIP's encoder layer is pre-norm with LayerNorm (bias=True),
     bidirectional (causal=False), q/k/v/out_proj all biased, and a
-    plain ``fc1 -> GELU(exact) -> fc2`` MLP (bias=True). HF source names
+    plain ``fc1 -> GELU -> fc2`` MLP (bias=True). HF source names
     differ from the Llama / Gemma defaults: ``layer_norm1`` /
     ``layer_norm2`` for the norms and ``out_proj`` for the attention
     output projection.

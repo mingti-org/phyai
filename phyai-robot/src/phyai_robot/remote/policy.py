@@ -114,12 +114,16 @@ class RemotePolicy:
             self._context = zmq.Context()
         if self._socket is None:
             socket = self._context.socket(zmq.REQ)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(
-                zmq.IMMEDIATE, 1
-            )  # Drop message if server endpoint is not connected.
-            socket.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
-            socket.connect(self.endpoint)
+            try:
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(
+                    zmq.IMMEDIATE, 1
+                )  # Drop message if server endpoint is not connected.
+                socket.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
+                socket.connect(self.endpoint)
+            except BaseException:
+                socket.close(linger=0)
+                raise
             self._socket = socket
         return self._socket
 

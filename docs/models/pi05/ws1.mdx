@@ -28,6 +28,8 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 This page focuses on `ws1`, i.e. `world_size=1` — a single rank with no distributed setup. Everything on this page targets this single-card configuration. The `entry` is `PI05Scheduler`.
 
+`PI05Args(enable_rlt=False, enable_rtc=False)` preserves action-only synchronous inference. You can opt in to either feature independently with a checkpoint trained for it. [Training-time RTC](/deployment/training-time-rtc) conditions the next action chunk on a committed prefix. [RL Token](/models/pi05/rl-token) adds a representation token to the action output and requires the trained sidecar weights.
+
 ![PI0.5 model execution pipeline](/images/models/pi05/inference_pipeline.svg)
 
 # Architecture

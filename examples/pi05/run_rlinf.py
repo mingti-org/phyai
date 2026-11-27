@@ -107,7 +107,8 @@ def make_engine(
                 runtime=RuntimeConfig(use_cuda_graph=use_cuda_graph, num_threads=16),
                 kernel=KernelConfig(
                     config_path=str(
-                        Path(__file__).with_name("kernel_policy_rlinf_bf16.yaml")
+                        Path(__file__).resolve().parents[1]
+                        / "configs/kernel_policies/pi05/rlinf_bf16.yaml"
                     )
                 ),
             ),

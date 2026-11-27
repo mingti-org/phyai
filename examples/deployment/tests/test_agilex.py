@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from phyai_robot import Sample, Observation, InferenceContext
 from phyai_robot.remote import PolicySpec
 
@@ -56,3 +57,14 @@ def test_build_uses_configured_domain_and_one_worker_per_camera(ros_messages):
     backends = embodiment.robot.backends
     assert len(backends) == 4 and all(b._domain_id == 3 for b in backends)
     assert embodiment.activate is None
+
+
+@pytest.mark.parametrize("right", ["/same", " /same ", "same"])
+def test_duplicate_command_topics_are_rejected(right):
+    config = agilex.AgilexConfig(command_topics={"left": "/same", "right": right})
+    with pytest.raises(ValueError, match="command_topics.*distinct"):
+        config.validate()
+
+
+def test_distinct_command_topics_are_valid():
+    agilex.AgilexConfig(command_topics={"left": "/left", "right": "/right"}).validate()

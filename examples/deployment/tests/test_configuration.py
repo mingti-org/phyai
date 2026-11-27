@@ -79,3 +79,80 @@ def test_processor_config_validation():
     ):
         with pytest.raises(ValueError):
             bad.validate()
+
+
+@pytest.mark.parametrize("key", ["camera_resize_hw", "camera_size"])
+@pytest.mark.parametrize("source", ["cli", "yaml"])
+def test_camera_size_overrides_bundled_default(tmp_path, key, source):
+    argv = [f"robot.{key}=[300,400]"]
+    if source == "yaml":
+        path = tmp_path / "legacy.yaml"
+        path.write_text(f"robot:\n  {key}: [300, 400]\n")
+        argv = ["--config", str(path)]
+    config = parse_config(
+        tianji.TianjiClientConfig,
+        default_config=tianji.DEFAULT_CONFIG,
+        argv=argv,
+        validate=validate_client,
+    )
+    assert config.robot.camera_size == [300, 400]
+    assert config.robot.camera_resize_hw is None
+
+
+@pytest.mark.parametrize("canonical", [[540, 960], None])
+def test_conflicting_camera_aliases_raise_value_error(canonical):
+    from omegaconf import OmegaConf
+
+    from examples.deployment.configuration import normalize_aliases
+
+    layer = OmegaConf.create(
+        {"robot": {"camera_size": canonical, "camera_resize_hw": [300, 400]}}
+    )
+    with pytest.raises(ValueError, match="Conflicting.*camera_resize_hw.*camera_size"):
+        normalize_aliases(layer, tianji.TianjiClientConfig.config_aliases)
+
+
+def test_conflicting_camera_cli_reports_usage_error(capsys):
+    with pytest.raises(SystemExit) as error:
+        parse_config(
+            tianji.TianjiClientConfig,
+            default_config=tianji.DEFAULT_CONFIG,
+            argv=["robot.camera_size=[540,960]", "robot.camera_resize_hw=[300,400]"],
+        )
+    assert error.value.code == 2
+    assert "Conflicting" in capsys.readouterr().err
+
+
+def test_identical_camera_aliases_are_accepted():
+    config = parse_config(
+        tianji.TianjiClientConfig,
+        default_config=tianji.DEFAULT_CONFIG,
+        argv=["robot.camera_size=[300,400]", "robot.camera_resize_hw=[300,400]"],
+        validate=validate_client,
+    )
+    assert config.robot.camera_size == [300, 400]
+
+
+def test_cli_camera_size_overrides_legacy_yaml(tmp_path):
+    path = tmp_path / "legacy.yaml"
+    path.write_text("robot:\n  camera_resize_hw: [300, 400]\n")
+    config = parse_config(
+        tianji.TianjiClientConfig,
+        default_config=tianji.DEFAULT_CONFIG,
+        argv=["--config", str(path), "robot.camera_size=null"],
+        validate=validate_client,
+    )
+    assert config.robot.camera_size is None
+
+
+@pytest.mark.parametrize("canonical", [None, [300, 400]])
+def test_direct_tianji_config_accepts_camera_alias(canonical):
+    config = tianji.TianjiConfig(camera_size=canonical, camera_resize_hw=[300, 400])
+    config.validate()
+    assert config.camera_size == [300, 400]
+
+
+def test_direct_tianji_config_rejects_conflicting_camera_alias():
+    config = tianji.TianjiConfig(camera_size=[540, 960], camera_resize_hw=[300, 400])
+    with pytest.raises(ValueError, match="Conflicting"):
+        config.validate()

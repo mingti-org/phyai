@@ -75,8 +75,8 @@ robot:
   # Set to null to preserve the camera stream's decoded aspect ratio.
   camera_size: [540, 960]
 
-  # Alias for camera_size for compatibility with converted model metadata configs.
-  camera_resize_hw: null
+  # Legacy camera_resize_hw is accepted per YAML/CLI layer as an alias.
+  # Specify only one spelling per layer, or give both the same value.
 
   # Maximum frame conversion rate (in Hz) for the H.264 mosaic decoder.
   # Decodes every H.264 slice to preserve stream reference frames, but throttles RGB conversion.

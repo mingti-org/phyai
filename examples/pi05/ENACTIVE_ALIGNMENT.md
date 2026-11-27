@@ -82,8 +82,8 @@ with identical checkpoint and initial noise.
 | CUDA Graph versus eager; repeated identical requests | Bitwise equal |
 | Batched versus single-request action cosine | At least 0.999992080 |
 
-Model outputs are not bitwise identical. The implementations differ in GELU
-(PhyAI's pi0.5 uses exact GELU; the Enactive reference used its tanh
-approximation), BF16 intermediate rounding, attention kernels and action-head
-precision. Bitwise agreement would require model changes beyond this adapter.
+The measured PhyAI configuration used exact GELU and the Enactive reference
+used its tanh approximation. Current PhyAI checkpoints can select
+`hidden_activation="gelu_tanh"` per tower. BF16 intermediate rounding,
+attention kernels and action-head precision also differed in this comparison.
 Robot task success was not measured by these tests.

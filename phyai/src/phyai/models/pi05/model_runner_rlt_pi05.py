@@ -62,6 +62,8 @@ class PI05RLTRunner(ModelRunner):
             raise ValueError(
                 "RLT runner requires its configured batch and visual shape"
             )
+        if mask.dtype != torch.bool:
+            raise TypeError("RLT mask must have dtype torch.bool")
         features = features.to(device=self.device, dtype=self.model.rl_token.dtype)
         mask = mask.to(device=self.device)
         if self.graph is None:

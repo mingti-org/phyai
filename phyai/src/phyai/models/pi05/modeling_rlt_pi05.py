@@ -274,11 +274,22 @@ class PI05RLTTokenAutoencoder(nn.Module):
             x = layer(x, valid)
         return x[:, -1:]
 
-    def encode(self, features, mask=None):
+    def encode(
+        self, features: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Encode [B, M, input_dim] features with a [B, M] mask into [B, 1, embed_dim]."""
         frozen, mask = self._prepare_features(features, mask)
         return self._encode(frozen, mask)
 
-    def decode(self, rl_token, features, mask=None):
+    def decode(
+        self,
+        rl_token: torch.Tensor,
+        features: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict [B, M, input_dim] from a [B, 1, embed_dim] token, features of
+        the output shape, and an optional [B, M] mask.
+        """
         frozen, mask = self._prepare_features(features, mask)
         if rl_token.shape != (frozen.shape[0], 1, self.embed_dim):
             raise ValueError(f"rl_token must have shape [B, 1, {self.embed_dim}]")

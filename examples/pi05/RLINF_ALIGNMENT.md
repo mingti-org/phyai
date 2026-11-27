@@ -1,7 +1,7 @@
 # RLinf Tianji pi0.5 inference
 
 `run_rlinf.py` runs a converted `openpi_rlinf` Tianji checkpoint through the
-existing `PI05Processor`, PI05 engine, and `kernel_policy_rlinf_bf16.yaml`.
+existing `PI05Processor`, PI05 engine, and the [RLinf BF16 kernel policy](../configs/kernel_policies/pi05/rlinf_bf16.yaml).
 It accepts raw camera images, a task, and joint state, and returns absolute
 joint and gripper targets. This change adds the example and this report;
 model, processor, runtime, and dependency files are unchanged.

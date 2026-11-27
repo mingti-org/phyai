@@ -13,7 +13,7 @@ from pathlib import Path
 from collections.abc import Callable, Sequence
 
 from yaml import YAMLError
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from omegaconf.errors import OmegaConfBaseException
 
 # Resolve from this module, not the process cwd: launching from another directory
@@ -36,6 +36,29 @@ def repository_path(value: str) -> Path:
 ConfigT = TypeVar("ConfigT")
 
 
+def normalize_aliases(layer: DictConfig, aliases: dict[str, str]) -> DictConfig:
+    """Canonicalize explicitly supplied aliases before merging configuration layers."""
+    for alias, canonical in aliases.items():
+        parent, _, key = alias.rpartition(".")
+        section = OmegaConf.select(layer, parent) if parent else layer
+        if not isinstance(section, DictConfig) or key not in section:
+            continue
+        value = section[key]
+        target_parent, _, target_key = canonical.rpartition(".")
+        target = OmegaConf.select(layer, target_parent) if target_parent else layer
+        if (
+            isinstance(target, DictConfig)
+            and target_key in target
+            and target[target_key] != value
+        ):
+            raise ValueError(
+                f"Conflicting {alias} and {canonical} in the same config layer"
+            )
+        OmegaConf.update(layer, canonical, value, merge=False)
+        del section[key]
+    return layer
+
+
 def parse_config(
     schema: type[ConfigT],
     *,
@@ -46,7 +69,9 @@ def parse_config(
     """Merge schema < default YAML < selected YAML < dotted CLI overrides.
 
     Validation is supplied by the entry point, keeping device/model constraints
-    out of this loader. --print-config permits missing required values and skips
+    out of this loader. Schemas may declare a config_aliases mapping of dotted
+    legacy keys to canonical keys, applied to each YAML/CLI layer before merging.
+    --print-config permits missing required values and skips
     semantic validation, so it can inspect configuration without creating any
     runtime resources. Normal parsing requires all mandatory fields and runs
     validation before returning the fully typed dataclass object.
@@ -92,11 +117,15 @@ def parse_config(
         # types in every later layer. Load bundled defaults even when --config
         # selects another file, so a private YAML can contain only its overrides.
         # Dot-list parsing preserves values such as true, null, and numeric lists.
-        merged = OmegaConf.merge(
-            OmegaConf.structured(schema),
+        layers = [
             OmegaConf.load(default_config),
             OmegaConf.load(args.config.expanduser()),
             OmegaConf.from_dotlist(list(args.overrides)),
+        ]
+        aliases = getattr(schema, "config_aliases", {})
+        merged = OmegaConf.merge(
+            OmegaConf.structured(schema),
+            *(normalize_aliases(layer, aliases) for layer in layers),
         )
         # Print before materializing the dataclass: unresolved mandatory fields
         # such as checkpoint: ??? are useful in a template, but not at runtime.

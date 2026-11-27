@@ -31,7 +31,7 @@ from phyai_robot import (
     CompositeRobot,
 )
 from phyai_robot.images import resize_with_pad
-from phyai_robot.remote import PolicySpec, Embodiment
+from phyai_robot.remote import Embodiment, PolicySpec
 from phyai_robot.backends.ros2 import (
     RosCommand,
     Ros2Backend,
@@ -111,6 +111,13 @@ class AgilexConfig:
         for attr in ("state_topics", "command_topics"):
             if set(getattr(self, attr)) != set(SIDES):
                 raise ValueError(f"robot.{attr} must map left and right")
+        command_topics = {
+            topic.strip().lstrip("/") for topic in self.command_topics.values()
+        }
+        if len(command_topics) != len(SIDES):
+            raise ValueError(
+                "robot.command_topics must use distinct left and right topics"
+            )
         if set(self.state_topics.values()) & set(self.command_topics.values()):
             raise ValueError("state topics and command topics must differ")
         if {"camera", "state", "command"} - set(self.qos):

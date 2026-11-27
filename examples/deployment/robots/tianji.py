@@ -36,8 +36,8 @@ from phyai_robot import (
     CompositeRobot,
 )
 from phyai_robot.images import resize, resize_with_pad
+from phyai_robot.remote import Embodiment, PolicySpec
 from phyai_robot.adapters import ACTION_PREFIX_KEY, PREFIX_LENGTH_KEY
-from phyai_robot.remote import PolicySpec, Embodiment
 from phyai_robot.backends.ros2 import (
     RosCommand,
     Ros2Backend,
@@ -45,7 +45,6 @@ from phyai_robot.backends.ros2 import (
     image_backends,
 )
 from phyai_robot.backends.ros2.video import H264Decoder, MosaicDecoder
-from phyai_robot.backends.ros2.backend import SERVICE_POLL_MARGIN_S
 from phyai_robot.backends.ros2.codecs import (
     POSE_NAMES,
     WRENCH_NAMES,
@@ -53,6 +52,7 @@ from phyai_robot.backends.ros2.codecs import (
     decode_wrench,
     decode_nv12_image,
 )
+from phyai_robot.backends.ros2.backend import SERVICE_POLL_MARGIN_S
 
 from .tianji_codecs import (
     ARM_DOF,
@@ -193,7 +193,13 @@ class TianjiConfig:
         if self.camera_source not in CAMERA_SOURCES:
             raise ValueError(f"robot.camera_source must be one of {CAMERA_SOURCES}")
 
-        # Support camera_resize_hw as an alias for camera_size.
+        if (
+            self.camera_size is not None
+            and self.camera_resize_hw is not None
+            and self.camera_size != self.camera_resize_hw
+        ):
+            raise ValueError("Conflicting robot.camera_resize_hw and robot.camera_size")
+        # Support direct dataclass callers as well as normalized YAML layers.
         if self.camera_size is None and self.camera_resize_hw is not None:
             self.camera_size = self.camera_resize_hw
 

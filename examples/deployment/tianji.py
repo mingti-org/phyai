@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+from typing import ClassVar
 from pathlib import Path
 from dataclasses import field, dataclass
 
@@ -49,6 +50,10 @@ class TianjiClientConfig:
         control: 200 Hz actuator send loop timing and sensor freshness age budgets.
         schedule: StopAndRefill trajectory chunk execution and action consumption pacing.
     """
+
+    config_aliases: ClassVar[dict[str, str]] = {
+        "robot.camera_resize_hw": "robot.camera_size",
+    }
 
     max_steps: int | None = (
         None  # Actual Robot.send_action calls; null runs until Ctrl-C.

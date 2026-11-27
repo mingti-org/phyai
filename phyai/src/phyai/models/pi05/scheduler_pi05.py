@@ -580,6 +580,8 @@ class PI05Scheduler(Scheduler):
                     :actual_B
                 ].clone()
 
+        del prefix_out
+
         # Sample noise (or use the user's, padded) and run the whole
         # Euler loop as one captured-graph replay. The expert runner
         # unrolls all N denoise steps internally — reading the bound

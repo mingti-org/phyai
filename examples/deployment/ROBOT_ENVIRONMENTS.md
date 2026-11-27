@@ -264,7 +264,7 @@ Robot terminal. **This calls controller services and sends commands.**
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source /opt/kernelmind/apex/install/setup.bash   # marvin_msgs
+source /path/to/apex/install/setup.bash   # marvin_msgs
 .venv-robot/bin/python -m examples.deployment.tianji
 ```
 

@@ -14,19 +14,32 @@ import subprocess
 from pathlib import Path
 
 
-def main() -> None:
-    root = Path(__file__).resolve().parents[3]
-    files = sorted(
-        p
-        for directory in (root / "phyai-robot", root / "examples/deployment")
-        for p in directory.rglob("*")
-        if p.is_file()
-        and p.suffix in (".py", ".toml", ".yaml", ".md", ".sh", ".in", ".lock")
+def source_files(root: Path) -> list[Path]:
+    """Collect tracked bundle inputs; require a Git checkout to fail closed."""
+    tracked = (
+        subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "phyai-robot", "examples/deployment"],
+            cwd=root,
+        )
+        .decode()
+        .split("\0")
+    )
+    return sorted(
+        root / name
+        for name in tracked
+        if name
+        and (root / name).is_file()
+        and Path(name).suffix in (".py", ".toml", ".yaml", ".md", ".sh", ".in", ".lock")
         and not any(
             part.startswith(".") or part in {"__pycache__", "build", "dist"}
-            for part in p.relative_to(root).parts[:-1]
+            for part in Path(name).parts[:-1]
         )
     )
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[3]
+    files = source_files(root)
     # Include matching examples/configs in the source identity even though only
     # the framework goes into the wheel. A dirty review tree is identified by
     # these contents; base_commit alone cannot identify uncommitted changes.
