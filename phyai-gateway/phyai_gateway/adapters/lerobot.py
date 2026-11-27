@@ -428,7 +428,7 @@ class LeRobotAdapter(services_pb2_grpc.AsyncInferenceServicer):
                 shape=observation.state.shape,
                 dtype=model_inference_pb2.DATA_TYPE_FLOAT32,
             ),
-            instruction=observation.task,
+            instructions=[observation.task],
             requested_action_horizon=setup.actions_per_chunk,
             extensions_json=setup.extensions_json,
         )

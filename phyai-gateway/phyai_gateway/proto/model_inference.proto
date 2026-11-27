@@ -16,6 +16,8 @@ message HealthRequest {
 message HealthResponse {
   // True when the backend is ready to accept inference requests.
   bool healthy = 1;
+  // Model-defined health metadata, including max_batch_size when limited.
+  string extensions_json = 2;
 }
 
 // Optional backend-initiated registration with renewable leases.
@@ -78,7 +80,8 @@ message InferenceRequest {
   repeated Image images = 3;
   // Optional robot-policy fields; the model defines shapes, order, and units.
   Tensor robot_state = 4;
-  string instruction = 5;
+  // One instruction for a single sample, or one per sample in a batch.
+  repeated string instructions = 5;
   // Zero selects the model's default horizon.
   uint32 requested_action_horizon = 6;
   // Model-defined JSON metadata.

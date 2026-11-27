@@ -219,8 +219,7 @@ class RLinfAdapter:
         ):
             raise RLinfPayloadError("requested_action_horizon must be a uint32")
         extensions = {"source": "rlinf", **metadata, "batch_size": batch_size}
-        if tasks is not None:
-            extensions["instructions"] = list(tasks)
+        extensions.pop("instructions", None)
         try:
             extensions_json = json.dumps(
                 extensions, separators=(",", ":"), allow_nan=False
@@ -286,7 +285,7 @@ class RLinfAdapter:
             request_id=request_id,
             timestamp_ns=received_ns,
             images=images,
-            instruction=data["tasks"][0] if data["tasks"] else "",
+            instructions=list(data["tasks"]) if data["tasks"] else [],
             requested_action_horizon=data["horizon"],
             extensions_json=data["extensions_json"],
         )
