@@ -13,12 +13,14 @@ The PhyAI pi0.5 scheduler does not resize images, tokenize text, discretize stat
 | Stage | Input | Output |
 | --- | --- | --- |
 | `preprocess` | `images`, `task`, `state` | `PI05ProcessedInputs(pixel_values, input_ids, lang_lens)` |
-| `engine.step` | `PI05Request` | `(B, chunk_size, max_action_dim)` |
+| `engine.step` | `PI05Request` | Action tensor of shape `(B, chunk_size, max_action_dim)` by default; `PI05Output` with `actions` and `rl_token` when RLT is enabled |
 | `postprocess` | Raw action chunk | `(B, chunk_size, action_dim)` |
 
 <Note>
   The public `pi05_base` checkpoint has empty normalizer `features`, so state/action normalization is a no-op by default. If your lerobot checkpoint includes dataset stats, `from_pretrained` loads those stats sidecars and uses them in pre/postprocess.
 </Note>
+
+Enable RLT and RTC independently at model construction with `enable_rlt` and `enable_rtc`. Both default to `False`. With RLT enabled, pass `result.actions` to `postprocess` and leave `result.rl_token` unchanged. For RTC, pass the pending absolute targets and the current observation state to `encode_action_prefix`; do not reuse normalized deltas from the previous request. See [RL Token](/models/pi05/rl-token) and [Training-time RTC](/deployment/training-time-rtc).
 
 # Input contract
 
@@ -199,7 +201,7 @@ finally:
 A manually constructed processor can be saved as lerobot-compatible JSON:
 
 ```python
-processor.save_pretrained("/tmp/pi05_processor")
+processor.save_pretrained("./pi05_processor")
 ```
 
 The saved directory contains:

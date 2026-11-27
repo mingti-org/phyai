@@ -1,0 +1,45 @@
+# ==============================================================================
+# Static BF16 Kernel Selection Policy for Pi0.5 Models
+# ==============================================================================
+# Configures operator implementation selection for the PhyAI inference engine.
+#
+# Pi0.5 models employ exact Gaussian Error Linear Unit (GELU) activations in their
+# vision transformer and language backbone. These rules enforce selection of exact
+# GELU kernel implementations (FlashInfer fused GELU and PyTorch exact GELU),
+# preventing silent fallback to Tanh-approximated GELU kernels.
+#
+# Schema: phyai.kernel/v1
+# Profile: static (deterministic dispatch without runtime autotuning overhead)
+# ==============================================================================
+
+schema: phyai.kernel/v1
+profile: static
+
+defaults:
+  # Raise an error immediately if a requested operator implementation is unavailable,
+  # rather than silently degrading numerical precision or changing activation semantics.
+  fallback: error
+
+overrides:
+  # Gated GELU: Fuses elementwise GELU activation and multiplicative gating.
+  # Selected for multi-layer perceptron (MLP) blocks in Pi0.5 expert layers.
+  - id: pi05-exact-geglu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: true
+    use: flashinfer.activation.gelu_and_mul
+
+  # Non-gated GELU: Standard elementwise exact GELU activation without gating.
+  - id: pi05-exact-gelu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: false
+    use: torch.activation.gelu

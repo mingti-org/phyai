@@ -34,7 +34,7 @@ from phyai import DeploymentConfig, Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Output, PI05Request
 from phyai.server import WorkerSupervisorConfig
 from phyai.utils import load_config
 
@@ -110,9 +110,9 @@ def benchmark(
     n_warmup: int,
     n_timed: int,
     synchronize_cuda: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor | PI05Output, dict[str, float]]:
     """Warm + ``n_timed`` ``engine.step`` calls; return last action + ms stats."""
-    actions: torch.Tensor | None = None
+    actions: torch.Tensor | PI05Output | None = None
     for _ in range(n_warmup):
         actions = engine.step(request)
     if synchronize_cuda:
@@ -228,6 +228,8 @@ def main() -> None:
             "mutually exclusive with --dump-filter."
         ),
     )
+    parser.add_argument("--enable-rlt", action="store_true")
+    parser.add_argument("--enable-rtc", action="store_true")
     args = parser.parse_args()
 
     if args.replica_count < 1:
@@ -252,6 +254,8 @@ def main() -> None:
             max_batch_size=args.batch_size,
             vision_params_dtype=vision_dtype,
             inputs_image_shape=inputs_image_shape,
+            enable_rlt=args.enable_rlt,
+            enable_rtc=args.enable_rtc,
         ),
         config=EngineConfig(
             device=DeviceConfig(target="cuda", params_dtype=dtype),
@@ -324,6 +328,9 @@ def main() -> None:
 
         # Managed results are CUDA-IPC views of worker memory; take a durable
         # CPU copy before the CPU-side postprocess.
+        if isinstance(actions, PI05Output):
+            print(f"RL token shape     : {tuple(actions.rl_token.shape)}")
+            actions = actions.actions
         if managed:
             actions = actions.cpu()
 

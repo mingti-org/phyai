@@ -20,13 +20,14 @@ STATE_NUM_BINS = 256
 def discretize_state(state: torch.Tensor, num_bins: int = STATE_NUM_BINS) -> np.ndarray:
     """Discretize a ``[-1, 1]``-normalized state vector into ``num_bins`` bins.
 
-    Mirrors openpi's PaligemmaTokenizer state binning. The caller must ensure
-    ``state`` already lies in ``[-1, 1]``; values outside are clipped to the
-    nearest bin by ``np.digitize``. Returns an integer ``ndarray`` of the same
-    shape as ``state``. The state is cast to fp32 first, so a bf16/fp16 state
-    (the model dtype) converts cleanly — numpy has no bfloat16.
+    Mirrors openpi's PaligemmaTokenizer state binning, including the edge
+    indices returned by ``np.digitize`` for values outside ``[-1, 1]``.
+    Returns an integer array with the same shape as ``state``.
+    Preserve float64 normalization at bin boundaries;
+    promote lower-precision input to float32 for NumPy compatibility.
     """
-    state_np = state.detach().to(torch.float32).cpu().numpy()
+    dtype = torch.float64 if state.dtype == torch.float64 else torch.float32
+    state_np = state.detach().to(dtype).cpu().numpy()
     bins = np.linspace(-1.0, 1.0, num_bins + 1)[:-1]
     return np.digitize(state_np, bins=bins) - 1
 

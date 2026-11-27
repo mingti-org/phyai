@@ -37,13 +37,17 @@ class StateTokenizerPrepareStep(ProcessorStep):
     PaligemmaTokenizer prompt assembly. If ``STATE`` is absent, the prompt uses
     the task text alone (no state bins).
 
-    Registry name + empty ``get_config`` match lerobot's
+    ``prompt_mode="instruction"`` emits only cleaned task text and ignores
+    state. A token suffix can be supplied by the following TokenizerStep.
+
+    Registry name + default empty ``get_config`` match lerobot's
     ``pi05_prepare_state_tokenizer_processor_step`` (it persists no config;
     ``max_state_dim`` / ``num_bins`` are construction-time defaults).
     """
 
     num_bins: int = STATE_NUM_BINS
     max_state_dim: int = 32
+    prompt_mode: str = "state"
 
     def __call__(self, transition: Transition) -> Transition:
         tasks = transition.get(TASK)
@@ -53,6 +57,13 @@ class StateTokenizerPrepareStep(ProcessorStep):
             tasks = [tasks]
 
         out = transition.copy()
+        if self.prompt_mode == "instruction":
+            out[PROMPT] = [
+                t.strip().replace("_", " ").replace("\n", " ") for t in tasks
+            ]
+            return out
+        if self.prompt_mode != "state":
+            raise ValueError(f"Unknown pi0.5 prompt mode: {self.prompt_mode!r}")
         state = transition.get(STATE)
         if state is not None:
             discretized = discretize_state(state, num_bins=self.num_bins)
@@ -65,8 +76,8 @@ class StateTokenizerPrepareStep(ProcessorStep):
         return out
 
     def get_config(self) -> dict[str, Any]:
-        # lerobot persists no config for this step; keep parity (empty {}).
-        return {}
+        # Preserve lerobot's empty config for the default state prompt.
+        return {} if self.prompt_mode == "state" else {"prompt_mode": self.prompt_mode}
 
 
 __all__ = ["StateTokenizerPrepareStep"]

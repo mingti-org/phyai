@@ -36,7 +36,8 @@
                 "group": "PI0.5",
                 "pages": [
                   "models/pi05/ws1",
-                  "models/pi05/processors"
+                  "models/pi05/processors",
+                  "models/pi05/rl-token"
                 ]
               },
               {
@@ -118,6 +119,7 @@
             "pages": [
               "deployment/server-gateway",
               "deployment/parallel-serving",
+              "deployment/training-time-rtc",
               "deployment/amd-rocm"
             ]
           },
@@ -160,7 +162,8 @@
                 "group": "PI0.5",
                 "pages": [
                   "zh/models/pi05/ws1",
-                  "zh/models/pi05/processors"
+                  "zh/models/pi05/processors",
+                  "zh/models/pi05/rl-token"
                 ]
               },
               {
@@ -239,9 +242,10 @@
           {
             "group": "部署",
             "pages": [
-                "zh/deployment/server-gateway",
-                "zh/deployment/parallel-serving",
-                "zh/deployment/amd-rocm"
+              "zh/deployment/server-gateway",
+              "zh/deployment/parallel-serving",
+              "zh/deployment/training-time-rtc",
+              "zh/deployment/amd-rocm"
             ]
           },
           {

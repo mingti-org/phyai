@@ -13,12 +13,14 @@ PhyAI 的 pi0.5 scheduler 不做图像 resize、文本 tokenization、state 离�
 | 阶段 | 输入 | 输出 |
 | --- | --- | --- |
 | `preprocess` | `images`、`task`、`state` | `PI05ProcessedInputs(pixel_values, input_ids, lang_lens)` |
-| `engine.step` | `PI05Request` | `(B, chunk_size, max_action_dim)` |
+| `engine.step` | `PI05Request` | 默认返回动作 Tensor；启用 RLT 时返回含 `actions` 和 `rl_token` 的 `PI05Output` |
 | `postprocess` | raw action chunk | `(B, chunk_size, action_dim)` |
 
 <Note>
   `pi05_base` 的公开 checkpoint 里 normalizer 的 `features` 为空，所以默认 state/action normalize 是 no-op。若你的 lerobot checkpoint 带有 dataset stats，`from_pretrained` 会加载这些 stats sidecar，并在 pre/postprocess 中使用。
 </Note>
+
+RLT 和 RTC 在构建时分别通过 `enable_rlt`、`enable_rtc` 启用，默认都关闭。启用 RLT 时，将 `result.actions` 交给动作后处理，`result.rl_token` 保持原值。RTC 的绝对动作前缀须使用当前观测 state 调用 `encode_action_prefix`，不能直接复用上一轮归一化 delta。具体约定见 [RL Token](/zh/models/pi05/rl-token) 和 [训练式 RTC](/zh/deployment/training-time-rtc)。
 
 # 输入规范
 

@@ -41,6 +41,7 @@ from phyai.layers.quant.active import resolve_quant_plan, use_quant_plan
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_pi05 import (
+    PI05Output,
     PI05Request,
     PI05RolloutOutput,
     PI05RolloutRequest,
@@ -72,6 +73,8 @@ _PI05_CANONICAL_DROP_KEYS: frozenset[str] = frozenset(
 
 def _compose_remap(
     user_remap: Callable[[str], str | None] | dict[str, str] | None,
+    *,
+    enable_rlt: bool = True,
 ) -> Callable[[str], str | None]:
     """Normalize source keys, then filter canonical pi0.5 keys.
 
@@ -79,27 +82,33 @@ def _compose_remap(
     namespace used by :data:`_PI05_CANONICAL_DROP_KEYS`.
     """
     if user_remap is None:
-        return lambda k: None if k in _PI05_CANONICAL_DROP_KEYS else k
-    if callable(user_remap):
-
-        def _chained(k: str) -> str | None:
-            remapped = user_remap(k)
-            return None if remapped in _PI05_CANONICAL_DROP_KEYS else remapped
-
-        return _chained
-    if isinstance(user_remap, dict):
+        remap = lambda k: k
+    elif callable(user_remap):
+        remap = user_remap
+    elif isinstance(user_remap, dict):
         rules = list(user_remap.items())
 
-        def _chained_dict(k: str) -> str | None:
+        def remap(k: str) -> str:
             for src, dst in rules:
                 if src in k:
                     k = k.replace(src, dst)
-            return None if k in _PI05_CANONICAL_DROP_KEYS else k
+            return k
 
-        return _chained_dict
-    raise TypeError(
-        f"weight_remap must be callable, dict, or None; got {type(user_remap).__name__}"
-    )
+    else:
+        raise TypeError(
+            f"weight_remap must be callable, dict, or None; got {type(user_remap).__name__}"
+        )
+
+    def filtered(k: str) -> str | None:
+        key = remap(k)
+        if key is None or key in _PI05_CANONICAL_DROP_KEYS:
+            return None
+        # An action-only load ignores the sidecar without weakening backbone checks.
+        if not enable_rlt and key.startswith("rlt_token."):
+            return None
+        return key
+
+    return filtered
 
 
 @dataclass
@@ -142,6 +151,12 @@ class PI05Args(EntryArgs):
     rollout engine; :class:`PI05RolloutRequest` remains functional without it
     but runs the expert loop eagerly.
 
+    ``enable_rlt`` and ``enable_rtc`` are independent, opt-in inference
+    features. Both default to False even when the checkpoint declares trained
+    support. Enabling requires the corresponding training metadata; RLT also
+    requires complete sidecar weights. Disabled RLT weights are ignored while
+    backbone loading retains the requested strictness.
+
     """
 
     checkpoint_dir: str | Path | None = None
@@ -152,6 +167,8 @@ class PI05Args(EntryArgs):
     vision_params_dtype: torch.dtype | None = None
     inputs_image_shape: list[list[int]] | None = None
     capture_rollout: bool = False
+    enable_rlt: bool = False
+    enable_rtc: bool = False
 
 
 @Engine.register
@@ -168,11 +185,17 @@ class PI05Entry(Entry):
         self.scheduler: PI05Scheduler | None = None
         self.weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
         self.weight_update: WeightLoadSession | None = None
+        self.enable_rlt = False
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
+        if args.enable_rlt and args.checkpoint_dir is None:
+            raise ValueError(
+                "RLT inference requires a checkpoint with trained sidecar weights"
+            )
         eng = get_engine_config()
         self.weight_remap = args.weight_remap
+        self.enable_rlt = args.enable_rlt
 
         # Resolve config: explicit override > checkpoint folder > defaults.
         if args.config is not None:
@@ -187,15 +210,24 @@ class PI05Entry(Entry):
                 config,
                 vision_params_dtype=args.vision_params_dtype,
                 device=eng.device.target,
+                enable_rlt=args.enable_rlt,
+                enable_rtc=args.enable_rtc,
             )
+        config = self.model.config
 
         if args.checkpoint_dir is not None:
-            load_pretrained(
+            report = load_pretrained(
                 self.model,
                 args.checkpoint_dir,
-                remap=_compose_remap(args.weight_remap),
+                remap=_compose_remap(args.weight_remap, enable_rlt=args.enable_rlt),
                 strict=args.weight_strict,
             )
+            if args.enable_rlt and any(
+                key.startswith("rlt_token.") for key in report.missing
+            ):
+                raise RuntimeError(
+                    "RLT inference requires complete trained sidecar weights"
+                )
 
         num_images = self._resolve_num_images(args.inputs_image_shape, config)
 
@@ -242,8 +274,8 @@ class PI05Entry(Entry):
                 )
         return len(inputs_image_shape)
 
-    def step(self, request: PI05Request) -> torch.Tensor:  # type: ignore[override]
-        """Run one pi0.5 inference; return the action chunk ``(B, chunk, action_dim)``."""
+    def step(self, request: PI05Request) -> torch.Tensor | PI05Output:
+        """Return actions, plus an RL token when the checkpoint enables RLT."""
         if isinstance(request, PI05RolloutRequest):
             raise TypeError(
                 "PI05RolloutRequest must be passed to rollout_step(), not step()."
@@ -268,7 +300,7 @@ class PI05Entry(Entry):
             raise RuntimeError("A PI05Entry weight update is already active.")
         self.weight_update = WeightLoadSession(
             self.model,
-            remap=_compose_remap(self.weight_remap),
+            remap=_compose_remap(self.weight_remap, enable_rlt=self.enable_rlt),
             source_label="hot update",
         )
 
