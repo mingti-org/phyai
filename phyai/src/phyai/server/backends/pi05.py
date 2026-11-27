@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import threading
 import time
@@ -398,40 +397,16 @@ class PI05RequestAdapter:
                 )
             images_by_name[image.name] = image
 
-        if is_batch:
-            try:
-                extensions = json.loads(request.extensions_json)
-            except (TypeError, ValueError):
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    "extensions_json must be valid JSON for batch inference",
-                )
-            if not isinstance(extensions, dict):
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    "extensions_json must be a JSON object for batch inference",
-                )
-            instructions = extensions.get("instructions")
-            if (
-                not isinstance(instructions, list)
-                or len(instructions) != batch_size
-                or any(
-                    not isinstance(instruction, str) or not instruction.strip()
-                    for instruction in instructions
-                )
-            ):
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    f"extensions_json.instructions must contain exactly {batch_size} "
-                    "non-empty strings",
-                )
-        else:
-            if not request.instruction.strip():
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    "instruction is required",
-                )
-            instructions = [request.instruction]
+        expected_instructions = batch_size if is_batch else 1
+        instructions = list(request.instructions)
+        if len(instructions) != expected_instructions or any(
+            not instruction.strip() for instruction in instructions
+        ):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"instructions must contain exactly {expected_instructions} "
+                "non-empty strings",
+            )
 
         robot_state = request.robot_state
         if robot_state.dtype != model_inference_pb2.DATA_TYPE_FLOAT32:

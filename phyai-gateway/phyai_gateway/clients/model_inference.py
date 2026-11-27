@@ -85,7 +85,7 @@ def _split_batch_request(request, max_batch_size):
         raise InvalidBatchedRequest()
     if not isinstance(extensions, dict):
         raise InvalidBatchedRequest()
-    instructions = extensions.get("instructions")
+    instructions = list(request.instructions)
     if (
         request.inputs
         or len(batch_images) != len(request.images)
@@ -109,12 +109,10 @@ def _split_batch_request(request, max_batch_size):
         or len(request.robot_state.data) != math.prod(request.robot_state.shape) * 4
         or type(extensions.get("batch_size")) is not int
         or extensions["batch_size"] != batch_size
-        or not isinstance(instructions, list)
         or len(instructions) != batch_size
         or any(
             not isinstance(value, str) or not value.strip() for value in instructions
         )
-        or (request.instruction and request.instruction != instructions[0])
     ):
         raise InvalidBatchedRequest()
     chunks = []
@@ -123,11 +121,11 @@ def _split_batch_request(request, max_batch_size):
         chunk_size = end - start
         chunk_extensions = dict(extensions)
         chunk_extensions["batch_size"] = chunk_size
-        chunk_extensions["instructions"] = instructions[start:end]
+        chunk_extensions.pop("instructions", None)
         chunk = model_inference_pb2.InferenceRequest(
             request_id=f"{request.request_id}-{uuid.uuid4().hex}",
             timestamp_ns=request.timestamp_ns,
-            instruction=instructions[start],
+            instructions=instructions[start:end],
             requested_action_horizon=request.requested_action_horizon,
             extensions_json=json.dumps(chunk_extensions, separators=(",", ":")),
             model_name=request.model_name,

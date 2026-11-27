@@ -87,7 +87,7 @@ class RobotAdapter(robot_pb2_grpc.RobotInferenceServicer):
                 shape=[len(values)],
                 dtype=model_inference_pb2.DATA_TYPE_FLOAT32,
             ),
-            instruction=sensor_data.language_instruction,
+            instructions=[sensor_data.language_instruction],
             requested_action_horizon=1,
             extensions_json=json.dumps(
                 {

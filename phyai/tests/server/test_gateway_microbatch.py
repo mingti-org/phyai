@@ -108,11 +108,9 @@ def request_for(batch_size, *, two_cameras=False):
             shape=[batch_size, 2],
             dtype=pb.DATA_TYPE_FLOAT32,
         ),
-        instruction=instructions[0],
+        instructions=instructions,
         requested_action_horizon=3,
-        extensions_json=json.dumps(
-            {"batch_size": batch_size, "instructions": instructions}
-        ),
+        extensions_json=json.dumps({"batch_size": batch_size}),
     )
 
 
@@ -154,10 +152,10 @@ def test_backend_capacity_preserves_batch_order(batch_size, capacity, sizes):
         for chunk, size in zip(stub.requests, sizes):
             extensions = json.loads(chunk.extensions_json)
             assert extensions["batch_size"] == size
-            assert extensions["instructions"] == [
+            assert "instructions" not in extensions
+            assert list(chunk.instructions) == [
                 f"task-{index}" for index in range(offset, offset + size)
             ]
-            assert chunk.instruction == f"task-{offset}"
             assert list(chunk.robot_state.shape) == [size, 2]
             assert [image.data[0] for image in chunk.images] == [offset, offset + 100]
             assert struct.unpack(f"<{size * 2}f", chunk.robot_state.data) == tuple(
@@ -194,6 +192,7 @@ def test_single_sample_robot_request_is_not_split():
     request.extensions_json = ""
     response = client.infer(request, "pi05")
     assert len(stub.requests) == 1
+    assert list(stub.requests[0].instructions) == ["task-0"]
     assert response.request_id == "original"
     assert registry.released == 1
 
@@ -212,6 +211,19 @@ def test_unsupported_batch_shape_is_rejected_before_forwarding():
     client, registry = client_for(1, stub)
     request = request_for(2)
     request.images[0].encoding = pb.IMAGE_ENCODING_PNG
+    with pytest.raises(grpc.RpcError) as error:
+        client.infer(request, "pi05")
+    assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert not stub.requests
+    assert registry.released == 1
+
+
+@pytest.mark.parametrize("instructions", [["task-0"], ["task-0", " "]])
+def test_oversized_batch_requires_one_instruction_per_sample(instructions):
+    stub = Stub()
+    client, registry = client_for(1, stub)
+    request = request_for(2)
+    request.instructions[:] = instructions
     with pytest.raises(grpc.RpcError) as error:
         client.infer(request, "pi05")
     assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
